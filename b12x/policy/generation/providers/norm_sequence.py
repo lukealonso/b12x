@@ -94,6 +94,7 @@ def _mhc_cases() -> tuple[SweepCase, ...]:
 def _mhc_config(
     *,
     backend: str,
+    decode_partials_schedule: str = "default",
     tile_m: int,
     tile_n: int,
     tile_k: int,
@@ -104,6 +105,7 @@ def _mhc_config(
 ) -> dict[str, object]:
     return {
         "backend": backend,
+        "decode_partials_schedule": decode_partials_schedule,
         "projection_tile_m": tile_m,
         "projection_tile_n": tile_n,
         "projection_tile_k": tile_k,
@@ -117,6 +119,19 @@ def _mhc_config(
 _MHC_NATIVE_CANDIDATE = SweepCandidate.create(
     _mhc_config(
         backend="native",
+        tile_m=16,
+        tile_n=8,
+        tile_k=256,
+        stages=1,
+        m_warps=1,
+        n_warps=1,
+        k_splits=1,
+    )
+)
+_MHC_DECODE_PARTIALS_CANDIDATE = SweepCandidate.create(
+    _mhc_config(
+        backend="native",
+        decode_partials_schedule="hidden4096_m128_v1",
         tile_m=16,
         tile_n=8,
         tile_k=256,
@@ -353,11 +368,15 @@ class _MhcSession(_GpuSession):
         from b12x.norm.mhc._policy import MHC_POLICY, MhcConfig, MhcQuery
 
         query = MhcQuery(**case.query.to_dict())
-        candidates = (
-            (_MHC_NATIVE_CANDIDATE,)
-            if query.max_tokens < 384
-            else (_MHC_NATIVE_CANDIDATE, *_MHC_TF32_CANDIDATES)
-        )
+        candidates = [_MHC_NATIVE_CANDIDATE]
+        if (
+            query.max_tokens == 128
+            and query.hidden_size == 4_096
+            and query.split_k == 64
+        ):
+            candidates.append(_MHC_DECODE_PARTIALS_CANDIDATE)
+        if query.max_tokens >= 384:
+            candidates.extend(_MHC_TF32_CANDIDATES)
         valid = []
         for candidate in candidates:
             config = MhcConfig.from_profile(candidate.config)
@@ -682,7 +701,7 @@ class MhcGenerator(DiscreteSweepGenerator):
         super().__init__(
             component_id=MHC,
             query_schema_version=1,
-            config_schema_version=2,
+            config_schema_version=3,
             query_fields=("dtype", "max_tokens", "hidden_size", "split_k"),
             range_fields=frozenset({"max_tokens"}),
             cases=_mhc_cases() if cases is None else cases,
@@ -692,7 +711,7 @@ class MhcGenerator(DiscreteSweepGenerator):
                 "prefill_capacities": list(COMMON_PREFILL_TOKEN_CAPACITIES),
                 "medium_prefill_anchors": [2_304, 3_072, 3_584],
             },
-            candidate_contract_version=2,
+            candidate_contract_version=3,
             nearest_range_bounds={"max_tokens": (1, 8_192)},
         )
 

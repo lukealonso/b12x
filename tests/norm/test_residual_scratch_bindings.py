@@ -19,6 +19,7 @@ from b12x.policy import (
 def _medium_tf32_config(*, stages: int) -> MhcConfig:
     return MhcConfig(
         backend="tf32_tma",
+        decode_partials_schedule="default",
         projection_tile_m=64,
         projection_tile_n=24,
         projection_tile_k=64,
@@ -99,6 +100,109 @@ def test_embedded_mhc_profiles_resolve_measured_medium_prefill_geometry(
     assert resolution.config.backend == "tf32_tma"
     assert resolution.config.projection_tile_m == tile_m
     assert resolution.config.projection_k_splits == k_splits
+
+
+def test_rtx_profile_scopes_mhc_decode_schedule_to_measured_capacity() -> None:
+    device = DeviceIdentity(
+        vendor="nvidia",
+        product_name=(
+            "nvidia rtx pro 6000 blackwell max-q workstation edition"
+        ),
+        compute_capability=(12, 0),
+        sm_count=188,
+    )
+    policy = PolicyContext.for_identity(
+        device,
+        mode=PolicyMode.PREPLANNED_ONLY,
+    )
+
+    resolutions = {
+        tokens: policy.resolve(
+            MHC_POLICY,
+            MhcQuery(
+                dtype="bfloat16",
+                max_tokens=tokens,
+                hidden_size=4_096,
+                split_k=64,
+            ),
+        )
+        for tokens in (127, 128, 129)
+    }
+
+    assert all(
+        resolution.source is PolicySource.PREPLANNED
+        for resolution in resolutions.values()
+    )
+    assert resolutions[127].config.decode_partials_schedule == "default"
+    assert (
+        resolutions[128].config.decode_partials_schedule
+        == "hidden4096_m128_v1"
+    )
+    assert resolutions[129].config.decode_partials_schedule == "default"
+
+
+def test_mhc_plan_owns_profiled_decode_schedule() -> None:
+    base = MHC_POLICY.heuristic(
+        MhcQuery(
+            dtype="bfloat16",
+            max_tokens=128,
+            hidden_size=4_096,
+            split_k=64,
+        ),
+        None,
+    )
+    config = MhcConfig(
+        **{
+            **base.to_dict(),
+            "decode_partials_schedule": "hidden4096_m128_v1",
+        }
+    )
+    policy = PolicyContext.for_identity(
+        None,
+        mode=PolicyMode.HEURISTIC_ONLY,
+    ).with_override(MHC, config)
+
+    plan = plan_mhc_scratch(
+        B12XMHCScratchCaps(
+            device="cpu",
+            max_tokens=128,
+            hidden_size=4_096,
+            split_k=64,
+        ),
+        policy=policy,
+    )
+
+    assert plan.config is config
+    assert plan.config.decode_partials_schedule == "hidden4096_m128_v1"
+
+
+def test_mhc_profiled_decode_schedule_rejects_unmeasured_queries() -> None:
+    config = MhcConfig(
+        **{
+            **MHC_POLICY.heuristic(
+                MhcQuery(
+                    dtype="bfloat16",
+                    max_tokens=128,
+                    hidden_size=4_096,
+                    split_k=64,
+                ),
+                None,
+            ).to_dict(),
+            "decode_partials_schedule": "hidden4096_m128_v1",
+        }
+    )
+
+    with pytest.raises(ValueError, match="requires native mHC"):
+        MHC_POLICY.validate_config(
+            MhcQuery(
+                dtype="bfloat16",
+                max_tokens=64,
+                hidden_size=4_096,
+                split_k=64,
+            ),
+            config,
+            None,
+        )
 
 
 @pytest.mark.parametrize(

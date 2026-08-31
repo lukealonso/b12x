@@ -13,6 +13,9 @@ from b12x.policy import (
 
 _MHC_MULT = 4
 _PREFILL_TF32_MIN_TOKENS = 384
+_MHC_DECODE_PARTIALS_SCHEDULES = frozenset(
+    {"default", "hidden4096_m128_v1"}
+)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -26,6 +29,7 @@ class MhcQuery:
 @dataclass(frozen=True, kw_only=True)
 class MhcConfig:
     backend: str
+    decode_partials_schedule: str
     projection_tile_m: int
     projection_tile_n: int
     projection_tile_k: int
@@ -41,6 +45,7 @@ class MhcConfig:
             raise ValueError(f"mHC config fields must be {sorted(expected)}")
         return cls(
             backend=str(payload["backend"]),
+            decode_partials_schedule=str(payload["decode_partials_schedule"]),
             projection_tile_m=int(payload["projection_tile_m"]),
             projection_tile_n=int(payload["projection_tile_n"]),
             projection_tile_k=int(payload["projection_tile_k"]),
@@ -53,6 +58,7 @@ class MhcConfig:
     def to_dict(self) -> dict[str, object]:
         return {
             "backend": self.backend,
+            "decode_partials_schedule": self.decode_partials_schedule,
             "projection_tile_m": self.projection_tile_m,
             "projection_tile_n": self.projection_tile_n,
             "projection_tile_k": self.projection_tile_k,
@@ -76,6 +82,7 @@ def _tf32_config(
 ) -> MhcConfig:
     return MhcConfig(
         backend=backend,
+        decode_partials_schedule="default",
         projection_tile_m=tile_m,
         projection_tile_n=tile_n,
         projection_tile_k=tile_k,
@@ -174,6 +181,21 @@ def _validate(
         raise ValueError("mHC query dimensions must be positive")
     if config.backend not in {"native", "tf32_tma"}:
         raise ValueError(f"unsupported mHC backend {config.backend!r}")
+    if config.decode_partials_schedule not in _MHC_DECODE_PARTIALS_SCHEDULES:
+        raise ValueError(
+            "unsupported mHC decode partials schedule "
+            f"{config.decode_partials_schedule!r}"
+        )
+    if config.decode_partials_schedule == "hidden4096_m128_v1" and (
+        config.backend != "native"
+        or query.max_tokens != 128
+        or query.hidden_size != 4_096
+        or query.split_k != 64
+    ):
+        raise ValueError(
+            "hidden4096_m128_v1 requires native mHC with "
+            "max_tokens=128, hidden_size=4096, and split_k=64"
+        )
     if config.backend == "native":
         return
     if query.hidden_size not in {4_096, 7_168}:
@@ -209,7 +231,7 @@ def _validate(
 MHC_POLICY = ComponentPolicy(
     component_id=MHC,
     query_schema_version=1,
-    config_schema_version=2,
+    config_schema_version=3,
     query_fields=frozenset(MhcQuery.__dataclass_fields__),
     config_fields=frozenset(MhcConfig.__dataclass_fields__),
     encode_query=_encode,

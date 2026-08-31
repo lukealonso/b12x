@@ -521,6 +521,7 @@ def _selected_post_pre_partials_per_cta(
     num_tokens: int,
     hidden_size: int,
     compute_capability: tuple[int, int] | None = None,
+    schedule: str = "default",
 ) -> int:
     raw = os.environ.get("B12X_MHC_PARTIALS_PER_CTA")
     if raw is not None and raw != "":
@@ -530,6 +531,28 @@ def _selected_post_pre_partials_per_cta(
             raise ValueError(
                 f"invalid B12X_MHC_PARTIALS_PER_CTA={raw!r}"
             ) from exc
+
+    if schedule == "hidden4096_m128_v1":
+        if int(hidden_size) != _HIDDEN:
+            raise ValueError(
+                "hidden4096_m128_v1 requires hidden_size=4096"
+            )
+        tokens = int(num_tokens)
+        if tokens >= 96:
+            return _POST_PRE_PARTIALS_PER_CTA
+        if tokens >= 24:
+            return 13
+        if tokens >= 16:
+            return 7
+        if tokens >= 8:
+            return 5
+        if tokens >= 4:
+            return 3
+        if tokens >= 2:
+            return 2
+        return 1
+    if schedule != "default":
+        raise ValueError(f"unsupported mHC decode partials schedule {schedule!r}")
 
     if compute_capability is None and torch.cuda.is_available():
         compute_capability = tuple(torch.cuda.get_device_capability())
@@ -4047,6 +4070,7 @@ def _run_mhc_post_pre_partial_launch(
     partials: torch.Tensor,
     out: torch.Tensor,
     compute_gram: bool = False,
+    partials_per_cta: int = 0,
 ) -> None:
     tokens = int(x.shape[0])
     hidden_size = int(residual.shape[2])
@@ -4062,9 +4086,13 @@ def _run_mhc_post_pre_partial_launch(
         if raw_bf16x2 is not None
         else tokens == 16 and hidden_size == _HIDDEN and decode_source_splits > 0
     )
-    partials_per_cta = _selected_post_pre_partials_per_cta(
-        num_tokens=tokens,
-        hidden_size=hidden_size,
+    partials_per_cta = (
+        _validate_post_pre_partials_per_cta(int(partials_per_cta))
+        if int(partials_per_cta) > 0
+        else _selected_post_pre_partials_per_cta(
+            num_tokens=tokens,
+            hidden_size=hidden_size,
+        )
     )
     _validate_tensor_shape("x", x, (tokens, hidden_size))
     _validate_tensor_shape("residual", residual, (tokens, _MHC_MULT, hidden_size))
@@ -4244,6 +4272,7 @@ def _mhc_post_pre_partial_launch_op(
     partials: torch.Tensor,
     out: torch.Tensor,
     compute_gram: bool,
+    partials_per_cta: int,
 ) -> None:
     _run_mhc_post_pre_partial_launch(
         x=x,
@@ -4254,6 +4283,7 @@ def _mhc_post_pre_partial_launch_op(
         partials=partials,
         out=out,
         compute_gram=compute_gram,
+        partials_per_cta=partials_per_cta,
     )
 
 
@@ -4267,6 +4297,7 @@ def _mhc_post_pre_partial_launch_fake(
     partials: torch.Tensor,
     out: torch.Tensor,
     compute_gram: bool,
+    partials_per_cta: int,
 ) -> None:
     return None
 
@@ -4281,7 +4312,13 @@ def run_mhc_post_pre_partial(
     partials: torch.Tensor,
     out: torch.Tensor,
     compute_gram: bool = False,
+    decode_partials_schedule: str = "default",
 ) -> None:
+    partials_per_cta = _selected_post_pre_partials_per_cta(
+        num_tokens=int(x.shape[0]),
+        hidden_size=int(residual.shape[2]),
+        schedule=decode_partials_schedule,
+    )
     torch.ops.b12x.mhc_post_pre_partial_launch(
         x,
         residual,
@@ -4291,6 +4328,7 @@ def run_mhc_post_pre_partial(
         partials,
         out,
         bool(compute_gram),
+        int(partials_per_cta),
     )
 
 
@@ -5163,6 +5201,7 @@ def _legacy_mhc_prefill_tf32_config(
         geometry = (16, 8, 256, 1, 1, 1, 1)
     return MhcConfig(
         backend="tf32_tma",
+        decode_partials_schedule="default",
         projection_tile_m=geometry[0],
         projection_tile_n=geometry[1],
         projection_tile_k=geometry[2],
