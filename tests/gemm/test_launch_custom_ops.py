@@ -212,6 +212,7 @@ def test_dense_gemm_launch_has_fake_dispatch() -> None:
             False,
             False,
             None,
+            None,
         )
         torch.ops.b12x.dense_gemm_launch(
             a,
@@ -246,6 +247,7 @@ def test_dense_gemm_launch_has_fake_dispatch() -> None:
             False,
             False,
             False,
+            None,
             123,
         )
 
