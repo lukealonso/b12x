@@ -85,11 +85,8 @@ class Nvfp4M8RoutePackKernel:
             all_work_published,
             input_global_scale,
         ).launch(
-            # One CTA owns one (token, route) pair. The original token-only
-            # grid reused each activation load but serialized all eight
-            # expert-scale quantizations in every lane. M8 has only 64
-            # routes, so exposing that route dimension still fits in one GPU
-            # wave and removes the serial inner loop.
+            # One CTA owns one (token, route) pair, so all eight route-specific
+            # quantizations for a token are represented in the launch grid.
             grid=(self.num_tokens, self.num_topk, 1),
             block=[self.threads_per_cta, 1, 1],
             cluster=[1, 1, 1],
