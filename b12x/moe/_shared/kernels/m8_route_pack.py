@@ -127,9 +127,9 @@ class Nvfp4M8RoutePackKernel:
         route_row = storage.physical_row.get_tensor(cute.make_layout(1))
         route_expert = storage.expert.get_tensor(cute.make_layout(1))
 
-        # Derive a stable compact-row index for each route. With only 64
-        # routes, an ordered prefix count in the eight route-owner lanes is
-        # cheaper than a grid of atomics and removes the resident rendezvous.
+        # Derive a stable compact-row index for each route with an ordered
+        # prefix count over the fixed 64-route domain. Each CTA can compute its
+        # destination without a cross-CTA rendezvous.
         if tidx == Int32(0):
             pair_idx = Int32(token_idx * self.num_topk) + Int32(route_idx)
             route_expert_value = topk_ids[pair_idx].to(Int32)
