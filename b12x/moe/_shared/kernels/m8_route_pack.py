@@ -85,7 +85,12 @@ class Nvfp4M8RoutePackKernel:
             all_work_published,
             input_global_scale,
         ).launch(
-            grid=(self.num_tokens, 1, 1),
+            # One CTA owns one (token, route) pair. The original token-only
+            # grid reused each activation load but serialized all eight
+            # expert-scale quantizations in every lane. M8 has only 64
+            # routes, so exposing that route dimension still fits in one GPU
+            # wave and removes the serial inner loop.
+            grid=(self.num_tokens, self.num_topk, 1),
             block=[self.threads_per_cta, 1, 1],
             cluster=[1, 1, 1],
             stream=stream,
@@ -112,55 +117,57 @@ class Nvfp4M8RoutePackKernel:
         input_global_scale: cute.Tensor,
     ):
         tidx, _, _ = cute.arch.thread_idx()
-        token_idx, _, _ = cute.arch.block_idx()
+        token_idx, route_idx, _ = cute.arch.block_idx()
 
         smem = cutlass.utils.SmemAllocator()
 
         @cute.struct
         class Storage:
-            route_rows: cute.struct.Align[
-                cute.struct.MemRange[cutlass.Int32, 8], 32
-            ]
-            route_experts: cute.struct.Align[
-                cute.struct.MemRange[cutlass.Int32, 8], 32
-            ]
+            physical_row: cute.struct.Align[cute.struct.MemRange[cutlass.Int32, 1], 4]
+            expert: cute.struct.Align[cute.struct.MemRange[cutlass.Int32, 1], 4]
 
         storage = smem.allocate(Storage)
-        route_rows = storage.route_rows.get_tensor(cute.make_layout(8))
-        route_experts = storage.route_experts.get_tensor(cute.make_layout(8))
+        route_row = storage.physical_row.get_tensor(cute.make_layout(1))
+        route_expert = storage.expert.get_tensor(cute.make_layout(1))
 
-        # Derive a stable compact-row index for each route with an ordered
-        # prefix count in the eight route-owner lanes. This avoids a
-        # cross-CTA rendezvous in the fixed 64-route specialization.
-        if tidx < Int32(self.num_topk):
-            pair_idx = Int32(token_idx * self.num_topk) + Int32(tidx)
-            expert = topk_ids[pair_idx].to(Int32)
-            physical_row = Int32(-1)
-            if expert >= Int32(0) and expert < Int32(self.num_experts):
+        # Derive a stable compact-row index for each route. With only 64
+        # routes, an ordered prefix count in the eight route-owner lanes is
+        # cheaper than a grid of atomics and removes the resident rendezvous.
+        if tidx == Int32(0):
+            pair_idx = Int32(token_idx * self.num_topk) + Int32(route_idx)
+            route_expert_value = topk_ids[pair_idx].to(Int32)
+            route_physical_row_value = Int32(-1)
+            if route_expert_value >= Int32(0) and route_expert_value < Int32(
+                self.num_experts
+            ):
                 row = Int32(0)
                 prior = Int32(0)
                 while prior < pair_idx:
-                    if topk_ids[prior].to(Int32) == expert:
+                    if topk_ids[prior].to(Int32) == route_expert_value:
                         row += Int32(1)
                     prior += Int32(1)
-                physical_tile = expert_tile_base[expert] + row // Int32(self.tile_m)
-                physical_row = (
-                    physical_tile * Int32(self.tile_m) + row % Int32(self.tile_m)
+                physical_tile = expert_tile_base[route_expert_value] + row // Int32(
+                    self.tile_m
                 )
+                route_physical_row_value = physical_tile * Int32(
+                    self.tile_m
+                ) + row % Int32(self.tile_m)
                 st_global_i32(
-                    get_ptr_as_int64(token_map, physical_row), Int32(token_idx)
+                    get_ptr_as_int64(token_map, route_physical_row_value),
+                    Int32(token_idx),
                 )
                 st_global_f32(
-                    get_ptr_as_int64(token_weights, physical_row),
+                    get_ptr_as_int64(token_weights, route_physical_row_value),
                     topk_weights[pair_idx].to(cutlass.Float32),
                 )
-            route_rows[Int32(tidx)] = physical_row
-            route_experts[Int32(tidx)] = expert
+            route_row[Int32(0)] = route_physical_row_value
+            route_expert[Int32(0)] = route_expert_value
 
         # CTA zero publishes the arithmetic materialized-task domain.  The
         # compute kernel recovers M-tile/slice coordinates from each slot, so
         # only expert and valid-row fields are materialized here.
-        if Int32(token_idx) == Int32(0):
+        expert = Int32(0)
+        if Int32(token_idx) == Int32(0) and Int32(route_idx) == Int32(0):
             expert = Int32(tidx)
             while expert < Int32(self.num_experts):
                 rows = row_counts[expert].to(Int32)
@@ -181,22 +188,22 @@ class Nvfp4M8RoutePackKernel:
                 expert += Int32(self.threads_per_cta)
             if tidx == Int32(0):
                 task_head[Int32(0)] = Int32(0)
-                task_tail[Int32(0)] = (
-                    expert_tile_base[Int32(self.num_experts)]
-                    * Int32(self.task_groups)
+                task_tail[Int32(0)] = expert_tile_base[Int32(self.num_experts)] * Int32(
+                    self.task_groups
                 )
                 all_work_published[Int32(0)] = Int32(1)
 
         # Compute-only deliberately skips the fused kernel's scatter clear.
         # Each preparation CTA owns one complete output row, so this is a
         # contiguous, conflict-free zero fill.
-        scatter_u32 = cute.recast_tensor(scatter_output, cutlass.Uint32)
-        clear_idx = Int32(tidx)
-        while clear_idx < Int32(self.hidden_size // 2):
-            scatter_u32[
-                Int32(token_idx * (self.hidden_size // 2)) + clear_idx
-            ] = Uint32(0)
-            clear_idx += Int32(self.threads_per_cta)
+        if Int32(route_idx) == Int32(0):
+            scatter_u32 = cute.recast_tensor(scatter_output, cutlass.Uint32)
+            clear_idx = Int32(tidx)
+            while clear_idx < Int32(self.hidden_size // 2):
+                scatter_u32[Int32(token_idx * (self.hidden_size // 2)) + clear_idx] = (
+                    Uint32(0)
+                )
+                clear_idx += Int32(self.threads_per_cta)
 
         cute.arch.sync_threads()
 
@@ -206,44 +213,41 @@ class Nvfp4M8RoutePackKernel:
         sf_blocks_per_row = Int32(self.hidden_size // self.sf_vec_size)
         packed_bytes_per_row = Int32(self.hidden_size // 2)
         num_k_tiles = Int32(self.hidden_size // 64)
-        sf_idx = Int32(tidx)
-        while sf_idx < sf_blocks_per_row:
-            block_start = sf_idx * Int32(self.sf_vec_size)
-            values = cute.make_rmem_tensor((16,), cutlass.Float32)
-            block_max = cutlass.Float32(0.0)
-            for elem_idx in cutlass.range_constexpr(16):
-                value = cutlass.Float32(
-                    a_input[Int32(token_idx), block_start + Int32(elem_idx)]
+        physical_row_value = route_row[Int32(0)]
+        expert_idx = route_expert[Int32(0)]
+        if physical_row_value >= Int32(0):
+            global_scale = input_global_scale[expert_idx].to(cutlass.Float32)
+            sf_idx = Int32(tidx)
+            while sf_idx < sf_blocks_per_row:
+                block_start = sf_idx * Int32(self.sf_vec_size)
+                values = cute.make_rmem_tensor((16,), cutlass.Float32)
+                block_max = cutlass.Float32(0.0)
+                for elem_idx in cutlass.range_constexpr(16):
+                    value = cutlass.Float32(
+                        a_input[Int32(token_idx), block_start + Int32(elem_idx)]
+                    )
+                    values[elem_idx] = value
+                    block_max = fmax_f32(block_max, fabs_f32(value))
+                packed64, scale_byte = quantize_block_fp4_fast(
+                    values, block_max, global_scale
                 )
-                values[elem_idx] = value
-                block_max = fmax_f32(block_max, fabs_f32(value))
-            route = Int32(0)
-            while route < Int32(self.num_topk):
-                physical_row = route_rows[route]
-                if physical_row >= Int32(0):
-                    expert = route_experts[route]
-                    global_scale = input_global_scale[expert].to(cutlass.Float32)
-                    packed64, scale_byte = quantize_block_fp4_fast(
-                        values, block_max, global_scale
-                    )
-                    st_global_u64(
-                        get_ptr_as_int64(
-                            packed_a_storage,
-                            physical_row * packed_bytes_per_row + sf_idx * Int32(8),
-                        ),
-                        Uint64(packed64),
-                    )
-                    k_tile_idx = sf_idx // Int32(4)
-                    inner_k_idx = sf_idx % Int32(4)
-                    sf_atom = physical_row >> Int32(7)
-                    sf_row = physical_row & Int32(127)
-                    scale_offset = (
-                        sf_atom * num_k_tiles * Int32(32 * 4 * 4)
-                        + k_tile_idx * Int32(32 * 4 * 4)
-                        + (sf_row % Int32(32)) * Int32(4 * 4)
-                        + (sf_row // Int32(32)) * Int32(4)
-                        + inner_k_idx
-                    )
-                    scale_storage[scale_offset] = Uint8(scale_byte)
-                route += Int32(1)
-            sf_idx += Int32(self.threads_per_cta)
+                st_global_u64(
+                    get_ptr_as_int64(
+                        packed_a_storage,
+                        physical_row_value * packed_bytes_per_row + sf_idx * Int32(8),
+                    ),
+                    Uint64(packed64),
+                )
+                k_tile_idx = sf_idx // Int32(4)
+                inner_k_idx = sf_idx % Int32(4)
+                sf_atom = physical_row_value >> Int32(7)
+                sf_row = physical_row_value & Int32(127)
+                scale_offset = (
+                    sf_atom * num_k_tiles * Int32(32 * 4 * 4)
+                    + k_tile_idx * Int32(32 * 4 * 4)
+                    + (sf_row % Int32(32)) * Int32(4 * 4)
+                    + (sf_row // Int32(32)) * Int32(4)
+                    + inner_k_idx
+                )
+                scale_storage[scale_offset] = Uint8(scale_byte)
+                sf_idx += Int32(self.threads_per_cta)
