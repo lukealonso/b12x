@@ -127,8 +127,9 @@ class _GroupedRmsNorm:
 
 
 class _ScaledSilu:
-    def __init__(self, streams: int) -> None:
+    def __init__(self, streams: int, lowrank: int) -> None:
         self.streams = int(streams)
+        self.lowrank = int(lowrank)
 
     @cute.jit
     def __call__(
@@ -136,9 +137,10 @@ class _ScaledSilu:
         projected: cute.Pointer,
         output: cute.Pointer,
         elements: Int32,
+        projected_stride: Int64,
         stream: cuda.CUstream,
     ) -> None:
-        self.kernel(projected, output, elements).launch(
+        self.kernel(projected, output, elements, projected_stride).launch(
             grid=((elements + Int32(_THREADS - 1)) // Int32(_THREADS), 1, 1),
             block=(_THREADS, 1, 1),
             stream=stream,
@@ -150,12 +152,16 @@ class _ScaledSilu:
         projected: cute.Pointer,
         output: cute.Pointer,
         elements: Int32,
+        projected_stride: Int64,
     ) -> None:
         block, _, _ = cute.arch.block_idx()
         thread, _, _ = cute.arch.thread_idx()
         offset = Int64(block) * Int64(_THREADS) + Int64(thread)
         if offset < elements.to(Int64):
-            scaled_bf16 = BFloat16(Float32(projected[offset]) / Float32(self.streams))
+            source = (offset // Int64(self.lowrank)) * projected_stride + (
+                offset % Int64(self.lowrank)
+            )
+            scaled_bf16 = BFloat16(Float32(projected[source]) / Float32(self.streams))
             scaled = Float32(scaled_bf16)
             output[offset] = BFloat16(scaled * _sigmoid(scaled))
 
@@ -220,9 +226,10 @@ class _Combine:
         logits: cute.Pointer,
         combined: cute.Pointer,
         tokens: Int32,
+        logit_stride: Int64,
         stream: cuda.CUstream,
     ) -> None:
-        self.kernel(state, block_output, logits, combined).launch(
+        self.kernel(state, block_output, logits, combined, logit_stride).launch(
             grid=(tokens, self.streams, self.column_blocks),
             block=(_THREADS, 1, 1),
             stream=stream,
@@ -235,6 +242,7 @@ class _Combine:
         block_output: cute.Pointer,
         logits: cute.Pointer,
         combined: cute.Pointer,
+        logit_stride: Int64,
     ) -> None:
         token, residual_stream, column_block = cute.arch.block_idx()
         thread, _, _ = cute.arch.thread_idx()
@@ -244,13 +252,19 @@ class _Combine:
                 Int64(token) * Int64(self.streams) + Int64(residual_stream)
             ) * Int64(self.hidden_size) + column.to(Int64)
             output_offset = Int64(token) * Int64(self.hidden_size) + column.to(Int64)
-            logit_offset = Int64(token) * Int64(self.streams) + Int64(residual_stream)
-            scale = Float32(2.0) * _sigmoid(
-                Float32(logits[logit_offset]) / Float32(self.streams)
+            logit_offset = Int64(token) * logit_stride + Int64(residual_stream)
+            scaled_logit = Float32(logits[logit_offset]) / Float32(self.streams)
+            scale = Float32(2.0) * cute.math.rcp(
+                Float32(1.0) + cute.math.exp(-scaled_logit, fastmath=True),
+                approx=True,
+                ftz=True,
             )
             combined[state_offset] = BFloat16(
-                Float32(state[state_offset])
-                + scale * Float32(block_output[output_offset])
+                cute.math.fma(
+                    scale,
+                    Float32(block_output[output_offset]),
+                    Float32(state[state_offset]),
+                )
             )
 
 
@@ -271,6 +285,7 @@ class _CombineNorm:
         normalized: cute.Pointer,
         eps: Float32,
         tokens: Int32,
+        logit_stride: Int64,
         stream: cuda.CUstream,
     ) -> None:
         self.kernel(
@@ -281,6 +296,7 @@ class _CombineNorm:
             combined,
             normalized,
             eps,
+            logit_stride,
         ).launch(
             grid=(tokens, self.streams, 1),
             block=(_THREADS, 1, 1),
@@ -297,6 +313,7 @@ class _CombineNorm:
         combined: cute.Pointer,
         normalized: cute.Pointer,
         eps: Float32,
+        logit_stride: Int64,
     ) -> None:
         token, residual_stream, _ = cute.arch.block_idx()
         thread, _, _ = cute.arch.thread_idx()
@@ -306,7 +323,7 @@ class _CombineNorm:
         ) * Int64(self.hidden_size)
         output_base = Int64(token) * Int64(self.hidden_size)
         weight_base = Int64(residual_stream) * Int64(self.hidden_size)
-        logit_offset = Int64(token) * Int64(self.streams) + Int64(residual_stream)
+        logit_offset = Int64(token) * logit_stride + Int64(residual_stream)
         scale = Float32(2.0) * _sigmoid(
             Float32(logits[logit_offset]) / Float32(self.streams)
         )
@@ -376,6 +393,7 @@ class _PackedCombineNorm:
         normalized: cute.Pointer,
         eps: Float32,
         tokens: Int32,
+        logit_stride: Int64,
         stream: cuda.CUstream,
     ) -> None:
         self.kernel(
@@ -386,6 +404,7 @@ class _PackedCombineNorm:
             combined,
             normalized,
             eps,
+            logit_stride,
         ).launch(
             grid=(tokens, self.streams, 1),
             block=(self._THREADS, 1, 1),
@@ -402,6 +421,7 @@ class _PackedCombineNorm:
         combined: cute.Pointer,
         normalized: cute.Pointer,
         eps: Float32,
+        logit_stride: Int64,
     ) -> None:
         token, residual_stream, _ = cute.arch.block_idx()
         thread, _, _ = cute.arch.thread_idx()
@@ -421,7 +441,7 @@ class _PackedCombineNorm:
         lane = thread_i % Int32(32)
         scale = Float32(0.0)
         if lane == Int32(0):
-            logit_offset = Int64(token) * Int64(self.streams) + Int64(residual_stream)
+            logit_offset = Int64(token) * logit_stride + Int64(residual_stream)
             scale = Float32(2.0) * _sigmoid(
                 Float32(logits[logit_offset]) / Float32(self.streams)
             )
@@ -551,6 +571,7 @@ def _compile(
     *,
     has_eps: bool = False,
     runtime_ints: int = 0,
+    runtime_int64s: int = 0,
 ) -> Callable[..., None]:
     with _LOCK:
         cached = _CACHE.get(key)
@@ -566,13 +587,14 @@ def _compile(
             if has_eps:
                 args.append(Float32(1.0e-6))
             args.extend(Int32(1) for _ in range(runtime_ints))
+            args.extend(Int64(1) for _ in range(runtime_int64s))
             args.append(current_cuda_stream())
             compiled = compile_cute(
                 entry,
                 *args,
                 compile_spec=KernelCompileSpec.from_key(
                     "norm.hyperconnection.cute",
-                    3,
+                    6,
                     key,
                 ),
             )
@@ -587,6 +609,7 @@ def _run(
     *,
     eps: float | None = None,
     runtime_ints: tuple[int, ...] = (),
+    runtime_int64s: tuple[int, ...] = (),
 ) -> None:
     device = tensors[0].device
     with torch.cuda.device(device):
@@ -607,11 +630,13 @@ def _run(
                 device,
                 has_eps=eps is not None,
                 runtime_ints=len(runtime_ints),
+                runtime_int64s=len(runtime_int64s),
             )
         args: list[object] = [_pointer(tensor) for tensor in tensors]
         if eps is not None:
             args.append(float(eps))
         args.extend(int(value) for value in runtime_ints)
+        args.extend(int(value) for value in runtime_int64s)
         args.append(current_cuda_stream())
         run_compiled(compiled, tuple(args))
     if not capturing:
@@ -647,12 +672,14 @@ def scaled_silu(
     streams: int,
 ) -> None:
     elements = int(projected.numel())
-    key = ("silu", _device_index(projected), int(streams))
+    lowrank = int(projected.shape[1])
+    key = ("silu", _device_index(projected), int(streams), lowrank)
     _run(
         key,
-        _ScaledSilu(streams),
+        _ScaledSilu(streams, lowrank),
         (projected, output),
         runtime_ints=(elements,),
+        runtime_int64s=(int(projected.stride(0)),),
     )
 
 
@@ -690,6 +717,7 @@ def combine(
         _Combine(streams, hidden_size),
         (state, block_output, logits, combined),
         runtime_ints=(tokens,),
+        runtime_int64s=(int(logits.stride(0)),),
     )
 
 
@@ -723,6 +751,7 @@ def combine_norm(
         (state, block_output, logits, weight, combined, normalized),
         eps=eps,
         runtime_ints=(tokens,),
+        runtime_int64s=(int(logits.stride(0)),),
     )
 
 

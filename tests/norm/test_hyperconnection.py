@@ -153,6 +153,144 @@ def test_plan_bind_uses_live_views_and_no_scratch() -> None:
     assert binding.normalized.data_ptr() == binding.normalized_capacity.data_ptr()
 
 
+def test_projection_slices_match_packed_inputs_under_frozen_replay() -> None:
+    """Merged projection views retain values, padding and live row strides."""
+    from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
+    from b12x.norm.hyperconnection import _cute, _kernels
+
+    device = require_sm120()
+    capacity, streams, lowrank, hidden = 16, 4, 320, 2560
+    binding = _allocate_binding(device=device, tokens=capacity)
+    weights = torch.randn(streams * hidden, device=device, dtype=torch.bfloat16)
+    _cute.clear_caches()
+
+    def check(rows: int, padding: int) -> None:
+        merged = torch.randn(
+            rows, lowrank + streams + padding, device=device, dtype=torch.bfloat16
+        )
+        down = merged[:, :lowrank]
+        injection = merged[:, lowrank : lowrank + streams]
+        state = torch.randn(rows, streams * hidden, device=device, dtype=torch.bfloat16)
+        block = torch.randn(rows, hidden, device=device, dtype=torch.bfloat16)
+        live = binding.plan.bind(
+            tokens=rows,
+            normalized=binding.normalized_capacity,
+            bottleneck=binding.bottleneck_capacity,
+            block_input=binding.block_input_capacity,
+        )
+
+        def launch():
+            silu = hc.run_scaled_silu(down, binding=live)
+            combined = hc.run_combine(state, block, injection, plan=live.plan)
+            fused, normalized = hc.run_combine_norm(
+                state, block, injection, weights, eps=1e-6, plan=live.plan
+            )
+            return silu, combined, fused, normalized
+
+        launch()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            outputs = launch()
+        for _ in range(2):
+            merged.normal_()
+            before = merged.clone()
+            expected_silu = torch.empty_like(down)
+            _kernels._scaled_silu_launch(down.contiguous(), expected_silu, streams, 256)
+            expected_combine = torch.empty_like(state)
+            _kernels._combine_launch(
+                state,
+                block,
+                injection.contiguous(),
+                expected_combine,
+                streams,
+                hidden,
+                4096,
+                4,
+            )
+            expected_pair = hc.run_combine_norm(
+                state, block, injection.contiguous(), weights, eps=1e-6, plan=live.plan
+            )
+            allocated = torch.cuda.memory_allocated(device)
+            graph.replay()
+            torch.cuda.synchronize(device)
+            assert torch.cuda.memory_allocated(device) == allocated
+            for actual, expected in zip(
+                outputs, (expected_silu, expected_combine, *expected_pair), strict=True
+            ):
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+            torch.testing.assert_close(merged, before, rtol=0, atol=0)
+
+    check(1, 12)
+    freeze_kernel_resolution()
+    try:
+        for rows in (4, 16):
+            for padding in (3, 12, 28):
+                check(rows, padding)
+    finally:
+        unfreeze_kernel_resolution()
+
+
+def test_projection_stride_alias_checks_cover_last_live_row() -> None:
+    """An output alias in a strided source's final row must fail closed."""
+    device = require_sm120()
+    binding = _allocate_binding(device=device, tokens=2, lowrank=8)
+    storage = torch.empty(80, device=device, dtype=torch.bfloat16)
+    projected = storage.as_strided((2, 8), (64, 1))
+    live = binding.plan.bind(
+        normalized=binding.normalized_capacity,
+        bottleneck=storage[64:80].view(2, 8),
+        block_input=binding.block_input_capacity,
+    )
+    with pytest.raises(ValueError, match="must not overlap"):
+        hc.run_scaled_silu(projected, binding=live)
+    with pytest.raises(ValueError, match="unit column stride"):
+        hc.run_scaled_silu(
+            torch.empty(2, 16, device=device, dtype=torch.bfloat16)[:, ::2],
+            binding=binding,
+        )
+
+
+@pytest.mark.parametrize("streams", [1, 3, 4, 8])
+def test_scaled_silu_preserves_triton_finite_bf16_bit_patterns(streams: int) -> None:
+    from b12x.norm.hyperconnection import _cute, _kernels
+
+    device = require_sm120()
+    patterns = torch.arange(65536, device=device, dtype=torch.int32).to(torch.int16)
+    values = patterns.view(torch.bfloat16)
+    values = values[torch.isfinite(values)].view(-1, 256)
+    oracle = torch.empty_like(values)
+    actual = torch.empty_like(values)
+    _kernels._scaled_silu_launch(values, oracle, streams, 256)
+    _cute.scaled_silu(values, actual, streams=streams)
+    torch.testing.assert_close(actual, oracle, rtol=0, atol=0)
+
+
+def test_projection_readers_address_rows_beyond_int32_elements() -> None:
+    """Only the two live rows are initialized in the wide projection owner."""
+    device = require_sm120()
+    stride, lowrank, streams = (1 << 31) + 32, 8, 4
+    storage = torch.empty(stride + 16, device=device, dtype=torch.bfloat16)
+    projected = storage.as_strided((2, lowrank), (stride, 1))
+    injection = storage.as_strided((2, streams), (stride, 1), storage_offset=8)
+    projected.normal_()
+    injection.normal_()
+    binding = _allocate_binding(device=device, tokens=2, lowrank=lowrank)
+    state = torch.randn(2, streams * 2560, device=device, dtype=torch.bfloat16)
+    block = torch.randn(2, 2560, device=device, dtype=torch.bfloat16)
+    weight = torch.randn(streams * 2560, device=device, dtype=torch.bfloat16)
+    expected_silu = hc.run_scaled_silu(projected.contiguous(), binding=binding).clone()
+    expected = hc.run_combine_norm(
+        state, block, injection.contiguous(), weight, eps=1e-6, plan=binding.plan
+    )
+    actual_silu = hc.run_scaled_silu(projected, binding=binding)
+    actual = hc.run_combine_norm(
+        state, block, injection, weight, eps=1e-6, plan=binding.plan
+    )
+    torch.testing.assert_close(actual_silu, expected_silu, rtol=0, atol=0)
+    for value, oracle in zip(actual, expected, strict=True):
+        torch.testing.assert_close(value, oracle, rtol=0, atol=0)
+
+
 def test_production_entry_point_never_falls_back_to_torch_on_cpu() -> None:
     binding = _allocate_binding(device="cpu", tokens=1, hidden_size=64, lowrank=16)
     state = torch.zeros((1, 256), dtype=torch.bfloat16)
@@ -681,7 +819,7 @@ def test_cute_reference_helpers_reuse_binaries_across_live_counts(
     keys_by_name = {str(key[0]): key for key in compile_keys}
     assert len(compile_keys) == 5
     assert keys_by_name["norm"][2:] == (streams, hidden_size)
-    assert keys_by_name["silu"][2:] == (streams,)
+    assert keys_by_name["silu"][2:] == (streams, lowrank)
     assert keys_by_name["gate"][2:] == (streams, hidden_size)
     assert keys_by_name["combine"][2:] == (streams, hidden_size)
     assert keys_by_name["combine_norm"][2:] == (streams, hidden_size)
