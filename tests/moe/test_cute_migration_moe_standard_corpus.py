@@ -1603,12 +1603,36 @@ def test_standard_moe_glm53_m8_split_route_compute_live_graph_oracle(
     assert len(case.scratch_plan._prewarmed_dynamic_launches) == 4
     assert fused_moe_impl._M8_ROUTE_PACK_KERNEL_CACHE
 
-    compiled_before = {
-        key: id(value) for key, value in fused_moe_impl._DYNAMIC_KERNEL_CACHE.items()
-    }
     route_pack_before = {
         key: id(value)
         for key, value in fused_moe_impl._M8_ROUTE_PACK_KERNEL_CACHE.items()
+    }
+    compute_artifact_ids = {
+        id(launch)
+        for kind, _dtype, launch in case.scratch_plan._prewarmed_dynamic_launches
+        if kind == "compute"
+    }
+    observed_compute_macs: list[int] = []
+    wrapped_compute_artifacts = 0
+    for cache_key, artifact in tuple(
+        fused_moe_impl._DYNAMIC_KERNEL_CACHE.items()
+    ):
+        if id(artifact) not in compute_artifact_ids:
+            continue
+
+        def record_compute_launch(*args, _artifact=artifact, **kwargs):
+            observed_compute_macs.append(int(args[-2]))
+            return _artifact(*args, **kwargs)
+
+        monkeypatch.setitem(
+            fused_moe_impl._DYNAMIC_KERNEL_CACHE,
+            cache_key,
+            record_compute_launch,
+        )
+        wrapped_compute_artifacts += 1
+    assert wrapped_compute_artifacts == len(compute_artifact_ids) == 2
+    compiled_before = {
+        key: id(value) for key, value in fused_moe_impl._DYNAMIC_KERNEL_CACHE.items()
     }
     monkeypatch.setenv("B12X_DYNAMIC_SPLIT_COMPUTE_MAC", "112")
     from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
@@ -1642,6 +1666,8 @@ def test_standard_moe_glm53_m8_split_route_compute_live_graph_oracle(
         for key, value in fused_moe_impl._M8_ROUTE_PACK_KERNEL_CACHE.items()
     } == route_pack_before
     assert launch_plan.dynamic_launch_config.split_compute_mac == 224
+    assert observed_compute_macs
+    assert set(observed_compute_macs) == {224}
     _assert_oracle(
         case.binding.output,
         changed_reference,
