@@ -96,7 +96,10 @@ def _cases():
     )
 
 
-@pytest.mark.parametrize("migration", ("subset", "missing", "undeclared", "settings"))
+@pytest.mark.parametrize("migration", (
+    "subset", "missing", "undeclared", "settings", "boolean_contract",
+    "float_contract", "boolean_schema", "legacy_subset",
+))
 def test_candidate_contract_migration_reuses_only_exact_recorded_candidates(
     tmp_path, migration,
 ) -> None:
@@ -116,6 +119,16 @@ def test_candidate_contract_migration_reuses_only_exact_recorded_candidates(
     original.generate(context, progress=NullProgressReporter(), checkpoints=checkpoints)
     saved = checkpoints.load("test.attention", _cases()[0].case_id)
     calls.clear()
+    changes = {
+        "boolean_contract": {"candidate_contract_version": True},
+        "float_contract": {"candidate_contract_version": 1.0},
+        "boolean_schema": {"schema_version": True},
+        "legacy_subset": {"schema_version": 1},
+    }.get(migration)
+    if changes is not None:
+        for case in _cases():
+            payload = checkpoints.load("test.attention", case.case_id)
+            checkpoints.save("test.attention", case.case_id, {**payload, **changes})
 
     def reduced_factory(group_id, cases, context):
         session = factory(group_id, cases, context)

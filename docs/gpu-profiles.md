@@ -210,6 +210,13 @@ run. After an interruption, rerun the command with the same `--work-dir`; the
 number or ordinals of identical GPUs may change without invalidating completed
 measurements.
 
+Checkpoints use one compact JSON file per measurement case, with atomic
+replacement and independent writes from measurement workers. Existing indented
+JSON checkpoints remain readable. Resume does not rewrite compatible records
+solely to change formatting. These files are local working evidence; embedded
+profiles contain the shared decision DAG rather than the measurement corpus.
+See [representation and generation measurements](gpu-policy-efficiency.md).
+
 No `--components` argument is needed for a full device profile; the default is
 all registered components. `--components` exists only for targeted development
 and resume diagnostics. A subset run automatically merges into an existing
@@ -229,6 +236,11 @@ measurement case and candidate IDs, and timing settings. `source_revision` is
 provenance rather than a measurement input, so committing an identical source
 tree or extending a corpus does not discard unrelated measurements. A cached
 sampling protocol may satisfy a weaker requested protocol, but not the reverse.
+Precision-selection providers additionally bind measurements to source and
+toolchain fingerprints. Dense GEMM includes that identity in its case IDs; MoE
+stores `precision_source_toolchain_sha256`. The MoE fingerprint includes the
+generation package, so generation-source changes invalidate its automatic
+precision measurements even when the checkpoint encoding remains compatible.
 Discrete sweep checkpoints also carry a component-owned candidate-contract
 version. A fully compatible allocation group skips session setup and candidate
 enumeration even after unrelated source changes or a commit. Providers must

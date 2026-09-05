@@ -234,7 +234,7 @@ class DiscreteSweepGenerator:
         self._cases = tuple(cases)
         self._benchmark_factory = benchmark_factory
         self._coverage = FrozenMapping(coverage)
-        self._candidate_contract_version = int(candidate_contract_version)
+        self._candidate_contract_version = candidate_contract_version
         self._subset_reuse_contract_versions = tuple(subset_reuse_contract_versions)
         self._nearest_range_bounds = dict(nearest_range_bounds or {})
         self._candidate_tie_breaker = candidate_tie_breaker
@@ -251,8 +251,8 @@ class DiscreteSweepGenerator:
             raise ValueError("sweep case query fields differ from the component schema")
         if len({case.case_id for case in self._cases}) != len(self._cases):
             raise ValueError("sweep case IDs must be unique")
-        if self._candidate_contract_version <= 0:
-            raise ValueError("candidate_contract_version must be positive")
+        if type(candidate_contract_version) is not int or candidate_contract_version <= 0:
+            raise ValueError("candidate_contract_version must be a positive integer")
         if any(
             type(version) is not int or not 0 < version < self._candidate_contract_version
             for version in self._subset_reuse_contract_versions
@@ -396,15 +396,23 @@ class DiscreteSweepGenerator:
     ) -> _CachedSweepMeasurements | None:
         cached = checkpoints.load(self.component_id, case.case_id)
         schema_version = None if cached is None else cached.get("schema_version")
+        contract_version = (
+            None if cached is None else cached.get("candidate_contract_version")
+        )
         if (
             cached is None
+            or type(schema_version) is not int
             or schema_version not in (1, 2)
             or not context.checkpoint_metadata_matches(cached.get("generation"))
             or cached.get("case_id") != case.case_id
             or (
                 schema_version == 2
-                and cached.get("candidate_contract_version") not in (
-                    self._candidate_contract_version, *self._subset_reuse_contract_versions,
+                and (
+                    type(contract_version) is not int
+                    or contract_version not in (
+                        self._candidate_contract_version,
+                        *self._subset_reuse_contract_versions,
+                    )
                 )
             )
         ):
@@ -434,7 +442,9 @@ class DiscreteSweepGenerator:
             candidate_ids=candidate_ids,
             measurements=measurements,
             checkpoint_schema_version=int(schema_version),
-            candidate_contract_version=cached.get("candidate_contract_version"),
+            candidate_contract_version=(
+                cast(int, contract_version) if schema_version == 2 else None
+            ),
         )
 
     def _checkpoint_is_current(

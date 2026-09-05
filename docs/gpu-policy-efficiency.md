@@ -1,8 +1,9 @@
-# GPU policy representation and search
+# GPU policy representation and generation
 
-Implemented: lossless decision-DAG serialization and GQA search over distinct
-execution configurations. Runtime policies retain exact device matching,
-explicit coverage, validation, override precedence, and plan-time resolution.
+Implemented: lossless decision-DAG serialization, GQA search over distinct
+execution configurations, and compact JSON checkpoints. Runtime policies retain
+exact device matching, explicit coverage, validation, override precedence, and
+plan-time resolution.
 The fixed timing protocol and MoE search remain unchanged.
 
 ## Mathematical model
@@ -41,27 +42,27 @@ solve separate parts of this problem:
 ## Representation qualification
 
 Qualified against all three embedded profiles at source revision
-`46220c2b1064bce736fd3c58ddd4eadcaf13337e`. The benchmark compares canonical
+`f9986fa6f94faf7317f9a13433791f229618e8ed`. The benchmark compares canonical
 accepted path predicates, selected configs, leaf names, and evidence. It also
-checks 10,782 covered query witnesses, including range endpoints. Unit tests
+checks 8,694 covered query witnesses, including range endpoints. Unit tests
 exercise holes, missing fields, defaults, Boolean/integer distinctions,
 malformed references, excessive depth, and heavily shared graphs.
 
 | Representation | Recompressed bytes | Unique nodes | Retained decoder allocations |
 |---|---:|---:|---:|
-| Nested tree | 307,792 | 93,619 | 55.7 MB |
-| Shared DAG | 209,427 | 19,939 | 12.8 MB |
-| DAG with common guards hoisted | 175,455 | 11,783 | 10.7 MB |
+| Nested tree | 308,821 | 93,648 | 55.7 MB |
+| Shared DAG | 210,443 | 19,969 | 12.8 MB |
+| DAG with common guards hoisted | 176,476 | 11,813 | 10.8 MB |
 
-The checked-in gzip assets total 174,810 bytes versus 307,795 bytes for the
-baseline assets. Their uncompressed JSON totals 2,828,908 versus 15,311,419
+The checked-in gzip assets total 176,484 bytes versus 308,822 bytes for the
+baseline assets. Their uncompressed JSON totals 2,838,222 versus 15,316,551
 bytes. These asset sizes differ slightly from the table because the benchmark
 reserializes all alternatives with the same canonical JSON writer.
 
-Five fresh-process imports had median policy import times of 0.777 s for the
-baseline and 0.146 s for the implemented encoding. Median process RSS was
-102.7 MiB and 37.8 MiB, respectively. Direct lookup over the fixed witness
-corpus had medians of 1.95 and 1.66 microseconds per query. These are CPU
+Five fresh-process imports had median policy import times of 0.743 s for the
+baseline and 0.142 s for the implemented encoding. Median process RSS was
+102.0 MiB and 37.8 MiB, respectively. Direct lookup over the fixed witness
+corpus had medians of 1.69 and 1.31 microseconds per query. These are CPU
 measurements; policy lookup does not occur during GPU replay.
 
 The runtime decoder accepts both nested trees and DAG format 1. Component query
@@ -104,11 +105,64 @@ allocation delta was zero; minimum cosine was 0.9999913 and maximum relative
 L2 error was 0.0047807. This is targeted GPU qualification, not a GPU run of the
 entire 14,400-case corpus.
 
+Qualified: spawned workers on two 188-SM Max-Q GPUs completed the same 32 cases
+as eight allocation groups. All 64 production plans passed correctness with
+zero replay allocation. The minimum cosine and maximum relative L2 matched the
+single-GPU qualification above. A complete resume reproduced the full artifact
+in 3.53 ms with GPU-session entry prohibited. The physical devices were
+`GPU-a0816187-68b2-b679-587f-0e56bac804f5` and
+`GPU-9c204557-77b4-7ffb-c9f2-effcb51d054a`. This run verifies parallel generation
+and resume; its idle-to-active clock transition does not qualify a latency or
+generation-throughput comparison.
+
 GQA declares compatible subset migration from candidate contract 1. A copied
 four-case baseline checkpoint set retained eight exact recorded candidate
 measurements, preserving their complete records and source provenance, with
 GPU measurement calls prohibited. A second resume succeeded with session entry
 prohibited. Other candidate-contract changes retain their invalidation behavior.
+
+## Checkpoint representation
+
+Implemented: checkpoints use compact, deterministic JSON with atomic per-record
+replacement. Paths, payload schemas, compatibility checks, and independent
+worker writes retain their existing contracts. Existing indented JSON files
+remain readable and are not rewritten during resume.
+
+Qualified: the 174,399-record measurement corpus was copied through each writer
+on the same ext4 filesystem as the source checkpoints. Canonical record digests
+match exactly across the complete corpus. Timed writes include source reads and
+digest computation; random-lookup times are the median of three complete passes
+with warm filesystem caches.
+
+| Representation | Logical bytes | Allocated bytes | Write seconds | Lookup seconds |
+|---|---:|---:|---:|---:|
+| Indented JSON | 816,096,347 | 1,188,511,744 | 22.412 | 3.698 |
+| Compact JSON | 588,192,014 | 926,629,888 | 13.391 | 3.552 |
+| Gzip JSON, level 1 | 180,632,422 | 714,338,304 | 18.595 | 5.034 |
+
+Compact JSON reduces logical bytes by 27.9% and allocated bytes by 22.0% while
+preserving the atomic-file storage model. Per-file gzip saves more space but
+increases lookup and bulk-resume cost; it is not enabled.
+
+Three complete copies in alternating format order measured indented JSON writes
+at 22.412, 22.314, and 22.228 s, and compact JSON at 13.391, 14.064, and 13.718 s.
+The median write-wall-time reduction is 38.5%. This is a checkpoint-storage
+measurement, not a measurement of complete GPU profile generation.
+
+Research-only: SQLite prototypes intern generation metadata and store either
+compact JSON or level-1 DEFLATE records. On ext4, rollback journals with
+`synchronous=FULL` committed only 6,293 and 6,308 records, respectively, within
+each 60-second write budget. The completed prefixes passed exact record
+comparison and database integrity checks. A separate reader timed out after
+five seconds during sustained writes. These commits have stronger power-loss
+durability than the JSON writer, which uses atomic rename without `fsync`;
+their times are not a comparison at equal durability.
+
+A complete RAM-filesystem study demonstrated that compressed SQLite can reduce
+allocated storage to 307,609,600 bytes, but it does not establish SSD write
+performance. WAL was not tested: the installed SQLite 3.50.4 predates the
+[upstream WAL-reset corruption fix](https://www.sqlite.org/wal.html).
+The database prototypes are not production checkpoint backends.
 
 ## Sampling and timing alternatives
 
@@ -139,9 +193,12 @@ regret alone is insufficient.
 Reusing CUDA event objects in four GQA cases saved less than 1% of timing wall
 time. Capturing existing graph replays inside an outer graph failed with
 `cudaErrorStreamCaptureUnsupported`; the runtime timing implementation is
-unchanged. The equivalent MoE timing experiment aborts inside CUTLASS 4.6.2
-`build_module` for `(E,K,N,top_k,tokens)=(256,2048,64,8,1)`, including in the main
-checkout. Its failure occurs before comparative measurements.
+unchanged. The equivalent MoE timing experiment aborts with SIGABRT inside
+CUTLASS 4.6.2 `build_module` for `(E,K,N,top_k,tokens)=(256,2048,64,8,1)`, including
+in the main checkout. It also aborts after integration onto
+`f9986fa6f94faf7317f9a13433791f229618e8ed` on GPU
+`GPU-a0816187-68b2-b679-587f-0e56bac804f5`. Its failure occurs before comparative
+measurements.
 
 Coarse/full MoE result reuse is not implemented. `_stage_query_inputs` seeds
 activations from the first uncached route for a query. Skipping a balanced or
@@ -157,7 +214,7 @@ qualification host; the commands recreate the studies in a fresh output director
 
 ```bash
 python -m benchmarks.benchmark_policy_representation \
-  --baseline-repo /path/to/46220c2b-checkout --repetitions 5 \
+  --baseline-repo /path/to/f9986fa6-checkout --repetitions 5 \
   --output /tmp/policy-study/representation.json
 python -m benchmarks.benchmark_gqa_search_space \
   --device 0 --output /tmp/policy-study/gqa-search.json
@@ -165,6 +222,11 @@ python -m benchmarks.benchmark_gqa_generation \
   --device 0 --repetitions 3 --output /tmp/policy-study/gqa-generation.json
 python -m benchmarks.benchmark_gqa_generation --qualify-layouts \
   --device 0 --repetitions 1 --output /tmp/policy-study/gqa-qualification.json
+python -m benchmarks.benchmark_gqa_generation --qualify-layouts \
+  --devices 4 5 --repetitions 1 --output /tmp/policy-study/gqa-parallel.json
+python -m benchmarks.benchmark_checkpoint_storage \
+  --source /path/to/checkpoints --output-dir /var/tmp/checkpoint-study \
+  --repetitions 3 --max-write-seconds 60
 python -m benchmarks.benchmark_profile_sampling \
   --checkpoints /path/to/checkpoints/moe.decode \
   --output /tmp/policy-study/sampling.json
@@ -173,7 +235,7 @@ python -m benchmarks.benchmark_gqa_profile_timing \
 python -m pytest -q -p no:cacheprovider tests/policy
 ```
 
-Policy tests: 239 passed; the baseline catalog consistency test fails because
+Policy tests: 277 passed; the baseline catalog consistency test fails because
 the planned `sequence.kda_prefill` op has no registration. The installed
 environment does not contain Ruff. No compiler, GPU clocks, existing checkpoint
 corpus, or main-checkout files were modified for this study.

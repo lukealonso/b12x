@@ -53,7 +53,9 @@ class CheckpointStore:
         path.parent.mkdir(parents=True, exist_ok=True)
         temporary = path.with_suffix(f"{path.suffix}.tmp-{os.getpid()}")
         temporary.write_text(
-            json.dumps(payload, indent=2, sort_keys=True, allow_nan=False) + "\n",
+            json.dumps(
+                payload, separators=(",", ":"), sort_keys=True, allow_nan=False,
+            ) + "\n",
             encoding="utf-8",
         )
         os.replace(temporary, path)
