@@ -270,13 +270,14 @@ def test_cute_migration_dense_grouped_fused_quant_gpu_oracle_and_graph() -> None
     torch.testing.assert_close(out, expected, rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("m", [4, 16])
-def test_cute_migration_mxfp8_quant_gpu_oracle_and_graph(m: int) -> None:
+@pytest.mark.parametrize("m", [1, 4, 8, 9, 16])
+@pytest.mark.parametrize("k", [128, 640, 2560, 6144])
+def test_cute_migration_mxfp8_quant_gpu_oracle_and_graph(m: int, k: int) -> None:
     require_b12x()
     generator = torch.Generator(device="cuda").manual_seed(46_100 + m)
     source = (
         torch.randn(
-            (m, 128),
+            (m, k),
             generator=generator,
             dtype=torch.bfloat16,
             device="cuda",
@@ -284,7 +285,7 @@ def test_cute_migration_mxfp8_quant_gpu_oracle_and_graph(m: int) -> None:
         / 4
     ).contiguous()
     expected = quantize_mxfp8_rows_torch(source)
-    actual = empty_mxfp8_rows_for_dense_gemm(m, 128, device="cuda")
+    actual = empty_mxfp8_rows_for_dense_gemm(m, k, device="cuda")
     values = actual.values
     scale_rows = actual.scale_rows
     scale_mma = actual.scale_mma
@@ -340,6 +341,32 @@ def test_cute_migration_mxfp8_quant_gpu_oracle_and_graph(m: int) -> None:
         rtol=0,
         atol=0,
     )
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_mxfp8_decode_quant_finite_bit_patterns_match_scalar(dtype) -> None:
+    from b12x._lib.quant.mxfp8_rows import _get_compiled_mxfp8_rows_quant
+
+    source = torch.arange(65536, device="cuda", dtype=torch.int32)
+    source = source.to(torch.int16).view(dtype).view(8, 8192)
+    source.masked_fill_(~torch.isfinite(source), 0)
+    reference = empty_mxfp8_rows_for_dense_gemm(8, 8192, device="cuda")
+    actual = empty_mxfp8_rows_for_dense_gemm(8, 8192, device="cuda")
+    for storage in (reference, actual):
+        for tensor in (storage.values, storage.scale_rows, storage.scale_mma):
+            tensor.view(torch.uint8).fill_(0xA5)
+    scalar = _get_compiled_mxfp8_rows_quant(8192, dtype, 0, 256, "linear")
+    scalar(source, reference.values, reference.scale_rows, reference.scale_mma)
+    quantize_mxfp8_rows_cute(
+        source, actual.values, actual.scale_rows, actual.scale_mma
+    )
+    for name in ("values", "scale_rows", "scale_mma"):
+        torch.testing.assert_close(
+            getattr(actual, name).view(torch.uint8),
+            getattr(reference, name).view(torch.uint8),
+            atol=0,
+            rtol=0,
+        )
 
 
 def test_cute_migration_mxfp8_quant_trellis_native_mma_order() -> None:
