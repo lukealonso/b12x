@@ -8,6 +8,7 @@ read-only and both arms use the identical source atoms, scales, and rotations.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from pathlib import Path
 
@@ -27,7 +28,13 @@ def main():
     parser.add_argument("--layer", type=int, default=1)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--max-tokens", type=int, default=16)
-    parser.add_argument("--block-m", type=int, default=8, choices=(8, 32, 48, 64))
+    parser.add_argument("--block-m", type=int, default=8, choices=(8, 32, 48, 64, 96, 128))
+    parser.add_argument(
+        "--time-iters",
+        type=int,
+        default=0,
+        help="when > 0, time the graph replay of each width (median of this many iterations)",
+    )
     parser.add_argument(
         "--m-values",
         default="1,2,4,8,16,1536",
@@ -117,6 +124,7 @@ def main():
         ).to(torch.int32)
         routing = torch.softmax(torch.randn((m, 16), device="cuda"), dim=-1)
         outputs = {}
+        timings: dict[int, float] = {}
         for width, (weights, plan, scratch, output, _) in runtimes.items():
             binding = fused_moe.bind(
                 plan,
@@ -137,6 +145,22 @@ def main():
             torch.cuda.synchronize()
             torch.testing.assert_close(replay_output, eager, rtol=0, atol=0)
             outputs[width] = eager
+            if args.time_iters > 0:
+                for _ in range(3):
+                    graph.replay()
+                torch.cuda.synchronize()
+                samples = []
+                for _ in range(args.time_iters):
+                    begin = torch.cuda.Event(enable_timing=True)
+                    end = torch.cuda.Event(enable_timing=True)
+                    begin.record()
+                    graph.replay()
+                    end.record()
+                    end.synchronize()
+                    samples.append(begin.elapsed_time(end) * 1000.0)
+                samples.sort()
+                timings[width] = samples[len(samples) // 2]
+            del graph
         reference = outputs[384]
         difference = outputs[256] - reference
         record = {
@@ -151,6 +175,17 @@ def main():
                 ).item()
             ),
             "graph_eager_exact": True,
+        }
+        if timings:
+            record["graph_replay_us"] = {str(w): round(t, 1) for w, t in timings.items()}
+            record["block_m"] = args.block_m
+        # Digests let runs with different route blocks be compared for
+        # bit-identical outputs without keeping the tensors.
+        record["output_sha256"] = {
+            str(width): hashlib.sha256(
+                tensor.contiguous().view(torch.uint8).cpu().numpy().tobytes()
+            ).hexdigest()[:16]
+            for width, tensor in outputs.items()
         }
         records.append(record)
         print(json.dumps(record), flush=True)
