@@ -48,7 +48,7 @@ def is_qwen_geometry(
         and int(kv_heads) > 0
         and int(q_heads) % int(kv_heads) == 0
         and int(head_dim) == HEAD_DIM
-        and int(selection_width) == SELECTION_WIDTH
+        and int(selection_width) >= SELECTION_WIDTH
         and int(block_n) == BLOCK_N
         and splits > 0
         and splits <= NUM_SPLITS

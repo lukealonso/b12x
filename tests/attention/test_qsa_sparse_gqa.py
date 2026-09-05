@@ -15,6 +15,112 @@ from b12x.attention.qsa._contract import _target_splits
 from ..conftest import require_b12x as require_sm120
 
 
+@pytest.mark.parametrize("heads", [6, 12, 24])
+@pytest.mark.parametrize("splits", [1, 16, 32, 64])
+def test_split_merge_matches_softmax_with_empty_heads_and_changed_graph_inputs(
+    heads: int,
+    splits: int,
+) -> None:
+    from b12x.attention.paged._selected_forward import launch_sparse_gqa_merge
+
+    device = require_sm120()
+    torch.manual_seed(20260905)
+    partials = torch.randn(16, splits, heads, 256, device=device)
+    lse = torch.randn(16, splits, heads, device=device) * 8
+    lse[:, 1::3] = -torch.inf
+    lse[0, :, 0] = -torch.inf
+    output = torch.empty(16, heads, 256, dtype=torch.bfloat16, device=device)
+
+    for rows in (1, 4, 16):
+
+        def launch() -> None:
+            launch_sparse_gqa_merge(
+                partial_output=partials[:rows],
+                partial_lse=lse[:rows],
+                output=output[:rows],
+                rows=rows,
+                splits=splits,
+            )
+
+        launch()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            launch()
+        for _ in range(2):
+            partials.mul_(0.75)
+            lse[:, :, -1].add_(2)
+            graph.replay()
+            probabilities = torch.softmax(lse[:rows].double(), dim=1).nan_to_num()
+            expected = (partials[:rows].double() * probabilities[..., None]).sum(1)
+            torch.testing.assert_close(
+                output[:rows].double(),
+                expected,
+                rtol=4e-3,
+                atol=3e-5,
+            )
+            assert torch.count_nonzero(output[0, 0]) == 0
+            assert torch.count_nonzero(output[:rows, -1]) > 0
+
+
+@pytest.mark.parametrize("heads", [6, 12, 24])
+def test_cooperative_merge_preserves_order_bitwise_under_changed_graph_inputs(
+    monkeypatch,
+    heads: int,
+) -> None:
+    """Tiling head dimensions cannot change the split-pair reduction tree."""
+    from b12x.attention.paged import _selected_forward as implementation
+    from b12x._lib.runtime_control import (
+        freeze_kernel_resolution,
+        unfreeze_kernel_resolution,
+    )
+
+    device = require_sm120()
+    torch.manual_seed(20260905)
+    partials = torch.randn(64, 64, heads, 256, device=device)
+    lse = torch.randn(64, 64, heads, device=device) * 8
+    output = torch.empty(64, heads, 256, device=device, dtype=torch.bfloat16)
+    original = implementation._SparseGqaMergeKernel
+    candidate = implementation._ShapeAdaptiveSparseGqaMergeKernel
+    graphs = {}
+    try:
+        for label, kernel in (("serial", original), ("cooperative", candidate)):
+            monkeypatch.setattr(implementation, "_MERGE_KERNEL", kernel)
+            implementation.clear_caches()
+
+            def launch(rows, splits):
+                implementation.launch_sparse_gqa_merge(
+                    partial_output=partials[:rows, :splits].contiguous(),
+                    partial_lse=lse[:rows, :splits].contiguous(),
+                    output=output[:rows],
+                    rows=rows,
+                    splits=splits,
+                )
+
+            launch(1, 64)
+            freeze_kernel_resolution("cooperative QSA merge live rows/splits")
+            for rows, splits in ((1, 64), (4, 32), (16, 16), (4, 1), (64, 16)):
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    launch(rows, splits)
+                graphs[label, rows, splits] = graph
+            unfreeze_kernel_resolution()
+        for rows, splits in ((1, 64), (4, 32), (16, 16), (4, 1), (64, 16)):
+            for _ in range(3):
+                partials.normal_()
+                lse.normal_()
+                lse[:, 1::3] = -torch.inf
+                lse[0, :, 0] = -torch.inf
+                graphs["serial", rows, splits].replay()
+                expected = output[:rows].clone()
+                graphs["cooperative", rows, splits].replay()
+                torch.testing.assert_close(output[:rows], expected, rtol=0, atol=0)
+                assert torch.count_nonzero(output[0, 0]) == 0
+                assert torch.count_nonzero(output[:rows, -1]) > 0
+    finally:
+        unfreeze_kernel_resolution()
+        implementation.clear_caches()
+
+
 def test_qsa_caps_do_not_gate_architecture_or_tensor_parallel_layout() -> None:
     values = dict(
         device="cuda:0",

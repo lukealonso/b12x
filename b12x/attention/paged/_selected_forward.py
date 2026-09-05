@@ -61,8 +61,8 @@ _LOG2_E = 1.4426950408889634
 _LOCK = RLock()
 _KERNEL_CACHE: dict[tuple[object, ...], Callable[..., None]] = {}
 _WARMED: dict[tuple[object, ...], Callable[..., None]] = {}
-_MERGE_CACHE: dict[tuple[int, int, int], Callable[..., None]] = {}
-_MERGE_WARMED: dict[tuple[int, int, int], Callable[..., None]] = {}
+_MERGE_CACHE: dict[tuple[int, int, int, str], Callable[..., None]] = {}
+_MERGE_WARMED: dict[tuple[int, int, int, str], Callable[..., None]] = {}
 
 
 def _add(left: Float32, right: Float32) -> Float32:
@@ -132,8 +132,12 @@ class _SelectedPositionPagedForwardKernel:
         page_size: int,
         key_strides: tuple[int, int, int],
         value_strides: tuple[int, int, int],
+        selection_width: int = _SELECTION_WIDTH,
     ) -> None:
         self.q_heads = int(q_heads)
+        self.selection_width = int(selection_width)
+        if self.selection_width < _SELECTION_WIDTH:
+            raise ValueError("selected-position capacity must cover the QSA selection")
         self.kv_heads = int(kv_heads)
         self.heads_per_kv = self.q_heads // self.kv_heads
         self.kv_is_fp8 = bool(kv_is_fp8)
@@ -363,11 +367,11 @@ class _SelectedPositionPagedForwardKernel:
         column = thread
         if column < Int32(self.tile_n):
             selected_column = tile * Int32(self.tile_n) + column
-            valid = request_valid & (selected_column < Int32(_SELECTION_WIDTH))
+            valid = request_valid & (selected_column < Int32(self.selection_width))
             logical_position = Int64(-1)
             if valid:
                 selected_offset = row.to(Int64) * Int64(
-                    _SELECTION_WIDTH
+                    self.selection_width
                 ) + selected_column.to(Int64)
                 logical_position = selected_positions[selected_offset].to(Int64)
                 valid = (logical_position >= Int64(0)) & (
@@ -713,7 +717,7 @@ class _SelectedPositionPagedForwardKernel:
         )
         softmax.reset()
 
-        tile_count = Int32((_SELECTION_WIDTH + self.tile_n - 1) // self.tile_n)
+        tile_count = Int32((self.selection_width + self.tile_n - 1) // self.tile_n)
         tiles_per_split = (tile_count - split + splits - Int32(1)) // splits
         self._mma_selected_tile(
             split,
@@ -915,27 +919,198 @@ class _SparseGqaMergeKernel:
         if denominator > Float32(0.0):
             inverse = Float32(1.0) / denominator
 
-        dimension = warp_id
-        for _ in cutlass.range_constexpr(_HEAD_DIM // _WARPS):
-            local_total = Float32(0.0)
+        allocator = cutlass.utils.SmemAllocator()
+        shared_weights = allocator.allocate_tensor(
+            Float32,
+            layout=cute.make_layout((_NUM_SPLITS,), stride=(1,)),
+            byte_alignment=16,
+        )
+        if warp_id == Int32(0):
             for slot in cutlass.range_constexpr(_NUM_SPLITS // 32):
-                split = lane + Int32(slot * 32)
+                shared_weights[lane + Int32(slot * 32)] = weights[slot]
+        cute.arch.sync_threads()
+
+        # Adjacent lanes load adjacent head dimensions. Preserve the original
+        # split-pair accumulation and ascending butterfly reduction order.
+        for tile in cutlass.range_constexpr(_HEAD_DIM // _THREADS):
+            dimension = thread_i + Int32(tile * _THREADS)
+            partials = cute.make_rmem_tensor((32,), Float32)
+            for split_lane in cutlass.range_constexpr(32):
+                total = Float32(0.0)
+                for slot in cutlass.range_constexpr(_NUM_SPLITS // 32):
+                    split = Int32(split_lane + slot * 32)
+                    if split < splits:
+                        offset = (
+                            (row_i * splits.to(Int64) + split.to(Int64))
+                            * Int64(self.q_heads)
+                            + head_i
+                        ) * Int64(_HEAD_DIM) + dimension.to(Int64)
+                        total += Float32(partial_output[offset]) * Float32(
+                            shared_weights[split]
+                        )
+                partials[split_lane] = total
+            for stage in cutlass.range_constexpr(5):
+                for group in cutlass.range_constexpr(32 // (2 << stage)):
+                    left = group * (2 << stage)
+                    right = left + (1 << stage)
+                    partials[left] = Float32(partials[left]) + Float32(partials[right])
+            output_offset = (row_i * Int64(self.q_heads) + head_i) * Int64(
+                _HEAD_DIM
+            ) + dimension.to(Int64)
+            output[output_offset] = BFloat16(Float32(partials[0]) * inverse)
+
+
+class _CooperativeSparseGqaMergeKernel(_SparseGqaMergeKernel):
+    """Distribute each ordered split reduction across four warps and dimension tiles."""
+
+    @cute.jit
+    def __call__(
+        self,
+        partial_output: cute.Pointer,
+        partial_lse: cute.Pointer,
+        output: cute.Pointer,
+        rows: Int32,
+        splits: Int32,
+        stream: cuda.CUstream,
+    ) -> None:
+        self.kernel(partial_output, partial_lse, output, splits).launch(
+            grid=(self.q_heads, rows, _HEAD_DIM // 32),
+            block=(_THREADS, 1, 1),
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        partial_output: cute.Pointer,
+        partial_lse: cute.Pointer,
+        output: cute.Pointer,
+        splits: Int32,
+    ) -> None:
+        query_head, row, tile = cute.arch.block_idx()
+        thread, _, _ = cute.arch.thread_idx()
+        lane = Int32(thread) % Int32(32)
+        warp = Int32(thread) // Int32(32)
+        row_i, head_i = Int64(row), Int64(query_head)
+        weights = cute.make_rmem_tensor((2,), Float32)
+        maximum = Float32(-Float32.inf)
+        for slot in cutlass.range_constexpr(2):
+            split = lane + Int32(slot * 32)
+            weight = Float32(-Float32.inf)
+            if split < splits:
+                offset = (row_i * splits.to(Int64) + split.to(Int64)) * Int64(
+                    self.q_heads
+                ) + head_i
+                weight = Float32(partial_lse[offset])
+            weights[slot] = weight
+            maximum = fmax(maximum, weight)
+        maximum = warp_reduce(maximum, fmax)
+        denominator = Float32(0.0)
+        for slot in cutlass.range_constexpr(2):
+            weight = Float32(0.0)
+            if weights[slot] > Float32(-Float32.inf):
+                weight = _exp2_approx(
+                    (Float32(weights[slot]) - maximum) * Float32(_LOG2_E)
+                )
+            weights[slot] = weight
+            denominator += weight
+        denominator = warp_reduce(denominator, _add)
+        inverse = Float32(0.0)
+        if denominator > Float32(0.0):
+            inverse = Float32(1.0) / denominator
+
+        allocator = cutlass.utils.SmemAllocator()
+        shared_weights = allocator.allocate_tensor(
+            Float32,
+            layout=cute.make_layout((64,), stride=(1,)),
+            byte_alignment=16,
+        )
+        shared_partials = allocator.allocate_tensor(
+            Float32,
+            layout=cute.make_layout((4, 32), stride=(32, 1)),
+            byte_alignment=16,
+        )
+        if warp == Int32(0):
+            for slot in cutlass.range_constexpr(2):
+                shared_weights[lane + Int32(slot * 32)] = weights[slot]
+        cute.arch.sync_threads()
+
+        dimension = Int64(tile) * Int64(32) + lane.to(Int64)
+        partials = cute.make_rmem_tensor((8,), Float32)
+        for local in cutlass.range_constexpr(8):
+            total = Float32(0.0)
+            for slot in cutlass.range_constexpr(2):
+                split = warp * Int32(8) + Int32(local + slot * 32)
                 if split < splits:
                     offset = (
                         (row_i * splits.to(Int64) + split.to(Int64))
                         * Int64(self.q_heads)
                         + head_i
-                    ) * Int64(_HEAD_DIM) + dimension.to(Int64)
-                    local_total += Float32(partial_output[offset]) * Float32(
-                        weights[slot]
+                    ) * Int64(_HEAD_DIM) + dimension
+                    total += Float32(partial_output[offset]) * Float32(
+                        shared_weights[split]
                     )
-            total = warp_reduce(local_total, _add)
-            if lane == Int32(0):
-                output_offset = (row_i * Int64(self.q_heads) + head_i) * Int64(
-                    _HEAD_DIM
-                ) + dimension.to(Int64)
-                output[output_offset] = BFloat16(total * inverse)
-            dimension += Int32(_WARPS)
+            partials[local] = total
+        # Pair s with s+32; ascending butterfly stages 0..2 stay warp-local.
+        for stage in cutlass.range_constexpr(3):
+            for group in cutlass.range_constexpr(8 // (2 << stage)):
+                left = group * (2 << stage)
+                partials[left] = Float32(partials[left]) + Float32(
+                    partials[left + (1 << stage)]
+                )
+        shared_partials[warp, lane] = partials[0]
+        cute.arch.sync_threads()
+        if warp == Int32(0):
+            # Stages 3 and 4 join the four warp-owned contiguous groups.
+            column = lane
+            low = Float32(shared_partials[0, column]) + Float32(
+                shared_partials[1, column]
+            )
+            high = Float32(shared_partials[2, column]) + Float32(
+                shared_partials[3, column]
+            )
+            dimension = Int64(tile) * Int64(32) + column.to(Int64)
+            offset = (row_i * Int64(self.q_heads) + head_i) * Int64(
+                _HEAD_DIM
+            ) + dimension
+            output[offset] = BFloat16((low + high) * inverse)
+
+
+class _ShapeAdaptiveSparseGqaMergeKernel:
+    """Trade split parallelism for independent query rows in one compiled callable."""
+
+    def __init__(self, *, q_heads: int) -> None:
+        self.q_heads = q_heads
+        self.serial = _SparseGqaMergeKernel(q_heads=q_heads)
+        self.cooperative = _CooperativeSparseGqaMergeKernel(q_heads=q_heads)
+
+    @cute.jit
+    def __call__(
+        self,
+        partial_output: cute.Pointer,
+        partial_lse: cute.Pointer,
+        output: cute.Pointer,
+        rows: Int32,
+        splits: Int32,
+        stream: cuda.CUstream,
+    ) -> None:
+        # Independent query rows supply parallelism without multiplying CTAs
+        # across head dimensions. Both branches preserve the same reduction tree.
+        if rows > splits:
+            self.serial.kernel(partial_output, partial_lse, output, splits).launch(
+                grid=(self.q_heads, rows, 1),
+                block=(_THREADS, 1, 1),
+                stream=stream,
+            )
+        else:
+            self.cooperative.kernel(partial_output, partial_lse, output, splits).launch(
+                grid=(self.q_heads, rows, _HEAD_DIM // 32),
+                block=(_THREADS, 1, 1),
+                stream=stream,
+            )
+
+
+_MERGE_KERNEL = _ShapeAdaptiveSparseGqaMergeKernel
 
 
 def _cache_key(
@@ -946,6 +1121,7 @@ def _cache_key(
     *,
     direct_output: bool,
     kv_warps: int,
+    selection_width: int = _SELECTION_WIDTH,
 ) -> tuple[object, ...]:
     device_index = query.device.index
     if device_index is None:
@@ -961,6 +1137,7 @@ def _cache_key(
         tuple(map(int, value_cache.stride()[:3])),
         bool(direct_output),
         int(kv_warps),
+        int(selection_width),
     )
 
 
@@ -993,6 +1170,7 @@ def _compile(
     request_ids: torch.Tensor,
     direct_output: bool,
     kv_warps: int,
+    selection_width: int = _SELECTION_WIDTH,
 ) -> tuple[tuple[object, ...], Callable[..., None]]:
     key = _cache_key(
         query,
@@ -1001,6 +1179,7 @@ def _compile(
         request_ids,
         direct_output=direct_output,
         kv_warps=kv_warps,
+        selection_width=selection_width,
     )
     with _LOCK:
         cached = _KERNEL_CACHE.get(key)
@@ -1017,6 +1196,7 @@ def _compile(
             value_strides,
             direct_output,
             kv_warps,
+            selection_width,
         ) = key
         request_id_type = Int32 if request_id_bits == 32 else Int64
         kv_type = Float8E4M3FN if kv_dtype == torch.float8_e4m3fn else BFloat16
@@ -1031,6 +1211,7 @@ def _compile(
             page_size=page_size,
             key_strides=key_strides,
             value_strides=value_strides,
+            selection_width=selection_width,
         )
         with torch.cuda.device(query.device):
             raise_if_kernel_resolution_frozen(
@@ -1061,7 +1242,7 @@ def _compile(
                 current_cuda_stream(),
                 compile_spec=KernelCompileSpec.from_key(
                     "attention.paged.selected_forward",
-                    2,
+                    3,
                     (
                         q_heads,
                         kv_heads,
@@ -1072,6 +1253,7 @@ def _compile(
                         value_strides,
                         direct_output,
                         kv_warps,
+                        selection_width,
                     ),
                     labels=(
                         "q_heads",
@@ -1083,6 +1265,7 @@ def _compile(
                         "value_strides",
                         "direct_output",
                         "kv_warps",
+                        "selection_width",
                     ),
                 ),
             )
@@ -1096,6 +1279,7 @@ def precompile_sparse_gqa_split(
     key_cache: torch.Tensor,
     value_cache: torch.Tensor,
     request_ids: torch.Tensor,
+    selection_width: int = _SELECTION_WIDTH,
 ) -> None:
     """Compile a supported specialization without touching runtime storage."""
     with torch.cuda.device(query.device):
@@ -1110,6 +1294,7 @@ def precompile_sparse_gqa_split(
             request_ids=request_ids,
             direct_output=False,
             kv_warps=2,
+            selection_width=selection_width,
         )
 
 
@@ -1137,6 +1322,7 @@ def launch_sparse_gqa_split(
         request_ids,
         direct_output=False,
         kv_warps=2,
+        selection_width=int(selected_positions.shape[1]),
     )
     with torch.cuda.device(query.device):
         capturing = torch.cuda.is_current_stream_capturing()
@@ -1156,6 +1342,7 @@ def launch_sparse_gqa_split(
                 request_ids=request_ids,
                 direct_output=False,
                 kv_warps=2,
+                selection_width=int(selected_positions.shape[1]),
             )
         request_id_type = Int32 if request_ids.dtype == torch.int32 else Int64
         kv_type = Float8E4M3FN if key_cache.dtype == torch.float8_e4m3fn else BFloat16
@@ -1217,6 +1404,7 @@ def launch_selected_paged_gqa_direct(
         request_ids,
         direct_output=True,
         kv_warps=kv_warps,
+        selection_width=int(selected_positions.shape[1]),
     )
     with torch.cuda.device(query.device):
         capturing = torch.cuda.is_current_stream_capturing()
@@ -1236,6 +1424,7 @@ def launch_selected_paged_gqa_direct(
                 request_ids=request_ids,
                 direct_output=True,
                 kv_warps=kv_warps,
+                selection_width=int(selected_positions.shape[1]),
             )
         request_id_type = Int32 if request_ids.dtype == torch.int32 else Int64
         kv_type = Float8E4M3FN if key_cache.dtype == torch.float8_e4m3fn else BFloat16
@@ -1286,7 +1475,7 @@ def launch_sparse_gqa_merge(
     if device_index is None:
         device_index = torch.cuda.current_device()
     q_heads = int(partial_output.shape[2])
-    key = (int(device_index), q_heads, _HEAD_DIM)
+    key = (int(device_index), q_heads, _HEAD_DIM, _MERGE_KERNEL.__name__)
     with torch.cuda.device(partial_output.device):
         capturing = torch.cuda.is_current_stream_capturing()
         with _LOCK:
@@ -1298,7 +1487,7 @@ def launch_sparse_gqa_merge(
                 "CUDA graph capture"
             )
         if raw is None:
-            kernel = _SparseGqaMergeKernel(q_heads=q_heads)
+            kernel = _MERGE_KERNEL(q_heads=q_heads)
             raise_if_kernel_resolution_frozen(
                 "cute.compile",
                 target=kernel,
@@ -1314,7 +1503,7 @@ def launch_sparse_gqa_merge(
                 current_cuda_stream(),
                 compile_spec=KernelCompileSpec.from_key(
                     "attention.qsa.sparse_gqa_merge",
-                    4,
+                    9,
                     key[1:],
                 ),
             )

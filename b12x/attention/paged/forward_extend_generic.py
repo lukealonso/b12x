@@ -3226,6 +3226,7 @@ class PagedForwardKernel:
         page_size: int,
         key_strides: tuple[int, int, int],
         value_strides: tuple[int, int, int],
+        selection_width: int = 2051,
     ):
         """Build the selected-position ABI of the paged forward engine.
 
@@ -3245,6 +3246,7 @@ class PagedForwardKernel:
             page_size=page_size,
             key_strides=key_strides,
             value_strides=value_strides,
+            selection_width=selection_width,
         )
 
     def __init__(
