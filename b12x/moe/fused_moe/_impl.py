@@ -1944,7 +1944,7 @@ def _dynamic_external_route_plan_supported(
         and 0 < int(routed_rows) <= _DYNAMIC_EXTERNAL_ROUTE_PLAN_MAX_ROWS
         and dynamic_route_mode == "grouped"
         and not deterministic_output
-        and _dynamic_work_source() == _DYNAMIC_WORK_SOURCE_DEFAULT
+        and _dynamic_work_source() in {_DYNAMIC_WORK_SOURCE_DEFAULT, "persistent_grid"}
     )
 
 
@@ -2699,6 +2699,15 @@ def _refresh_dynamic_workspace_scales(
 ) -> None:
     a1_src_ptr = a1_gscale.data_ptr()
     a2_src_ptr = a2_gscale.data_ptr()
+    # Canonical per-expert vectors can be consumed directly. Their owner stays
+    # alive through the binding, and live value updates need no staging copy.
+    if (
+        workspace.input_gs.data_ptr() == a1_src_ptr
+        and workspace.down_input_scale.data_ptr() == a2_src_ptr
+    ):
+        workspace.input_gs_src_ptr = a1_src_ptr
+        workspace.down_input_scale_src_ptr = a2_src_ptr
+        return
     if (
         force
         or not input_scales_static
@@ -3007,8 +3016,23 @@ def _build_tp_moe_fp4_binding_from_views(
     if plan.implementation == "dynamic":
         if plan.dynamic_physical_tiles is None or plan.dynamic_task_capacity is None:
             raise RuntimeError("dynamic TP MoE binding plan is missing capacities")
-        tensors["input_gs"].copy_(experts.a1_gscale.expand(plan.weight_E))
-        tensors["down_input_scale"].copy_(experts.a2_gscale.expand(plan.weight_E))
+        direct_scales = all(
+            scale.dtype == torch.float32
+            and scale.device == a.device
+            and scale.numel() == plan.weight_E
+            and scale.is_contiguous()
+            for scale in (experts.a1_gscale, experts.a2_gscale)
+        )
+        # Bind maps views only. Scalar/strided scales are expanded into the
+        # caller's scratch by the run-time refresh before their consumer.
+        input_gs = (
+            experts.a1_gscale.view(plan.weight_E)
+            if direct_scales else tensors["input_gs"]
+        )
+        down_input_scale = (
+            experts.a2_gscale.view(plan.weight_E)
+            if direct_scales else tensors["down_input_scale"]
+        )
         view_kwargs = _packed_input_binding_views(
             packed_input=tensors["packed_input"],
             packed_input_scale=tensors["packed_input_scale"],
@@ -3034,8 +3058,8 @@ def _build_tp_moe_fp4_binding_from_views(
             materialized_intermediate=tensors["materialized_intermediate"],
             expert_write_rows=tensors["expert_write_rows"],
             expert_tile_base=tensors["expert_tile_base"],
-            input_gs=tensors["input_gs"],
-            down_input_scale=tensors["down_input_scale"],
+            input_gs=input_gs,
+            down_input_scale=down_input_scale,
             pair_head=tensors["pair_head"],
             producers_done_count=tensors["producers_done_count"],
             all_work_published=tensors["all_work_published"],
