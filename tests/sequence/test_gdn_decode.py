@@ -92,9 +92,7 @@ def _make_case(
         "a": _randn((max_tokens, value_heads), device=device),
         "b": _randn((max_tokens, value_heads), device=device),
         "z": _randn((max_tokens, value_heads, 128), device=device),
-        "A_log": _randn(
-            (value_heads,), device=device, dtype=a_log_dtype, scale=0.1
-        ),
+        "A_log": _randn((value_heads,), device=device, dtype=a_log_dtype, scale=0.1),
         "dt_bias": _randn(
             (value_heads,), device=device, dtype=dt_bias_dtype, scale=0.1
         ),
@@ -123,7 +121,180 @@ def _make_case(
     return binding, tensors
 
 
-def _reference(binding: gdn.Binding, state: torch.Tensor) -> torch.Tensor:
+def test_live_strided_views_are_correct_and_graph_replay_safe() -> None:
+    device = require_sm120()
+    full_binding, tensors = _make_case(
+        device=device,
+        query_lengths=(3, 2),
+        activation="silu",
+    )
+    caps = full_binding.plan.caps
+    token_capacity = 5
+    sequence_capacity = 2
+
+    qkvz = torch.full(
+        (token_capacity, caps.packed_qkv_width + caps.value_heads * 128),
+        31.0,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    mixed_qkv = qkvz[:, : caps.packed_qkv_width]
+    z = qkvz[:, caps.packed_qkv_width :].view(token_capacity, caps.value_heads, 128)
+    mixed_qkv.copy_(tensors["mixed_qkv"][:token_capacity])
+    z.copy_(tensors["z"][:token_capacity])
+
+    ba = torch.full(
+        (token_capacity, 2 * caps.value_heads),
+        31.0,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    b, a = ba.chunk(2, dim=-1)
+    b.copy_(tensors["b"][:token_capacity])
+    a.copy_(tensors["a"][:token_capacity])
+
+    output_storage = torch.full(
+        (token_capacity, caps.value_heads * 128 + 8),
+        31.0,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    output = output_storage[:, : caps.value_heads * 128].view(
+        token_capacity, caps.value_heads, 128
+    )
+    state_index_storage = torch.full(
+        (sequence_capacity, caps.state_index_columns + 2),
+        -1,
+        dtype=torch.int32,
+        device=device,
+    )
+    state_indices = state_index_storage[:, : caps.state_index_columns]
+    state_indices.copy_(tensors["state_indices"][:sequence_capacity])
+
+    live_tensors = {
+        **tensors,
+        "mixed_qkv": mixed_qkv,
+        "a": a,
+        "b": b,
+        "z": z,
+        "query_start_loc": tensors["query_start_loc"][: sequence_capacity + 1],
+        "num_accepted_tokens": tensors["num_accepted_tokens"][:sequence_capacity],
+        "state_indices": state_indices,
+        "output": output,
+    }
+    binding = gdn.bind(full_binding.plan, **live_tensors)
+    assert binding.mixed_qkv.stride(0) == qkvz.stride(0)
+    assert binding.a.stride(0) == ba.stride(0)
+    assert binding.b.stride(0) == ba.stride(0)
+    assert binding.output.stride(0) == output_storage.stride(0)
+    assert binding.state_indices.stride(0) == state_index_storage.stride(0)
+
+    initial_state = binding.recurrent_state.clone()
+    expected_state = initial_state.clone()
+    expected = _reference(binding, expected_state)
+
+    gdn.run(full_binding)
+    contiguous_output = full_binding.output[:token_capacity].clone()
+    contiguous_state = full_binding.recurrent_state.clone()
+    binding.recurrent_state.copy_(initial_state)
+    gdn.run(binding)
+    torch.cuda.synchronize(device)
+    binding.recurrent_state.copy_(initial_state)
+    output.fill_(31.0)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        gdn.run(gdn.bind(full_binding.plan, **live_tensors))
+    binding.recurrent_state.copy_(initial_state)
+    output.fill_(31.0)
+    graph.replay()
+    torch.cuda.synchronize(device)
+
+    torch.testing.assert_close(output, expected, rtol=1e-2, atol=2e-2)
+    torch.testing.assert_close(output, contiguous_output, rtol=0, atol=0)
+    torch.testing.assert_close(
+        binding.recurrent_state, contiguous_state, rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        binding.recurrent_state, expected_state, rtol=1e-5, atol=2e-5
+    )
+    assert torch.count_nonzero(output_storage[:, -8:] != 31.0) == 0
+    assert torch.count_nonzero(state_index_storage[:, -2:] != -1) == 0
+
+
+def test_bounded_views_reuse_planned_kernels_and_validate_bound_counts(
+    monkeypatch,
+) -> None:
+    from b12x._lib.runtime_control import (
+        freeze_kernel_resolution,
+        unfreeze_kernel_resolution,
+    )
+    from b12x.sequence.gdn_decode import _kernels
+
+    device = require_sm120()
+    full_binding, tensors = _make_case(device=device, query_lengths=(4, 4))
+    initial_state = full_binding.recurrent_state.clone()
+    gdn.run(full_binding)
+
+    def reject_resolution(*args, **kwargs):
+        pytest.fail("Bound capacities must reuse warmed planned kernels")
+
+    for kernel in (
+        _kernels._reset_validation_kernel,
+        _kernels._validate_packed_metadata_kernel,
+        _kernels._validate_active_state_slots_kernel,
+        _kernels._gated_rmsnorm_kernel,
+    ):
+        monkeypatch.setattr(kernel, "_do_compile", reject_resolution)
+
+    freeze_kernel_resolution("Qwen GDN bounded-view replay qualification")
+    try:
+        for rows, requests, columns in ((1, 1, 1), (4, 1, 4), (8, 2, 4)):
+            live = dict(tensors)
+            for name in ("mixed_qkv", "a", "b", "z", "output"):
+                live[name] = tensors[name][:rows]
+            live["state_indices"] = tensors["state_indices"][:requests, :columns]
+            live["query_start_loc"] = tensors["query_start_loc"][: requests + 1]
+            live["num_accepted_tokens"] = tensors["num_accepted_tokens"][:requests]
+            live["query_start_loc"].copy_(
+                torch.arange(requests + 1, dtype=torch.int32, device=device)
+                * (rows // requests)
+            )
+            live["num_tokens"].fill_(rows)
+            live["num_seqs"].fill_(requests)
+            live["num_accepted_tokens"].fill_(1)
+            binding = gdn.bind(full_binding.plan, **live)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                gdn.run(gdn.bind(full_binding.plan, **live))
+
+            live["mixed_qkv"].mul_(0.75)
+            binding.recurrent_state.copy_(initial_state)
+            expected_state = initial_state.clone()
+            expected = _reference(binding, expected_state)
+            graph.replay()
+            torch.cuda.synchronize(device)
+            torch.testing.assert_close(binding.output, expected, rtol=1e-2, atol=2e-2)
+            torch.testing.assert_close(
+                binding.recurrent_state, expected_state, rtol=1e-5, atol=2e-5
+            )
+
+            # The count is legal for the plan but exceeds the bound allocation.
+            binding.num_tokens.fill_(rows + 1)
+            before_invalid = binding.recurrent_state.clone()
+            graph.replay()
+            torch.cuda.synchronize(device)
+            assert torch.isnan(binding.output).all()
+            torch.testing.assert_close(
+                binding.recurrent_state, before_invalid, rtol=0, atol=0
+            )
+    finally:
+        unfreeze_kernel_resolution()
+
+
+def _reference(
+    binding: gdn.Binding, state: torch.Tensor, *, scale: float | None = None
+) -> torch.Tensor:
     caps = binding.plan.caps
     return gdn.reference.decode(
         binding.mixed_qkv,
@@ -141,6 +312,7 @@ def _reference(binding: gdn.Binding, state: torch.Tensor) -> torch.Tensor:
         binding.num_tokens,
         key_heads=caps.key_heads,
         value_heads=caps.value_heads,
+        scale=scale,
         gate_activation=caps.gate_activation,
         qk_l2norm=caps.qk_l2norm,
     )
@@ -525,8 +697,10 @@ def test_v_by_k_padded_slot_layout_matches_transposed_mathematical_oracle() -> N
 
 
 @pytest.mark.parametrize("norm_dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("scale", [128**-0.5, 1.0])
 def test_qwen3_8_flash_next_output_norm_preserves_parameter_dtype_rounding(
     norm_dtype: torch.dtype,
+    scale: float,
 ) -> None:
     device = require_sm120()
     binding, _ = _make_case(
@@ -535,9 +709,9 @@ def test_qwen3_8_flash_next_output_norm_preserves_parameter_dtype_rounding(
         norm_dtype=norm_dtype,
     )
     state_reference = binding.recurrent_state.clone()
-    expected = _reference(binding, state_reference)
+    expected = _reference(binding, state_reference, scale=scale)
 
-    actual = gdn.run(binding, scale=1.0)
+    actual = gdn.run(binding, scale=scale)
     torch.cuda.synchronize(device)
     torch.testing.assert_close(actual, expected, rtol=1e-2, atol=2e-2)
     torch.testing.assert_close(
@@ -709,9 +883,7 @@ def test_rejected_draft_restarts_next_iteration_from_accepted_checkpoint() -> No
     binding.b.copy_(torch.randn_like(binding.b).mul_(0.2))
     binding.z.copy_(torch.randn_like(binding.z).mul_(0.2))
     state_reference = binding.recurrent_state.clone()
-    torch.testing.assert_close(
-        state_reference[1], accepted_checkpoint, rtol=0, atol=0
-    )
+    torch.testing.assert_close(state_reference[1], accepted_checkpoint, rtol=0, atol=0)
     expected = _reference(binding, state_reference)
     actual = gdn.run(binding)
     torch.cuda.synchronize(device)
@@ -774,9 +946,7 @@ def test_invalid_active_slot_poisons_output_without_state_mutation(
     bad_slot: int,
 ) -> None:
     device = require_sm120()
-    binding, _ = _make_case(
-        device=device, query_lengths=(1,), state_slots=2
-    )
+    binding, _ = _make_case(device=device, query_lengths=(1,), state_slots=2)
     binding.state_indices.fill_(bad_slot)
     before = binding.recurrent_state.clone()
     binding.output.fill_(13.0)
@@ -939,9 +1109,7 @@ def test_cuda_graph_replay_uses_device_counts_and_fixed_addresses() -> None:
         torch.tensor([1, 2], dtype=torch.int32, device=device)
     )
     binding.state_indices[:2].copy_(
-        torch.tensor(
-            [[0, 1, 4, 5], [2, 3, 6, 7]], dtype=torch.int32, device=device
-        )
+        torch.tensor([[0, 1, 4, 5], [2, 3, 6, 7]], dtype=torch.int32, device=device)
     )
     binding.mixed_qkv.copy_(torch.randn_like(binding.mixed_qkv).mul_(0.25))
     binding.a.copy_(torch.randn_like(binding.a).mul_(0.25))
@@ -1116,6 +1284,98 @@ def test_qwen_grouped_state_slot_offset_past_int32_boundary() -> None:
     del binding, recurrent_state, state_storage
     gc.collect()
     torch.cuda.empty_cache()
+
+
+@pytest.mark.parametrize("null_index", [None, -1, 0])
+def test_bounded_metadata_validation_preserves_error_bits_with_large_slot_ids(
+    null_index: int | None,
+) -> None:
+    from b12x.sequence.gdn_decode import _kernels as kernels
+
+    device = require_sm120()
+    starts = torch.empty(5, dtype=torch.int32, device=device)
+    accepted = torch.empty(4, dtype=torch.int32, device=device)
+    slot_storage = torch.empty(4, 8, dtype=torch.int64, device=device)
+    slots = slot_storage[:, :4]
+    sequences = torch.empty(1, dtype=torch.int32, device=device)
+    tokens = torch.empty_like(sequences)
+    table = torch.empty(32, dtype=torch.int64, device=device)
+    error = torch.empty(1, dtype=torch.int32, device=device)
+    expected_error = torch.empty_like(error)
+    generator = torch.Generator().manual_seed(20260905)
+    arguments = dict(
+        MAX_STATE_SLOTS=1 << 35,
+        HAS_NULL_STATE_INDEX=null_index is not None,
+        NULL_STATE_INDEX=-1 if null_index is None else null_index,
+        num_warps=1,
+        num_stages=1,
+    )
+    for sample in range(64):
+        if sample == 0:
+            starts.copy_(torch.tensor([0, 4, 7, 8, 8], device=device))
+            accepted.fill_(1)
+            slots.copy_(torch.arange(16, device=device).view(4, 4) + (1 << 33))
+            sequences.fill_(3)
+            tokens.fill_(8)
+        else:
+            starts.copy_(torch.randint(-1, 10, (5,), generator=generator))
+            accepted.copy_(torch.randint(0, 6, (4,), generator=generator))
+            selected = torch.randint(-2, 6, (4, 4), generator=generator)
+            selected = torch.where(selected > 2, selected + (1 << 33), selected)
+            slots.copy_(selected)
+            sequences.fill_((sample % 7) - 1)
+            tokens.fill_((sample % 12) - 1)
+        kernels._reset_validation_kernel[(1,)](
+            table,
+            expected_error,
+            TABLE_SIZE=32,
+            BLOCK=256,
+            num_warps=1,
+        )
+        kernels._validate_packed_metadata_kernel[(4,)](
+            starts,
+            accepted,
+            sequences,
+            tokens,
+            expected_error,
+            8,
+            4,
+            4,
+            num_warps=1,
+        )
+        kernels._validate_active_state_slots_kernel[(16,)](
+            starts,
+            accepted,
+            slots,
+            sequences,
+            table,
+            expected_error,
+            4,
+            4,
+            slots.stride(0),
+            slots.stride(1),
+            TABLE_SIZE=32,
+            **arguments,
+        )
+        error.fill_(127)
+        kernels._validate_bounded_packed_metadata_kernel[(1,)](
+            starts,
+            accepted,
+            slots,
+            sequences,
+            tokens,
+            error,
+            8,
+            4,
+            4,
+            slots.stride(0),
+            slots.stride(1),
+            BLOCK=16,
+            **arguments,
+        )
+        assert error.item() == expected_error.item(), (sample, null_index)
+        if sample == 0:
+            assert error.item() == 0
 
 
 def test_caps_accept_divisible_head_ratios_and_reject_invalid_capacity() -> None:
