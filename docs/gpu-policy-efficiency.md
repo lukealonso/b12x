@@ -200,11 +200,14 @@ in the main checkout. It also aborts after integration onto
 `GPU-a0816187-68b2-b679-587f-0e56bac804f5`. Its failure occurs before comparative
 measurements.
 
-Coarse/full MoE result reuse is not implemented. `_stage_query_inputs` seeds
-activations from the first uncached route for a query. Skipping a balanced or
-hot race can change the activation input later used for zipf/disjoint races.
-Deduplication there requires an explicit input-identity contract before it can
-preserve benchmark semantics.
+Coarse/full MoE result reuse is not implemented. Activation seeds depend on
+geometry, top-k, token count, and the base seed; they exclude the route pattern.
+The input cache therefore does not make activation values depend on which route
+is measured first. Reuse must account for qualification and timing semantics:
+screening can use an independent reference, other races select a reference from
+their candidate cohort, and automatic precision races retain paired samples and
+independent confirmation passes. Matching a case and config alone does not
+establish that those measurement contracts are equivalent.
 
 ## Reproduction
 
