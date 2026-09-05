@@ -160,6 +160,7 @@ class _CachedSweepMeasurements:
     candidate_ids: tuple[str, ...]
     measurements: tuple[SweepMeasurement, ...]
     checkpoint_schema_version: int
+    candidate_contract_version: int | None
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -204,7 +205,9 @@ class DiscreteSweepGenerator:
 
     Providers must bump ``candidate_contract_version`` when candidate
     enumeration or eligibility changes. Case IDs independently version the
-    measured corpus.
+    measured corpus. A provider may explicitly reuse a subset from earlier
+    contracts when the retained candidate IDs and measurement inputs are
+    unchanged; migration enumerates and verifies every retained candidate.
     """
 
     def __init__(
@@ -219,6 +222,7 @@ class DiscreteSweepGenerator:
         benchmark_factory: SweepBenchmarkFactory,
         coverage: Mapping[str, object],
         candidate_contract_version: int = 1,
+        subset_reuse_contract_versions: Sequence[int] = (),
         nearest_range_bounds: Mapping[str, tuple[int, int]] | None = None,
         candidate_tie_breaker: Callable[[SweepCandidate], int | str] | None = None,
     ) -> None:
@@ -231,6 +235,7 @@ class DiscreteSweepGenerator:
         self._benchmark_factory = benchmark_factory
         self._coverage = FrozenMapping(coverage)
         self._candidate_contract_version = int(candidate_contract_version)
+        self._subset_reuse_contract_versions = tuple(subset_reuse_contract_versions)
         self._nearest_range_bounds = dict(nearest_range_bounds or {})
         self._candidate_tie_breaker = candidate_tie_breaker
         if not self._cases:
@@ -248,6 +253,11 @@ class DiscreteSweepGenerator:
             raise ValueError("sweep case IDs must be unique")
         if self._candidate_contract_version <= 0:
             raise ValueError("candidate_contract_version must be positive")
+        if any(
+            type(version) is not int or not 0 < version < self._candidate_contract_version
+            for version in self._subset_reuse_contract_versions
+        ):
+            raise ValueError("subset reuse requires positive, earlier candidate contracts")
         if not frozenset(self._nearest_range_bounds) <= self._range_fields:
             raise ValueError("nearest range fields must also be range_fields")
 
@@ -337,7 +347,16 @@ class DiscreteSweepGenerator:
         candidate_ids = [candidate.candidate_id for candidate in candidates]
         if len(candidate_ids) != len(set(candidate_ids)):
             raise ValueError(f"candidate IDs are not unique for {case.case_id}")
-        if cached is not None and cached.candidate_ids == tuple(candidate_ids):
+        can_reuse = cached is not None and (
+            cached.candidate_ids == tuple(candidate_ids)
+            or (
+                cached.candidate_contract_version in self._subset_reuse_contract_versions
+                and set(candidate_ids) <= set(cached.candidate_ids)
+            )
+        )
+        if can_reuse:
+            by_id = {item.candidate.candidate_id: item for item in cached.measurements}
+            reused = tuple(by_id[candidate_id] for candidate_id in candidate_ids)
             checkpoints.save(
                 self.component_id,
                 case.case_id,
@@ -345,10 +364,10 @@ class DiscreteSweepGenerator:
                     case=case,
                     generation=cached.generation,
                     candidate_ids=candidate_ids,
-                    measurements=cached.measurements,
+                    measurements=reused,
                 ),
             )
-            return cached.measurements
+            return reused
 
         measurements = session.measure(case, candidates)
         measured_ids = [item.candidate.candidate_id for item in measurements]
@@ -384,8 +403,9 @@ class DiscreteSweepGenerator:
             or cached.get("case_id") != case.case_id
             or (
                 schema_version == 2
-                and cached.get("candidate_contract_version")
-                != self._candidate_contract_version
+                and cached.get("candidate_contract_version") not in (
+                    self._candidate_contract_version, *self._subset_reuse_contract_versions,
+                )
             )
         ):
             return None
@@ -414,13 +434,17 @@ class DiscreteSweepGenerator:
             candidate_ids=candidate_ids,
             measurements=measurements,
             checkpoint_schema_version=int(schema_version),
+            candidate_contract_version=cached.get("candidate_contract_version"),
         )
 
     def _checkpoint_is_current(
         self,
         cached: _CachedSweepMeasurements | None,
     ) -> bool:
-        return cached is not None and cached.checkpoint_schema_version == 2
+        return (
+            cached is not None and cached.checkpoint_schema_version == 2
+            and cached.candidate_contract_version == self._candidate_contract_version
+        )
 
     def _checkpoint_payload(
         self,
@@ -648,7 +672,7 @@ class DiscreteSweepGenerator:
                 "query_schema_version": self.query_schema_version,
                 "config_schema_version": self.config_schema_version,
                 "coverage": outcome.coverage,
-                "planner": decision_node_to_dict(self.build_planner(outcome.records)),
+                "planner": decision_node_to_dict(self.build_planner(outcome.records), compact=True),
             },
             evidence=outcome.evidence,
             completed_work_units=outcome.completed_work_units,

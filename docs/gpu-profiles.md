@@ -139,10 +139,45 @@ contracts. Shape-only and historical benchmark spellings remain accepted
 aliases, while `--list-models` prints one canonical name for each deduplicated
 model.
 
+## Planner encoding
+
+Implemented: component planners use a lossless decision DAG with shared configs
+and subtrees. Single-config components retain an unconditional leaf. Planning
+still performs exact scalar tests and disjoint inclusive range tests; missing
+coverage remains a miss. Binding and replay do not traverse the diagram.
+
+The serialized DAG has its own format version, independent of component query
+and config versions:
+
+```json
+{
+  "kind": "dag",
+  "schema_version": 1,
+  "configs": [{"backend": "cutedsl"}],
+  "nodes": [
+    {"kind": "leaf", "name": "qualified", "config": 0},
+    {"kind": "exact", "field": "dtype",
+     "branches": [{"value": "bfloat16", "node": 0}]}
+  ],
+  "root": 1
+}
+```
+
+Node references must point backward in the node table. Leaf config references
+index the config table. A default is an optional node index. The decoder rejects
+cycles, invalid references, unreachable entries, and paths deeper than 64 edges.
+Nested tree artifacts remain readable. Equal configs and nodes share immutable
+runtime objects; validation traverses each shared node once.
+
+Generation also hoists identical equality guards when every accepted path
+requires them and none of their occurrences has a default. It preserves scalar
+types, leaf names, evidence, and uncovered queries. This is exact compression;
+it does not infer coverage from neighboring geometries.
+
 ## Generation boundary
 
 One top-level command discovers every registered component, prints the complete
-work estimate, runs every provider, reduces measured races into decision trees,
+work estimate, runs every provider, reduces measured races into decision diagrams,
 validates the serialized profile, and optionally embeds the compact runtime
 payload:
 
@@ -203,6 +238,20 @@ candidate-ID comparison before being upgraded to this contract.
 Fixed-backend qualifications similarly persist the ordered probe case IDs and
 the qualified config, so changing either invalidates only that component's
 checkpoint.
+
+GQA candidate contract 2 races distinct decode schedules and workspace layouts.
+CTA budgets that produce identical tile geometry, chunk-page tables, chunk
+limits, work-item capacity, and partial-row capacity share one representative.
+The first enumerated representative retains the heuristic's preference. This
+equivalence applies only to single-token decode; verifier kernels can consume
+the CTA budget directly.
+
+GQA explicitly permits migration from candidate contract 1. Migration enumerates
+the retained candidates, requires each exact candidate ID in the compatible
+checkpoint, and retains that candidate's recorded measurement and provenance.
+It never assigns one candidate's timing to a different config. Other contract
+changes invalidate checkpoints unless the provider explicitly declares a
+compatible subset migration. Migrated checkpoints resume without enumeration.
 
 The built-in measured corpus covers common model geometries and TP sizes 1
 through 16,

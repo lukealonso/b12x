@@ -1019,7 +1019,8 @@ class DsaIndexerProfileGenerator:
                 "config_schema_version": self.config_schema_version,
                 "coverage": coverage,
                 "planner": decision_node_to_dict(
-                    _with_default_leaf(self._race.build_planner(records), default_leaf)
+                    _with_default_leaf(self._race.build_planner(records), default_leaf),
+                    compact=True,
                 ),
             },
             evidence={

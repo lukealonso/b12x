@@ -302,12 +302,7 @@ class ExactDecisionNode:
 
     @property
     def query_fields(self) -> frozenset[str]:
-        fields = {self.field}
-        for _, node in self.branches:
-            fields.update(node.query_fields)
-        if self.default is not None:
-            fields.update(self.default.query_fields)
-        return frozenset(fields)
+        return _decision_query_fields(self)
 
     def lookup(self, query: Mapping[str, object]) -> ProfileLeaf | None:
         value = query.get(self.field, _MISSING)
@@ -317,10 +312,7 @@ class ExactDecisionNode:
         return None if self.default is None else self.default.lookup(query)
 
     def iter_leaves(self) -> Iterator[ProfileLeaf]:
-        for _, node in self.branches:
-            yield from node.iter_leaves()
-        if self.default is not None:
-            yield from self.default.iter_leaves()
+        yield from _decision_leaves(self)
 
 
 @dataclass(frozen=True)
@@ -354,12 +346,7 @@ class RangeDecisionNode:
 
     @property
     def query_fields(self) -> frozenset[str]:
-        fields = {self.field}
-        for _, node in self.branches:
-            fields.update(node.query_fields)
-        if self.default is not None:
-            fields.update(self.default.query_fields)
-        return frozenset(fields)
+        return _decision_query_fields(self)
 
     def lookup(self, query: Mapping[str, object]) -> ProfileLeaf | None:
         value = query.get(self.field, _MISSING)
@@ -369,13 +356,37 @@ class RangeDecisionNode:
         return None if self.default is None else self.default.lookup(query)
 
     def iter_leaves(self) -> Iterator[ProfileLeaf]:
-        for _, node in self.branches:
-            yield from node.iter_leaves()
-        if self.default is not None:
-            yield from self.default.iter_leaves()
+        yield from _decision_leaves(self)
 
 
 DecisionNode = ProfileLeaf | ExactDecisionNode | RangeDecisionNode
+
+
+def _decision_nodes(root: DecisionNode) -> Iterator[DecisionNode]:
+    """Visit shared decision nodes once, preserving branch order."""
+    pending = [root]
+    visited: set[int] = set()
+    while pending:
+        node = pending.pop()
+        if id(node) in visited:
+            continue
+        visited.add(id(node))
+        yield node
+        if not isinstance(node, ProfileLeaf):
+            if node.default is not None:
+                pending.append(node.default)
+            pending.extend(child for _, child in reversed(node.branches))
+
+
+def _decision_query_fields(root: DecisionNode) -> frozenset[str]:
+    return frozenset(
+        node.field for node in _decision_nodes(root)
+        if not isinstance(node, ProfileLeaf)
+    )
+
+
+def _decision_leaves(root: DecisionNode) -> Iterator[ProfileLeaf]:
+    return (node for node in _decision_nodes(root) if isinstance(node, ProfileLeaf))
 
 
 @dataclass(frozen=True)

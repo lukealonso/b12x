@@ -96,6 +96,60 @@ def _cases():
     )
 
 
+@pytest.mark.parametrize("migration", ("subset", "missing", "undeclared", "settings"))
+def test_candidate_contract_migration_reuses_only_exact_recorded_candidates(
+    tmp_path, migration,
+) -> None:
+    calls, candidate_calls, session_calls = [], [], []
+    factory = _Factory(calls, candidate_calls, session_calls)
+    arguments = dict(
+        component_id="test.attention", query_schema_version=1, config_schema_version=1,
+        query_fields=("family", "rows"), range_fields=frozenset({"rows"}),
+        cases=_cases(), coverage={},
+    )
+    context = GenerationContext(
+        device=_DEVICE, device_ordinal=0, work_dir=tmp_path,
+        source_revision="measured-source", settings=GenerationSettings(),
+    )
+    checkpoints = CheckpointStore(tmp_path / "checkpoints")
+    original = DiscreteSweepGenerator(benchmark_factory=factory, **arguments)
+    original.generate(context, progress=NullProgressReporter(), checkpoints=checkpoints)
+    saved = checkpoints.load("test.attention", _cases()[0].case_id)
+    calls.clear()
+
+    def reduced_factory(group_id, cases, context):
+        session = factory(group_id, cases, context)
+        session._candidates = (
+            SweepCandidate.create({"backend": "unmeasured"})
+            if migration == "missing" else session._candidates[1],
+        )
+        return session
+
+    reduced = DiscreteSweepGenerator(
+        benchmark_factory=reduced_factory, candidate_contract_version=2,
+        subset_reuse_contract_versions=() if migration == "undeclared" else (1,),
+        **arguments,
+    )
+    if migration == "settings":
+        context = replace(context, settings=GenerationSettings(groups=6))
+    reduced.generate(context, progress=NullProgressReporter(), checkpoints=checkpoints)
+
+    upgraded = checkpoints.load("test.attention", _cases()[0].case_id)
+    assert upgraded["candidate_contract_version"] == 2
+    assert len(upgraded["candidate_ids"]) == 1
+    if migration == "subset":
+        assert calls == []
+        assert upgraded["measurements"] == saved["measurements"][1:]
+        assert upgraded["generation"] == saved["generation"]
+    else:
+        assert len(calls) == len(_cases())
+    enumerations = len(candidate_calls)
+    measurements = len(calls)
+    reduced.generate(context, progress=NullProgressReporter(), checkpoints=checkpoints)
+    assert len(candidate_calls) == enumerations
+    assert len(calls) == measurements
+
+
 def test_discrete_sweep_partitions_preserve_allocation_groups(tmp_path) -> None:
     calls = []
     candidate_calls = []

@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from b12x.policy.serialization import profile_from_dict
+from b12x.policy.decision_dag import encode_planner_dag
 
 from .contracts import (
     ComponentGenerator,
@@ -142,6 +143,10 @@ def runtime_profile_payload(profile: Mapping[str, object]) -> dict[str, object]:
     payload = strip_audit_fields(profile)
     if not isinstance(payload, dict):
         raise TypeError("runtime profile payload must be an object")
+    parsed = profile_from_dict(payload)
+    for component, parsed_component in zip(payload["components"], parsed.components, strict=True):
+        if parsed_component.planner is not None:
+            component["planner"] = encode_planner_dag(parsed_component.planner)
     profile_from_dict(payload)
     return payload
 

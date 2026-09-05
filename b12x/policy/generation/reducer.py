@@ -263,7 +263,11 @@ def synthesize_integer_axis_coverage(
     return tuple(synthesized)
 
 
-def decision_node_to_dict(node: DecisionNode) -> dict[str, object]:
+def decision_node_to_dict(node: DecisionNode, *, compact: bool = False) -> dict[str, object]:
+    if compact:
+        from b12x.policy.decision_dag import encode_planner_dag
+
+        return encode_planner_dag(node)
     if isinstance(node, ProfileLeaf):
         result: dict[str, object] = {
             "kind": "leaf",

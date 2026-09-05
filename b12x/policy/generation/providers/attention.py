@@ -70,6 +70,8 @@ class _AttentionGenerator(DiscreteSweepGenerator):
         benchmark_factory: SweepBenchmarkFactory | None,
         query_schema_version: int = 1,
         config_schema_version: int = 1,
+        candidate_contract_version: int = 1,
+        subset_reuse_contract_versions: Sequence[int] = (),
         nearest_range_bounds: Mapping[str, tuple[int, int]] | None = None,
     ) -> None:
         del corpus_name
@@ -77,6 +79,8 @@ class _AttentionGenerator(DiscreteSweepGenerator):
             component_id=component_id,
             query_schema_version=query_schema_version,
             config_schema_version=config_schema_version,
+            candidate_contract_version=candidate_contract_version,
+            subset_reuse_contract_versions=subset_reuse_contract_versions,
             query_fields=query_fields,
             range_fields=range_fields,
             cases=cases,
@@ -171,6 +175,8 @@ class GqaAttentionGenerator(_AttentionGenerator):
             benchmark_factory=benchmark_factory or GqaBenchmarkFactory(),
             query_schema_version=2,
             config_schema_version=2,
+            candidate_contract_version=2,
+            subset_reuse_contract_versions=(1,),
         )
 
 

@@ -1,0 +1,179 @@
+# GPU policy representation and search
+
+Implemented: lossless decision-DAG serialization and GQA search over distinct
+execution configurations. Runtime policies retain exact device matching,
+explicit coverage, validation, override precedence, and plan-time resolution.
+The fixed timing protocol and MoE search remain unchanged.
+
+## Mathematical model
+
+For a planned query `q`, let `C(q)` contain its legal execution configurations.
+For components with several scenarios, use the generator's existing geometric
+mean latency `T(q,c)` across those scenarios. The policy objective is low
+dispatch regret, not the smallest absolute latency across unrelated shapes:
+
+```text
+regret(q,c) = T(q,c) / min_{a in C(q)} T(q,a) - 1
+
+policy loss = sum_q weight(q) * log(1 + regret(q, policy(q)))
+              + complexity_penalty * representation_size(policy)
+```
+
+Runtime representation, candidate enumeration, and experimental query selection
+solve separate parts of this problem:
+
+- A shared decision DAG compresses an existing piecewise dispatch function
+  without changing its decisions or coverage. It shares suffixes and configs
+  and hoists universally required equality guards. It is not guaranteed to be
+  the globally smallest diagram. The underlying principle is shared decision
+  subfunctions, as in [decision-diagram reduction](https://www.cs.cmu.edu/~bryant/pubdir/ieeetc86.pdf).
+- Search should operate on equivalence classes of configurations that produce
+  the same execution. For GQA decode, identical tile geometry, complete chunk
+  tables, chunk limits, and workspace capacities define the implemented
+  equivalence. CTA budgets are excluded only after these results are fixed.
+- Approximate query selection should spend measurements where they reduce
+  expected dispatch regret, accounting for preparation and timing cost. A
+  geometric nearest-neighbor index alone does not establish that a neighboring
+  query has a legal or fast configuration. Conditional and categorical search
+  spaces also motivate model-based configurators such as
+  [SMAC](https://www.jmlr.org/papers/volume23/21-0888/21-0888.pdf).
+
+## Representation qualification
+
+Qualified against all three embedded profiles at source revision
+`46220c2b1064bce736fd3c58ddd4eadcaf13337e`. The benchmark compares canonical
+accepted path predicates, selected configs, leaf names, and evidence. It also
+checks 10,782 covered query witnesses, including range endpoints. Unit tests
+exercise holes, missing fields, defaults, Boolean/integer distinctions,
+malformed references, excessive depth, and heavily shared graphs.
+
+| Representation | Recompressed bytes | Unique nodes | Retained decoder allocations |
+|---|---:|---:|---:|
+| Nested tree | 307,792 | 93,619 | 55.7 MB |
+| Shared DAG | 209,427 | 19,939 | 12.8 MB |
+| DAG with common guards hoisted | 175,455 | 11,783 | 10.7 MB |
+
+The checked-in gzip assets total 174,810 bytes versus 307,795 bytes for the
+baseline assets. Their uncompressed JSON totals 2,828,908 versus 15,311,419
+bytes. These asset sizes differ slightly from the table because the benchmark
+reserializes all alternatives with the same canonical JSON writer.
+
+Five fresh-process imports had median policy import times of 0.777 s for the
+baseline and 0.146 s for the implemented encoding. Median process RSS was
+102.7 MiB and 37.8 MiB, respectively. Direct lookup over the fixed witness
+corpus had medians of 1.95 and 1.66 microseconds per query. These are CPU
+measurements; policy lookup does not occur during GPU replay.
+
+The runtime decoder accepts both nested trees and DAG format 1. Component query
+and config schema versions do not change. Generated full artifacts and embedded
+runtime artifacts both use compact planners. See
+[the serialization contract](gpu-profiles.md#planner-encoding).
+
+## GQA generation qualification
+
+Implemented: GQA candidate contract 2 selects the first representative of each
+decode execution class. It retains the complete config for validation and
+provenance. Verifier queries preserve CTA-budget distinctions because their
+kernel selection can consume that budget directly.
+
+The complete 14,400-case, 360-group corpus was enumerated on the 188-SM Max-Q
+device. Its 144,628 distinct serialized candidates reduce to 37,352 execution
+representatives: 74.17% fewer candidates to prepare, qualify, and time. Every
+original execution key has a retained representative; no measured performance
+or neighboring query was used to discard a candidate. Enumeration took
+300.5 s. This is a host-side search-space census, not a GPU timing sweep.
+
+The production generator was exercised on Qwen3.8 Flash Next geometry with 24 Q
+heads, 2 KV heads, 256-dimensional heads, batch capacities 1 and 8, and cache
+capacities 128 and 16,384. BF16 KV, separate caches, and 64-token pages formed
+the fixed four-case timing subset. Every case reduced from ten candidates to
+two, removing 32 of 40 preparation, correctness, and timing cycles.
+
+Three alternating-arm provider runs measured 2.198, 2.353, and 2.292 s for the
+baseline and 1.854, 1.900, and 1.847 s for candidate deduplication. The median
+reduction is 19.1%. These are diagnostic generation wall times on GPU UUID
+`GPU-ac6fcbb2-ae5f-231d-cc3e-e843c305baff`, an RTX PRO 6000 Blackwell Max-Q with
+188 SMs. Clocks varied and one baseline start was P3; these results do not
+qualify a kernel latency improvement under fixed clocks. All reported throttle
+masks were zero. Warmup, cold-L2 flushing, five groups of five replays, and
+correctness thresholds were identical between arms.
+
+Qualified: the 32-case extension across BF16/FP8 KV, separate/combined caches,
+and page sizes 64/128 passed all 64 measured production plans. Every replay
+allocation delta was zero; minimum cosine was 0.9999913 and maximum relative
+L2 error was 0.0047807. This is targeted GPU qualification, not a GPU run of the
+entire 14,400-case corpus.
+
+GQA declares compatible subset migration from candidate contract 1. A copied
+four-case baseline checkpoint set retained eight exact recorded candidate
+measurements, preserving their complete records and source provenance, with
+GPU measurement calls prohibited. A second resume succeeded with session entry
+prohibited. Other candidate-contract changes retain their invalidation behavior.
+
+## Sampling and timing alternatives
+
+Research-only: a Matérn-3/2 Gaussian-process sampler over log2 token capacity
+was compared with space-filling and winner-boundary sampling. It models relative
+log latency with a one-octave length scale and 2% observation noise. Its
+acquisition prioritizes uncertainty in the selected configuration's regret.
+Device, source revision, measurement protocol, candidate contract, and eligible
+candidate set are stratified; each observation contains all four route
+scenarios. No GPU results are inferred or added to checkpoints.
+
+The replay corpus contains 165,283 saved full-stage MoE records. Requiring
+complete scenarios and at least eight capacities per stratum leaves 14,336
+query points in 1,783 strata. At a half-query budget:
+
+| Selection method | Geometric-mean regret | P99 regret | Maximum regret |
+|---|---:|---:|---:|
+| Space-filling | 0.647% | 17.47% | 436.98% |
+| Winner-boundary refinement | 0.351% | 10.43% | 229.49% |
+| Gaussian-process sampling | 0.303% | 9.87% | 74.77% |
+
+These are counterfactual decisions evaluated against saved measurements, not
+independent GPU qualification. The large tail losses preclude enabling this
+sampler for profile generation. A useful sampler must account for support
+boundaries and validate its uncertainty against held-out measurements; average
+regret alone is insufficient.
+
+Reusing CUDA event objects in four GQA cases saved less than 1% of timing wall
+time. Capturing existing graph replays inside an outer graph failed with
+`cudaErrorStreamCaptureUnsupported`; the runtime timing implementation is
+unchanged. The equivalent MoE timing experiment aborts inside CUTLASS 4.6.2
+`build_module` for `(E,K,N,top_k,tokens)=(256,2048,64,8,1)`, including in the main
+checkout. Its failure occurs before comparative measurements.
+
+Coarse/full MoE result reuse is not implemented. `_stage_query_inputs` seeds
+activations from the first uncached route for a query. Skipping a balanced or
+hot race can change the activation input later used for zipf/disjoint races.
+Deduplication there requires an explicit input-identity contract before it can
+preserve benchmark semantics.
+
+## Reproduction
+
+Use the project Python environment from the candidate checkout. Raw evidence
+for the measurements above is under `/tmp/b12x-policy-efficiency.IT4SFh/` on the
+qualification host; the commands recreate the studies in a fresh output directory.
+
+```bash
+python -m benchmarks.benchmark_policy_representation \
+  --baseline-repo /path/to/46220c2b-checkout --repetitions 5 \
+  --output /tmp/policy-study/representation.json
+python -m benchmarks.benchmark_gqa_search_space \
+  --device 0 --output /tmp/policy-study/gqa-search.json
+python -m benchmarks.benchmark_gqa_generation \
+  --device 0 --repetitions 3 --output /tmp/policy-study/gqa-generation.json
+python -m benchmarks.benchmark_gqa_generation --qualify-layouts \
+  --device 0 --repetitions 1 --output /tmp/policy-study/gqa-qualification.json
+python -m benchmarks.benchmark_profile_sampling \
+  --checkpoints /path/to/checkpoints/moe.decode \
+  --output /tmp/policy-study/sampling.json
+python -m benchmarks.benchmark_gqa_profile_timing \
+  --device 0 --output /tmp/policy-study/gqa-timing.json
+python -m pytest -q -p no:cacheprovider tests/policy
+```
+
+Policy tests: 239 passed; the baseline catalog consistency test fails because
+the planned `sequence.kda_prefill` op has no registration. The installed
+environment does not contain Ruff. No compiler, GPU clocks, existing checkpoint
+corpus, or main-checkout files were modified for this study.

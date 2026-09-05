@@ -1042,7 +1042,7 @@ class MoeDecodeGenerator:
                 "qualified_fixed_query_points": qualified_fixed_query_points,
                 "runtime_query_points": len(records),
             },
-            "planner": decision_node_to_dict(planner),
+            "planner": decision_node_to_dict(planner, compact=True),
         }
         estimate = self.estimate(context)
         return ComponentGenerationResult(

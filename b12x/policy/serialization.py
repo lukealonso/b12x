@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 
 from .types import (
     ComponentProfile,
@@ -111,12 +111,17 @@ def _rule(value: object, *, component: str, index: int) -> ProfileRule:
     )
 
 
-def _planner_node(value: object, *, name: str, depth: int = 0) -> DecisionNode:
+def _planner_node(
+    value: object, *, name: str, depth: int = 0,
+    resolve_child: Callable[[object, str], DecisionNode] | None = None,
+) -> DecisionNode:
     if depth > 64:
         raise ValueError(f"{name} exceeds the maximum decision-tree depth")
     if not isinstance(value, Mapping):
         raise TypeError(f"{name} must be an object")
     kind = value.get("kind")
+    if kind == "dag" and resolve_child is None and depth == 0:
+        return _planner_dag(value, name=name)
     if kind == "leaf":
         data = _object(
             value,
@@ -128,9 +133,9 @@ def _planner_node(value: object, *, name: str, depth: int = 0) -> DecisionNode:
         if not isinstance(config, Mapping):
             raise TypeError(f"{name}.config must be an object")
         evidence = data.get("evidence")
-        return ProfileLeaf.create(
+        return ProfileLeaf(
             name=str(data["name"]),
-            config=config,
+            config=config if isinstance(config, FrozenMapping) else FrozenMapping(config),
             evidence=None if evidence is None else str(evidence),
         )
     if kind not in {"exact", "range"}:
@@ -143,15 +148,17 @@ def _planner_node(value: object, *, name: str, depth: int = 0) -> DecisionNode:
     )
     field = str(data["field"])
     branches = _sequence(data["branches"], name=f"{name}.branches")
+
+    def child(value: object, child_name: str) -> DecisionNode:
+        if resolve_child is not None:
+            return resolve_child(value, child_name)
+        return _planner_node(value, name=child_name, depth=depth + 1)
+
     default_value = data.get("default")
     default = (
         None
         if default_value is None
-        else _planner_node(
-            default_value,
-            name=f"{name}.default",
-            depth=depth + 1,
-        )
+        else child(default_value, f"{name}.default")
     )
     if kind == "exact":
         parsed_exact: list[tuple[object, DecisionNode]] = []
@@ -183,11 +190,7 @@ def _planner_node(value: object, *, name: str, depth: int = 0) -> DecisionNode:
                 for item in raw_values
             ):
                 raise TypeError(f"{branch_name} exact values must be scalars")
-            node = _planner_node(
-                branch_data["node"],
-                name=f"{branch_name}.node",
-                depth=depth + 1,
-            )
+            node = child(branch_data["node"], f"{branch_name}.node")
             parsed_exact.extend((item, node) for item in raw_values)
         return ExactDecisionNode(
             field=field,
@@ -209,11 +212,7 @@ def _planner_node(value: object, *, name: str, depth: int = 0) -> DecisionNode:
                     minimum=int(branch_data["minimum"]),
                     maximum=int(branch_data["maximum"]),
                 ),
-                _planner_node(
-                    branch_data["node"],
-                    name=f"{branch_name}.node",
-                    depth=depth + 1,
-                ),
+                child(branch_data["node"], f"{branch_name}.node"),
             )
         )
     return RangeDecisionNode(
@@ -221,6 +220,66 @@ def _planner_node(value: object, *, name: str, depth: int = 0) -> DecisionNode:
         branches=tuple(parsed_ranges),
         default=default,
     )
+
+
+def _planner_dag(value: object, *, name: str) -> DecisionNode:
+    data = _object(
+        value, name=name,
+        required=frozenset({"kind", "schema_version", "root", "configs", "nodes"}),
+    )
+    if type(data["schema_version"]) is not int or data["schema_version"] != 1:
+        raise ValueError(f"{name} has an unsupported decision-DAG schema version")
+    raw_configs = _sequence(data["configs"], name=f"{name}.configs")
+    configs = []
+    for index, config in enumerate(raw_configs):
+        if not isinstance(config, Mapping) or not config:
+            raise TypeError(f"{name}.configs[{index}] must be a non-empty object")
+        configs.append(FrozenMapping(config))
+    raw_nodes = _sequence(data["nodes"], name=f"{name}.nodes")
+    nodes: list[DecisionNode] = []
+    heights: list[int] = []
+    children: list[list[int]] = []
+    used_configs: set[int] = set()
+
+    def reference(value: object, size: int, field: str) -> int:
+        if type(value) is not int or not 0 <= value < size:
+            raise ValueError(f"{field} must reference an earlier node or an existing config")
+        return value
+
+    for index, raw_node in enumerate(raw_nodes):
+        node_name = f"{name}.nodes[{index}]"
+        if not isinstance(raw_node, Mapping):
+            raise TypeError(f"{node_name} must be an object")
+        payload = dict(raw_node)
+        references: list[int] = []
+
+        def resolve(value: object, field: str) -> DecisionNode:
+            child_id = reference(value, len(nodes), field)
+            references.append(child_id)
+            return nodes[child_id]
+
+        if payload.get("kind") == "leaf":
+            config_id = reference(payload.get("config"), len(configs), f"{node_name}.config")
+            used_configs.add(config_id)
+            payload["config"] = configs[config_id]
+        node = _planner_node(payload, name=node_name, resolve_child=resolve)
+        height = max((heights[child_id] + 1 for child_id in references), default=0)
+        if height > 64:
+            raise ValueError(f"{name} exceeds the maximum decision-tree depth")
+        nodes.append(node)
+        heights.append(height)
+        children.append(references)
+    root_id = reference(data["root"], len(nodes), f"{name}.root")
+    pending = [root_id]
+    reachable: set[int] = set()
+    while pending:
+        node_id = pending.pop()
+        if node_id not in reachable:
+            reachable.add(node_id)
+            pending.extend(children[node_id])
+    if len(reachable) != len(nodes) or used_configs != set(range(len(configs))):
+        raise ValueError(f"{name} contains unreachable nodes or configs")
+    return nodes[root_id]
 
 
 def _component(value: object, *, index: int) -> ComponentProfile:

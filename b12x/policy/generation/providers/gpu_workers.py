@@ -528,6 +528,20 @@ def _ceil_div(value: int, divisor: int) -> int:
     return (int(value) + int(divisor) - 1) // int(divisor)
 
 
+def _gqa_execution_key(
+    case: SweepCase, candidate: SweepCandidate,
+) -> tuple[tuple[str, object], ...]:
+    if case.query["mode"] != "decode" or case.query["query_len"] != 1:
+        return tuple(candidate.config.items())
+    # Decode consumes the resulting schedule and workspace. Verify kernels can
+    # also consume the CTA budget directly and must retain it in their key.
+    planning_budgets = {"graph_ctas_per_sm", "architecture_max_chunks_per_request"}
+    return tuple(
+        (field, value) for field, value in candidate.config.items()
+        if field not in planning_budgets
+    )
+
+
 class _GqaSession(AbstractContextManager["_GqaSession"]):
     def __init__(
         self,
@@ -622,7 +636,7 @@ class _GqaSession(AbstractContextManager["_GqaSession"]):
             if requested_split is not None
             else (None, False, True)
         )
-        candidates_by_id: dict[str, SweepCandidate] = {}
+        candidates_by_execution: dict[tuple[tuple[str, object], ...], SweepCandidate] = {}
         for split in split_options:
             for graph_ctas in graph_options:
                 capacity = self._capacity(
@@ -633,8 +647,8 @@ class _GqaSession(AbstractContextManager["_GqaSession"]):
                 candidate = SweepCandidate.create(
                     GqaConfig.from_capacity(capacity).profile_dict()
                 )
-                candidates_by_id.setdefault(candidate.candidate_id, candidate)
-        candidates = tuple(candidates_by_id.values())
+                candidates_by_execution.setdefault(_gqa_execution_key(case, candidate), candidate)
+        candidates = tuple(candidates_by_execution.values())
         self._candidate_cache[case.case_id] = candidates
         return candidates
 
