@@ -221,11 +221,9 @@ def _materialize_packed_row_errors_kernel(
         other=-1,
     ).to(tl.int64)
     invalid_live_rope = tl.sum(
-        (
-            live
-            & axis_mask
-            & ((live_rope < 0) | (live_rope >= rope_position_rows))
-        ).to(tl.int32),
+        (live & axis_mask & ((live_rope < 0) | (live_rope >= rope_position_rows))).to(
+            tl.int32
+        ),
         axis=0,
     )
     error = error | tl.where(invalid_live_rope != 0, 64, 0)
@@ -393,7 +391,7 @@ def _validate_active_raw_slots_kernel(
         tl.atomic_or(state_errors + row, 4096)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["index_query_row_stride"])
 def _prepare_index_query_kernel(
     index_query,
     request_ids,
@@ -409,6 +407,7 @@ def _prepare_index_query_kernel(
     rope_position_axis_stride,
     rope_cos_row_stride,
     rope_sin_row_stride,
+    index_query_row_stride,
     INDEX_HEADS: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     ROTARY_DIM: tl.constexpr,
@@ -427,9 +426,10 @@ def _prepare_index_query_kernel(
     valid_row = (tl.load(state_errors + row) == 0) & (
         tl.load(request_ids + row).to(tl.int64) >= 0
     )
-    offsets = (row * INDEX_HEADS + head) * HEAD_DIM + dims
+    offsets = (row.to(tl.int64) * INDEX_HEADS + head) * HEAD_DIM + dims
+    query_base = row.to(tl.int64) * index_query_row_stride + head * HEAD_DIM
     values = tl.load(
-        index_query + offsets,
+        index_query + query_base + dims,
         mask=valid_row & dim_mask,
         other=0.0,
     ).to(tl.float32)
@@ -442,9 +442,8 @@ def _prepare_index_query_kernel(
     in_rotary = dims < ROTARY_DIM
     pair = dims % half_rotary
     partner_dim = tl.where(dims < half_rotary, dims + half_rotary, dims - half_rotary)
-    partner_offsets = (row * INDEX_HEADS + head) * HEAD_DIM + partner_dim
     partner = tl.load(
-        index_query + partner_offsets,
+        index_query + query_base + partner_dim,
         mask=valid_row & in_rotary,
         other=0.0,
     ).to(tl.float32)
@@ -621,7 +620,7 @@ def _broadcast_request_errors_kernel(
     tl.store(state_errors + row, prior | request_error)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["raw_key_row_stride"])
 def _compress_completed_groups_kernel(
     raw_index_key,
     query_positions,
@@ -654,6 +653,7 @@ def _compress_completed_groups_kernel(
     compressed_table_stride,
     num_compressed_pages,
     eps,
+    raw_key_row_stride,
     INDEX_HEAD_DIM: tl.constexpr,
     ROTARY_DIM: tl.constexpr,
     COMPRESS_RATIO: tl.constexpr,
@@ -696,12 +696,12 @@ def _compress_completed_groups_kernel(
             from_current = source_position >= current_first
             current_row = request_start + source_position - current_first
             current = tl.load(
-                raw_index_key + current_row * INDEX_HEAD_DIM + dims,
+                raw_index_key + current_row * raw_key_row_stride + dims,
                 mask=from_current & dim_mask,
                 other=0.0,
             ).to(tl.float32)
             current_partner = tl.load(
-                raw_index_key + current_row * INDEX_HEAD_DIM + partner_dim,
+                raw_index_key + current_row * raw_key_row_stride + partner_dim,
                 mask=from_current & (dims < ROTARY_DIM),
                 other=0.0,
             ).to(tl.float32)
@@ -819,7 +819,7 @@ def _compress_completed_groups_kernel(
             )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["raw_key_row_stride"])
 def _commit_raw_ring_kernel(
     raw_index_key,
     query_positions,
@@ -843,6 +843,7 @@ def _commit_raw_ring_kernel(
     raw_rope_slot_stride,
     raw_rope_ring_stride,
     raw_interval_start_stride,
+    raw_key_row_stride,
     INDEX_HEAD_DIM: tl.constexpr,
     POSITION_AXES: tl.constexpr,
     RING_CAPACITY: tl.constexpr,
@@ -875,7 +876,7 @@ def _commit_raw_ring_kernel(
             tl.int64
         )
         key = tl.load(
-            raw_index_key + row * INDEX_HEAD_DIM + dims,
+            raw_index_key + row.to(tl.int64) * raw_key_row_stride + dims,
             mask=dim_mask,
             other=0.0,
         )
@@ -1514,6 +1515,7 @@ def launch_prepare_index_query(
         int(rope_positions.stride(1)),
         int(rope_cos.stride(0)),
         int(rope_sin.stride(0)),
+        int(index_query.stride(0)),
         INDEX_HEADS=int(caps.index_heads),
         HEAD_DIM=int(caps.index_head_dim),
         ROTARY_DIM=int(caps.index_rotary_dim),
@@ -1642,6 +1644,7 @@ def launch_compress_completed_groups(
         int(compressed_block_table.stride(0)),
         int(compressed_cache.shape[0]),
         float(caps.rms_norm_eps),
+        int(raw_index_key.stride(0)),
         INDEX_HEAD_DIM=int(caps.index_head_dim),
         ROTARY_DIM=int(caps.index_rotary_dim),
         COMPRESS_RATIO=int(caps.compress_ratio),
@@ -1675,9 +1678,7 @@ def launch_commit_raw_ring(
     state_errors: torch.Tensor,
     caps,
 ) -> None:
-    _commit_raw_ring_kernel[
-        (int(caps.max_batch), int(caps.raw_ring_capacity))
-    ](
+    _commit_raw_ring_kernel[(int(caps.max_batch), int(caps.raw_ring_capacity))](
         raw_index_key,
         query_positions,
         rope_positions,
@@ -1700,6 +1701,7 @@ def launch_commit_raw_ring(
         int(raw_rope_positions.stride(0)),
         int(raw_rope_positions.stride(1)),
         int(raw_interval_start_positions.stride(0)),
+        int(raw_index_key.stride(0)),
         INDEX_HEAD_DIM=int(caps.index_head_dim),
         POSITION_AXES=int(caps.position_axes),
         RING_CAPACITY=int(caps.raw_ring_capacity),

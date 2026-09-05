@@ -13,6 +13,8 @@ from ._contract import (
     plan,
     prewarm,
     run,
+    run_selected,
+    select,
 )
 from ._policy import QsaConfig, QsaQuery
 
@@ -28,5 +30,7 @@ __all__ = [
     "bind",
     "prewarm",
     "run",
+    "select",
+    "run_selected",
     "is_supported",
 ]

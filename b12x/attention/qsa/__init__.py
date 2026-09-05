@@ -15,6 +15,11 @@ tables are read-only.  The bound output, selected-position matrix, compressed
 selector cache, and raw selector state are mutable.  The caller writes the
 live original-token K/V before calling ``run``; QSA has no main-cache writer.
 
+``select`` and ``run_selected`` split that same transaction so index projection
+and selection can overlap main Q/K/V projection and cache writes. Selection
+does not read main Q/K/V. The caller orders both producers before attention and
+retains the matching scratch, error mask and selection until consumption.
+
 Raw selector state is indexed by persistent state slots, not batch indices.
 ``request_ids[row]`` selects a batch entry and ``raw_state_slot_ids[batch]``
 selects its persistent slot; ``-1`` denotes padded work and forbids mutation.
@@ -76,6 +81,8 @@ META = OpMeta(
         "bind",
         "prewarm",
         "run",
+        "select",
+        "run_selected",
         "is_supported",
     ),
     dtypes=("bf16",),
@@ -115,6 +122,8 @@ if TYPE_CHECKING:
         plan,
         prewarm,
         run,
+        run_selected,
+        select,
     )
 
 install_lazy_api(globals(), META)

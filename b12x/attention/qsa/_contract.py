@@ -261,7 +261,7 @@ class Caps:
             is_qwen_geometry,
         )
 
-        if not is_qwen_geometry(
+        if int(self.selection_width) != 2051 or not is_qwen_geometry(
             q_heads=int(self.q_heads),
             kv_heads=int(self.kv_heads),
             head_dim=int(self.head_dim),
@@ -514,10 +514,15 @@ class _KernelCaps:
         return int(self.max_seq_len) // int(self.compress_ratio)
 
 
+def _qwen_row_splits(rows: int) -> int:
+    return (
+        64 if rows == 1 else 32 if rows <= 4 else 16 if rows <= _MAX_SPLIT_ROWS else 1
+    )
+
+
 def _target_splits(caps: Caps, rows: int) -> tuple[int, int]:
     from ._sparse_gqa_cute_config import (
         BLOCK_N as QWEN_CUTE_BLOCK_N,
-        MAX_SPLIT_ROWS as QWEN_CUTE_MAX_SPLIT_ROWS,
         NUM_SPLITS as QWEN_CUTE_NUM_SPLITS,
         is_qwen_geometry,
     )
@@ -530,17 +535,7 @@ def _target_splits(caps: Caps, rows: int) -> tuple[int, int]:
         block_n=QWEN_CUTE_BLOCK_N,
         splits=QWEN_CUTE_NUM_SPLITS,
     ):
-        rows = int(rows)
-        splits = (
-            64
-            if rows == 1
-            else 32
-            if rows <= 4
-            else 16
-            if rows <= QWEN_CUTE_MAX_SPLIT_ROWS
-            else 1
-        )
-        return QWEN_CUTE_BLOCK_N, splits
+        return QWEN_CUTE_BLOCK_N, _qwen_row_splits(int(rows))
     raise NotImplementedError(
         "QSA requires the CuTe Qwen sparse-GQA geometry: q_heads divisible by "
         "kv_heads, head_dim=256, selection_width=2051; "
@@ -1039,6 +1034,9 @@ def bind(
     inner stride.  This admits zero-copy slices of a combined cosine/sine
     table such as ``cos_sin_cache[:, :rotary_half]`` and
     ``cos_sin_cache[:, rotary_half:]``.
+
+    ``output`` may have fewer rows than the plan's capacity. Every execution
+    must fit its live query rows in that caller-owned contiguous output.
     """
     if not isinstance(plan, Plan):
         raise TypeError("plan must be a qsa.Plan")
@@ -1219,11 +1217,13 @@ def bind(
     )
     if int(rope_sin.stride(0)) <= 0:
         raise ValueError("rope_sin must have a positive row stride")
+    if output.ndim != 3 or not 0 < int(output.shape[0]) <= int(caps.max_q_rows):
+        raise ValueError("output rows must be within the planned QSA capacity")
     _check_tensor(
         output,
         name="output",
         device=caps.device,
-        shape=(int(caps.max_q_rows), int(caps.q_heads), int(caps.head_dim)),
+        shape=(int(output.shape[0]), int(caps.q_heads), int(caps.head_dim)),
         dtype=caps.dtype,
         contiguous=True,
     )
@@ -1391,7 +1391,7 @@ def bind(
 
 
 def _qsa_decode_impl(
-    query: torch.Tensor,
+    query: torch.Tensor | None,
     index_query: torch.Tensor,
     raw_index_key: torch.Tensor,
     request_ids: torch.Tensor,
@@ -1451,10 +1451,10 @@ def _qsa_decode_impl(
     partial_lse_offset_bytes: int,
     work_metadata_offset_bytes: int,
 ) -> None:
-    """Launch the complete decode transaction inside one dispatcher boundary."""
-    rows = int(query.shape[0])
-    q_heads = int(query.shape[1])
-    head_dim = int(query.shape[2])
+    """Launch selector state updates, optionally followed by sparse attention."""
+    rows = int(index_query.shape[0])
+    q_heads = int(output.shape[1])
+    head_dim = int(output.shape[2])
     index_heads = int(index_query.shape[1])
     index_head_dim = int(index_query.shape[2])
     position_axes = int(rope_positions.shape[1])
@@ -1485,9 +1485,9 @@ def _qsa_decode_impl(
         max_speculative_tokens=int(max_speculative_tokens),
     )
 
-    max_q_rows = int(output.shape[0])
+    max_q_rows = int(selected_positions.shape[0])
     work_rows = int(workspace_q_rows)
-    if not 0 < work_rows <= max_q_rows:
+    if not 0 < work_rows <= max_q_rows or rows > int(output.shape[0]):
         raise RuntimeError("invalid planned QSA workspace row capacity")
     group_budget = int(budget) // int(compress_ratio)
     prepared_query = _scratch_view(
@@ -1629,7 +1629,6 @@ def _qsa_decode_impl(
         launch_prepare_index_query,
         launch_propagate_request_errors,
         launch_remap_topk_group_ids,
-        launch_score_representatives,
         launch_stabilize_topk,
         launch_stage_topk_carry,
         launch_topk_groups,
@@ -1639,6 +1638,7 @@ def _qsa_decode_impl(
         launch_validate_page_tables,
         launch_validate_shared_pool_ownership,
     )
+    from ._score_cute import launch_score_representatives
 
     launch_validate_rows(
         request_ids=request_ids,
@@ -1846,6 +1846,11 @@ def _qsa_decode_impl(
             caps=caps,
         )
 
+        # Selection has no dependency on main Q/K/V contents. Its output and
+        # error mask remain live in caller storage until run_selected consumes it.
+        if query is None:
+            continue
+
         block_n, splits = _target_splits(caps, chunk_rows)
         split_output = None
         split_lse = None
@@ -1895,7 +1900,7 @@ _QSA_MUTATED_ARGUMENTS = (
     mutates_args=_QSA_MUTATED_ARGUMENTS,
 )
 def _qsa_decode_op(
-    query: torch.Tensor,
+    query: torch.Tensor | None,
     index_query: torch.Tensor,
     raw_index_key: torch.Tensor,
     request_ids: torch.Tensor,
@@ -1967,7 +1972,7 @@ def _qsa_decode_op(
             ("selected_positions", selected_positions),
         ),
         read_only=(
-            ("query", query),
+            *((("query", query),) if query is not None else ()),
             ("index_query", index_query),
             ("raw_index_key", raw_index_key),
             ("request_ids", request_ids),
@@ -2044,7 +2049,7 @@ def _qsa_decode_op(
 
 @_qsa_decode_op.register_fake
 def _qsa_decode_fake(
-    query: torch.Tensor,
+    query: torch.Tensor | None,
     index_query: torch.Tensor,
     raw_index_key: torch.Tensor,
     request_ids: torch.Tensor,
@@ -2176,7 +2181,7 @@ _QSA_SHARED_MUTATED_ARGUMENTS = (
     mutates_args=_QSA_SHARED_MUTATED_ARGUMENTS,
 )
 def _qsa_decode_shared_op(
-    query: torch.Tensor,
+    query: torch.Tensor | None,
     index_query: torch.Tensor,
     raw_index_key: torch.Tensor,
     request_ids: torch.Tensor,
@@ -2242,7 +2247,7 @@ def _qsa_decode_shared_op(
             ("selected_positions", selected_positions),
         ),
         read_only=(
-            ("query", query),
+            *((("query", query),) if query is not None else ()),
             ("index_query", index_query),
             ("raw_index_key", raw_index_key),
             ("request_ids", request_ids),
@@ -2331,7 +2336,7 @@ def _qsa_decode_shared_op(
 
 @_qsa_decode_shared_op.register_fake
 def _qsa_decode_shared_fake(
-    query: torch.Tensor,
+    query: torch.Tensor | None,
     index_query: torch.Tensor,
     raw_index_key: torch.Tensor,
     request_ids: torch.Tensor,
@@ -2395,7 +2400,7 @@ def _qsa_decode_shared_fake(
 def run(
     binding: Binding,
     *,
-    query: torch.Tensor,
+    query: torch.Tensor | None,
     index_query: torch.Tensor,
     raw_index_key: torch.Tensor,
     request_ids: torch.Tensor,
@@ -2407,6 +2412,9 @@ def run(
     is_prefilling: torch.Tensor,
 ) -> torch.Tensor:
     """Run one packed QSA decode transaction after main K/V is populated.
+
+    ``query=None`` executes only the selector and leaves ``output`` untouched;
+    prefer the named :func:`select` entry point for that split transaction.
 
     Active request intervals are the dense prefix encoded by
     ``query_start_loc``.  Remaining boundaries repeat the live-row count and
@@ -2439,22 +2447,20 @@ def run(
     position-zero initialization with one accepted token.  ``rope_positions``
     may be any non-overlapping 2-D view with positive row and axis strides,
     including ``positions_by_axis.T``.
+    Selector projections may be disjoint dense-row views of a fused Q/K
+    projection; their positive row strides are consumed without staging copies.
     """
     if not isinstance(binding, Binding):
         raise TypeError("binding must be a qsa.Binding")
     caps = binding.plan.caps
-    if query.device.type != "cuda":
+    if index_query.device.type != "cuda":
         raise RuntimeError("QSA GPU decode requires a CUDA device")
-    rows = int(query.shape[0])
+    rows = int(index_query.shape[0])
     if not 0 < rows <= int(caps.max_q_rows):
         raise ValueError("query rows must be within the planned decode capacity")
+    if rows > int(binding.output.shape[0]):
+        raise ValueError("query rows exceed the bound QSA output capacity")
     dynamic_specs = (
-        (
-            query,
-            "query",
-            (rows, int(caps.q_heads), int(caps.head_dim)),
-            (torch.bfloat16,),
-        ),
         (
             index_query,
             "index_query",
@@ -2500,6 +2506,16 @@ def run(
             (torch.bool,),
         ),
     )
+    if query is not None:
+        dynamic_specs = (
+            (
+                query,
+                "query",
+                (rows, int(caps.q_heads), int(caps.head_dim)),
+                (torch.bfloat16,),
+            ),
+            *dynamic_specs,
+        )
     for tensor, name, shape, dtypes in dynamic_specs:
         _check_tensor(
             tensor,
@@ -2507,8 +2523,19 @@ def run(
             device=caps.device,
             shape=shape,
             dtype=dtypes,
-            contiguous=name != "rope_positions",
+            contiguous=name not in ("rope_positions", "index_query", "raw_index_key"),
         )
+    for tensor, name in (
+        (index_query, "index_query"),
+        (raw_index_key, "raw_index_key"),
+    ):
+        tail_elements = math.prod(tensor.shape[1:])
+        if (
+            int(tensor.stride(0)) < tail_elements
+            or int(tensor.stride(-1)) != 1
+            or (tensor.ndim == 3 and int(tensor.stride(1)) != int(tensor.shape[2]))
+        ):
+            raise ValueError(f"{name} requires non-overlapping dense rows")
     if int(rope_positions.stride(0)) <= 0 or int(rope_positions.stride(1)) <= 0:
         raise ValueError("rope_positions must have positive row and axis strides")
     _require_non_overlapping_layout("rope_positions", rope_positions)
@@ -2594,7 +2621,7 @@ def run(
             int(layout.partial_lse_offset_bytes),
             int(layout.work_metadata_offset_bytes),
         )
-        return binding.output[:rows]
+        return (binding.selected_positions if query is None else binding.output)[:rows]
     _qsa_decode_op(
         query,
         index_query,
@@ -2655,6 +2682,253 @@ def run(
         int(layout.partial_output_offset_bytes),
         int(layout.partial_lse_offset_bytes),
         int(layout.work_metadata_offset_bytes),
+    )
+    return (binding.selected_positions if query is None else binding.output)[:rows]
+
+
+def select(
+    binding: Binding,
+    *,
+    index_query: torch.Tensor,
+    raw_index_key: torch.Tensor,
+    request_ids: torch.Tensor,
+    query_positions: torch.Tensor,
+    rope_positions: torch.Tensor,
+    sequence_lengths: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    num_accepted_tokens: torch.Tensor,
+    is_prefilling: torch.Tensor,
+) -> torch.Tensor:
+    """Update selector state and select positions without reading main Q/K/V.
+
+    Dynamic metadata and mutation semantics are identical to :func:`run`.
+    Before :func:`run_selected`, the caller must finish this operation, populate
+    main K/V and retain the selected positions, error mask and scratch storage.
+    Neither another selection nor scratch reuse may intervene. Stream ordering
+    is caller-owned, including during CUDA graph capture and replay.
+    """
+    return run(
+        binding,
+        query=None,
+        index_query=index_query,
+        raw_index_key=raw_index_key,
+        request_ids=request_ids,
+        query_positions=query_positions,
+        rope_positions=rope_positions,
+        sequence_lengths=sequence_lengths,
+        query_start_loc=query_start_loc,
+        num_accepted_tokens=num_accepted_tokens,
+        is_prefilling=is_prefilling,
+    )
+
+
+@torch.library.custom_op("b12x::qsa_selected", mutates_args=("scratch", "output"))
+def _qsa_selected_op(
+    query: torch.Tensor,
+    request_ids: torch.Tensor,
+    query_positions: torch.Tensor,
+    main_k_cache: torch.Tensor,
+    main_v_cache: torch.Tensor,
+    k_descale: torch.Tensor | None,
+    v_descale: torch.Tensor | None,
+    main_block_table: torch.Tensor,
+    selected_positions: torch.Tensor,
+    selection_errors: torch.Tensor | None,
+    scratch: torch.Tensor,
+    output: torch.Tensor,
+    work_rows: int,
+    max_split_row_product: int,
+    state_errors_offset: int,
+    partial_output_offset: int,
+    partial_lse_offset: int,
+    direct_kv_warps: int,
+) -> None:
+    from ._kernels import launch_poison_failed_rows
+    from ._sparse_gqa import launch_sparse_paged_gqa
+    from ._sparse_gqa_cute_config import BLOCK_N
+
+    rows, q_heads, head_dim = map(int, query.shape)
+    errors = selection_errors
+    if errors is None:
+        errors = _scratch_view(
+            scratch,
+            offset_bytes=state_errors_offset,
+            shape=(int(output.shape[0]),),
+            dtype=torch.int32,
+        )
+    partial_output = _scratch_view(
+        scratch,
+        offset_bytes=partial_output_offset,
+        shape=(max_split_row_product, q_heads, head_dim),
+        dtype=torch.float32,
+    )
+    partial_lse = _scratch_view(
+        scratch,
+        offset_bytes=partial_lse_offset,
+        shape=(max_split_row_product, q_heads),
+        dtype=torch.float32,
+    )
+    # Use the same row-chunk and native CuTe split policy as the combined call.
+    for start in range(0, rows, work_rows):
+        count = min(work_rows, rows - start)
+        row_slice = slice(start, start + count)
+        splits = _qwen_row_splits(count)
+        launch_sparse_paged_gqa(
+            query=query[row_slice],
+            key_cache=main_k_cache,
+            value_cache=main_v_cache,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            block_table=main_block_table,
+            request_ids=request_ids[row_slice],
+            selected_positions=selected_positions[row_slice],
+            query_positions=query_positions[row_slice],
+            output=output[row_slice],
+            partial_output=(
+                partial_output[: count * splits].view(count, splits, q_heads, head_dim)
+                if splits > 1
+                else None
+            ),
+            partial_lse=(
+                partial_lse[: count * splits].view(count, splits, q_heads)
+                if splits > 1
+                else None
+            ),
+            softmax_scale=1.0 / math.sqrt(head_dim),
+            block_n=BLOCK_N,
+            splits=splits,
+            direct_kv_warps=direct_kv_warps,
+        )
+        launch_poison_failed_rows(
+            output=output[row_slice], state_errors=errors[row_slice]
+        )
+
+
+@_qsa_selected_op.register_fake
+def _qsa_selected_fake(
+    query: torch.Tensor,
+    request_ids: torch.Tensor,
+    query_positions: torch.Tensor,
+    main_k_cache: torch.Tensor,
+    main_v_cache: torch.Tensor,
+    k_descale: torch.Tensor | None,
+    v_descale: torch.Tensor | None,
+    main_block_table: torch.Tensor,
+    selected_positions: torch.Tensor,
+    selection_errors: torch.Tensor | None,
+    scratch: torch.Tensor,
+    output: torch.Tensor,
+    work_rows: int,
+    max_split_row_product: int,
+    state_errors_offset: int,
+    partial_output_offset: int,
+    partial_lse_offset: int,
+    direct_kv_warps: int,
+) -> None:
+    return None
+
+
+def run_selected(
+    binding: Binding,
+    *,
+    query: torch.Tensor,
+    request_ids: torch.Tensor,
+    query_positions: torch.Tensor,
+    selected_positions: torch.Tensor | None = None,
+    selection_errors: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Consume the matching select result after main Q/K/V becomes available.
+
+    The binding must reference the same plan, scratch, metadata, cache and
+    selection storage used by :func:`select`. Attention cannot race selector
+    completion or main-cache writes. Failed selector requests remain poisoned;
+    this entry point does not reset their error mask or mutate selector state.
+
+    A speculative caller may instead provide an immutable captured selection
+    extended by ``caps.max_speculative_tokens`` columns and its captured int32
+    error mask. Both tensors must follow the query-row order. The caller owns
+    capture, request compaction, causal tail population and stream ordering;
+    this entry point never infers those errors from unrelated scratch rows.
+    The extended selection width is planned capacity, not a live token count.
+    """
+    if not isinstance(binding, Binding):
+        raise TypeError("binding must be a qsa.Binding")
+    caps = binding.plan.caps
+    rows = int(query.shape[0])
+    if not 0 < rows <= int(caps.max_q_rows):
+        raise ValueError("query rows must be within the planned decode capacity")
+    if rows > int(binding.output.shape[0]):
+        raise ValueError("query rows exceed the bound QSA output capacity")
+    if (selected_positions is None) != (selection_errors is None):
+        raise ValueError(
+            "captured positions and selection errors must be supplied together"
+        )
+    captured_inputs: tuple[tuple[str, torch.Tensor], ...] = ()
+    if selected_positions is None:
+        selected_positions = binding.selected_positions
+    else:
+        if int(caps.max_speculative_tokens) <= 0:
+            raise ValueError("captured selections require planned speculative capacity")
+        _check_tensor(
+            selected_positions,
+            name="captured selected_positions",
+            device=caps.device,
+            shape=(rows, caps.selection_width + caps.max_speculative_tokens),
+            dtype=torch.int32,
+            contiguous=True,
+        )
+        _check_tensor(
+            selection_errors,
+            name="selection_errors",
+            device=caps.device,
+            shape=(rows,),
+            dtype=torch.int32,
+            contiguous=True,
+        )
+        captured_inputs = (("selection_errors", selection_errors),)
+    for tensor, name, shape, dtype in (
+        (query, "query", (rows, caps.q_heads, caps.head_dim), torch.bfloat16),
+        (request_ids, "request_ids", (rows,), (torch.int32, torch.int64)),
+        (query_positions, "query_positions", (rows,), torch.int64),
+    ):
+        _check_tensor(
+            tensor,
+            name=name,
+            device=caps.device,
+            shape=shape,
+            dtype=dtype,
+            contiguous=True,
+        )
+    _require_mutation_alias_contract(
+        mutable=(("scratch", binding.scratch), ("output", binding.output)),
+        read_only=(
+            ("query", query),
+            ("request_ids", request_ids),
+            ("query_positions", query_positions),
+            ("selected_positions", selected_positions),
+            *captured_inputs,
+        ),
+    )
+    layout = binding.plan._layout
+    _qsa_selected_op(
+        query,
+        request_ids,
+        query_positions,
+        binding.main_k_cache,
+        binding.main_v_cache,
+        binding.k_descale,
+        binding.v_descale,
+        binding.main_block_table,
+        selected_positions,
+        selection_errors,
+        binding.scratch,
+        binding.output,
+        binding.plan.workspace_q_rows,
+        binding.plan.max_split_row_product,
+        layout.state_errors_offset_bytes,
+        layout.partial_output_offset_bytes,
+        layout.partial_lse_offset_bytes,
+        binding.plan.policy_resolution.config.sparse_gqa_direct_kv_warps,
     )
     return binding.output[:rows]
 
