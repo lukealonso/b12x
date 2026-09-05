@@ -26,7 +26,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-DEFAULT_SHAPES = "4x7168,8x7168,16x7168,32x7168,4x3584,8x3584,16x3584"
+DEFAULT_SHAPES = "1x1024,1x4096,1x7168,2x7168,4x7168,8x7168,16x7168,32x7168,4x3584,8x3584,16x3584"
 
 
 def _shapes(raw: str) -> tuple[tuple[int, int], ...]:
@@ -67,6 +67,7 @@ def _time(fn, device: torch.device, iters: int, warmup: int) -> tuple[float, flo
 
 def _worker(rank: int, port: int, args: argparse.Namespace) -> None:
     from b12x.comm.pcie.pcie_oneshot import PCIeOneshotAllReducePool
+    from b12x.comm.pcie.pcie_island9 import PCIeIsland9AllReduce
     from b12x.comm.pcie.pcie_twoshot_bf16 import PCIeTwoShotBF16
 
     world = args.world_size
@@ -216,6 +217,35 @@ def _worker(rank: int, port: int, args: argparse.Namespace) -> None:
         emit("twoshot-push-fused", rows, width, "graph", median, p90)
         del graph
     pushed.close()
+
+    # Two-island push all-reduce (ranks 0-3 / 4-7 reduce quarters inside
+    # their switch clusters; rank 8 contributes through island 0).
+    island9 = PCIeIsland9AllReduce.from_exchange_group(
+        exchange_group=group,
+        device=device,
+        max_rows=args.twoshot_max_rows,
+        row_elems=args.twoshot_row_elems,
+    )
+    for rows, width in shapes:
+        inp = _pattern(rows, width, rank, device)
+        out = torch.empty_like(inp)
+        if not island9.accepts(inp):
+            continue
+        island9.all_reduce(inp, out=out)
+        verify(out, rows, width, "island9-push")
+        median, p90 = _time(
+            lambda: island9.all_reduce(inp, out=out), device, args.iters, args.warmup
+        )
+        emit("island9-push", rows, width, "eager", median, p90)
+        graph = torch.cuda.CUDAGraph()
+        with island9.capture(), torch.cuda.graph(graph):
+            island9.all_reduce(inp, out=out)
+        graph.replay()
+        verify(out, rows, width, "island9-push-graph")
+        median, p90 = _time(graph.replay, device, args.iters, args.warmup)
+        emit("island9-push", rows, width, "graph", median, p90)
+        del graph
+    island9.close()
 
     # Push-based reduce-scatter followed by push-based all-gather (two
     # launches, posted PCIe writes instead of remote reads). Rows are padded

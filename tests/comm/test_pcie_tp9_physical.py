@@ -17,6 +17,7 @@ def _worker(rank: int, port: int) -> None:
     from b12x.comm.pcie.pcie_dcp_a2a import PCIeDCPA2A
     from b12x.comm.pcie.pcie_dma import PCIeDmaAllReduce
     from b12x.comm.pcie.pcie_oneshot import PCIeOneshotAllReducePool
+    from b12x.comm.pcie.pcie_island9 import PCIeIsland9AllReduce
     from b12x.comm.pcie.pcie_twoshot_bf16 import PCIeTwoShotBF16
 
     torch.cuda.set_device(rank)
@@ -120,6 +121,51 @@ def _worker(rank: int, port: int) -> None:
         del graph
         twoshot.close()
         record(f"twoshot_{mode}_balanced_partition_eager_graph_passed")
+
+    # Two-island push all-reduce with rank 8 contributing through island 0.
+    # Quarter boundaries are not divisible by the launch stride for most of
+    # these shapes, and the odd widths leave short last quarters.
+    island9 = PCIeIsland9AllReduce.from_exchange_group(
+        exchange_group=group,
+        device=device,
+        max_rows=49149,
+        row_elems=8,
+    )
+    assert island9.mapped_peers == (
+        (0, 1, 2, 3) if rank == 8 else tuple(
+            sorted(({(rank // 4) * 4 + p for p in range(4)} - {rank})
+                   | {((1 - rank // 4) * 4 + rank % 4)}
+                   | ({8} if rank < 4 else set()))
+        )
+    )
+    for rows, width in ((1, 7168), (2, 7168), (4, 7168), (8, 7168), (9, 7168),
+                        (16, 7168), (32, 7168), (4, 3584), (16, 3584), (1, 1030)):
+        inp = position_pattern(rows, width) * (rank + 1)
+        out = torch.empty_like(inp)
+        assert island9.accepts(inp)
+        island9.all_reduce(inp, out=out)
+        check_pattern(out, 45)
+    # The island-0 partial (4 x 64 + rank 8's 1 = 257) is not representable
+    # in bf16; only fp32 partials give the representable total 258.
+    value = {8: 1.0, 4: 1.0}.get(rank, 64.0 if rank < 4 else 0.0)
+    inp = torch.full((4, 7168), value, dtype=torch.bfloat16, device=device)
+    out = torch.empty_like(inp)
+    island9.all_reduce(inp, out=out)
+    check(out, 258.0)
+    inp = position_pattern(16, 7168) * (rank + 1)
+    out = torch.empty_like(inp)
+    graph = torch.cuda.CUDAGraph()
+    with island9.capture(), torch.cuda.graph(graph):
+        island9.all_reduce(inp, out=out)
+    for iteration in range(3):
+        inp.copy_(
+            position_pattern(16, 7168) * (rank + 1 + (iteration if rank == 8 else 0))
+        )
+        graph.replay()
+        check_pattern(out, 45 + iteration)
+    del graph
+    island9.close()
+    record("island9_push_eager_graph_passed")
 
     dma = PCIeDmaAllReduce(
         exchange_group=group,
