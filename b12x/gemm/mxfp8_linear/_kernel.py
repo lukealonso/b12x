@@ -8,7 +8,7 @@ import torch
 
 from b12x._lib.utils import cuda_stream_to_int
 from b12x.gemm._shared.block_fp8 import (
-    quantize_block_fp8_linear_input_mxfp8,
+    _quantize_block_fp8_linear_input_for_immediate_gemm,
 )
 from b12x._lib.dense_gemm import dense_gemm, dense_gemm_fused_quant_a
 from b12x.gemm._shared.wo_mxfp8 import (
@@ -235,7 +235,12 @@ def _mxfp8_linear_fused_op(
             **_dense_gemm_kwargs_for_n(out_features),
         )[:, :, 0]
     source_for_quant = _pad_source_2d_k(source_2d, int(padded_in_features))
-    x_q = quantize_block_fp8_linear_input_mxfp8(source_for_quant)
+    # This opaque op consumes the quantized rows immediately. The quantizer
+    # overwrites every logical row scale and every physical scale entry read by
+    # the GEMM, so initializing fresh scale storage first only adds two CUDA
+    # fills per projection. Keep the public allocating quantizer's initialized
+    # padding contract unchanged; use the private immediate-consumer path here.
+    x_q = _quantize_block_fp8_linear_input_for_immediate_gemm(source_for_quant)
     return dense_gemm(
         (x_q.values.reshape(tokens, padded_in_features, 1), x_q.scale_mma),
         (
