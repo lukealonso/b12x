@@ -6,6 +6,7 @@ from ..._lib.gating import default_is_supported
 from ._impl import (
     EPExpertMap as ExpertMap,
 )
+from ._policy import EpMoeConfig, EpMoeQuery
 from ._impl import (
     EPMoEFP4Binding as Binding,
 )
@@ -46,6 +47,8 @@ __all__ = [
     "Plan",
     "Binding",
     "ExpertMap",
+    "EpMoeConfig",
+    "EpMoeQuery",
     "plan",
     "bind",
     "run",

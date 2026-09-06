@@ -191,6 +191,40 @@ def test_packed_speculative_compression_replaces_rejected_groups_before_use() ->
     assert torch.equal(cache[0, 1], expected_group_one)
 
 
+def test_packed_prefill_commits_only_final_ring_suffix_and_final_anchor() -> None:
+    dim = 8
+    capacity = 8
+    rows = 19
+    raw = torch.arange(rows * dim, dtype=torch.float32).reshape(rows, dim).to(
+        torch.bfloat16
+    )
+    positions = torch.arange(rows, dtype=torch.int64)
+    ring = torch.full((capacity, dim), -1, dtype=torch.bfloat16)
+    tags = torch.full((capacity,), -1, dtype=torch.int64)
+    rope_tags = torch.full((capacity, 1), -1, dtype=torch.int64)
+
+    _, _, anchor = packed_stream_compress_reference(
+        raw,
+        positions,
+        positions[:, None],
+        ring,
+        tags,
+        rope_tags,
+        prior_interval_start_position=-1,
+        num_accepted_tokens=1,
+        is_prefilling=True,
+        compress_ratio=4,
+        key_norm_weight=torch.zeros((dim,), dtype=torch.float32),
+        eps=1e-6,
+        rope=_identity_rope,
+    )
+
+    assert anchor == rows - 1
+    for position in range(rows - capacity, rows):
+        slot = position % capacity
+        assert int(tags[slot]) == position
+        assert torch.equal(ring[slot], raw[position])
+        assert int(rope_tags[slot, 0]) == position
 def test_packed_speculative_compression_rejects_inconsistent_acceptance() -> None:
     with pytest.raises(ValueError, match="prior interval start"):
         packed_stream_compress_reference(

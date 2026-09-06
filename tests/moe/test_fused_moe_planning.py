@@ -8,6 +8,24 @@ import torch
 
 import b12x.moe.fused_moe._impl as fused_moe_impl
 from b12x.moe import fused_moe
+from b12x.policy import (
+    DeviceIdentity,
+    PolicyContext,
+    PolicyResolution,
+    PolicySource,
+)
+
+
+_GB10_IDENTITY = DeviceIdentity(
+    vendor="nvidia",
+    compute_capability=(12, 1),
+    sm_count=48,
+    product_name="NVIDIA GB10",
+)
+
+
+def _policy_context(device: DeviceIdentity) -> PolicyContext:
+    return PolicyContext.for_identity(device)
 
 
 def _weight_plan() -> fused_moe.WeightsPlan:
@@ -48,7 +66,7 @@ def _trellis_caps() -> fused_moe.Caps:
         w13_layout="w31",
         w4a16_layout="trellis_native",
         trellis_bits=3,
-        trellis_tile_config=(128, 256, 64, 256),
+        trellis_tile_config=(128, 128, 128, 128),
         trellis_codebook="mcg",
         trellis_rate_granularity="per_expert_projection",
     )
@@ -81,6 +99,64 @@ def _small_packed_caps() -> fused_moe.Caps:
         weight_plan=weight_plan,
         quant_mode="w4a16",
     )
+
+
+def _preplanned_w4a16_workspace(*, activation: str) -> SimpleNamespace:
+    return SimpleNamespace(
+        activation=activation,
+        device=torch.device("cpu"),
+        full_rotation=False,
+        num_topk=8,
+        planned_direct_topk_launches={4: "direct-topk"},
+        planned_fused_moe_launches={
+            ("packed", "e4m3_k16", 8, False): "route-packed"
+        },
+        planned_mapped_direct_launches={4: "mapped-direct"},
+        planned_tc_decode_launches={4: "tc-decode"},
+        planned_token_counts=frozenset({8}),
+        planned_topk_sum_launches={4: "sum-4", 8: "sum-8"},
+        weight_E=288,
+    )
+
+
+def test_w4a16_preplanned_relu2_direct_uses_direct_topk_kernel() -> None:
+    workspace = _preplanned_w4a16_workspace(activation="relu2")
+
+    launches = fused_moe_impl._w4a16_preplanned_launches(
+        workspace,
+        token_count=4,
+        weight_layout="packed",
+        route_mode="direct",
+    )
+
+    assert launches == ("direct-topk", "sum-4")
+
+
+def test_w4a16_preplanned_silu_direct_uses_tc_decode_kernel() -> None:
+    workspace = _preplanned_w4a16_workspace(activation="silu")
+
+    launches = fused_moe_impl._w4a16_preplanned_launches(
+        workspace,
+        token_count=4,
+        weight_layout="packed",
+        route_mode="direct",
+    )
+
+    assert launches == ("tc-decode", "sum-4")
+
+
+def test_w4a16_preplanned_packed_mode_rejects_mapped_direct_kernel() -> None:
+    workspace = _preplanned_w4a16_workspace(activation="silu")
+
+    launches = fused_moe_impl._w4a16_preplanned_launches(
+        workspace,
+        token_count=4,
+        weight_layout="packed",
+        use_route_expert_map=True,
+        route_mode="packed",
+    )
+
+    assert launches == ("route-packed", "sum-8")
 
 
 def _subset_router_caps() -> fused_moe.Caps:
@@ -140,7 +216,7 @@ def test_required_nbytes_avoids_launch_prewarm(
 
     required = fused_moe.required_nbytes(caps)
 
-    assert required > 800 * 1024 * 1024
+    assert required > 780 * 1024 * 1024
     assert "required_nbytes" in fused_moe.META.entry_points
     with pytest.raises(TypeError, match="TPMoEScratchCaps"):
         fused_moe.required_nbytes(object())
@@ -375,11 +451,19 @@ def test_projection_mixed_config_selects_fixed_mixed_workspace(
 
     assert plan._core_workspace_plan.implementation == "trellis_mixed3"
     assert plan._core_workspace_plan.projection_mixed_trellis
+    assert plan._core_workspace_plan.trellis_tile_config == (
+        128,
+        128,
+        128,
+        128,
+    )
+    assert plan._core_workspace_plan.route_block_size_m == 48
     assert specs["intermediate_cache13"].shape == (3072 * 8 * 1024,)
     assert specs["intermediate_cache2"].shape == (3072 * 8 * 512,)
     assert specs["rotation_a_gate"].shape == (3072 * 8, 6144)
     assert specs["rotation_a_up"].shape == (3072 * 8, 6144)
     assert specs["full_rotation_output"].shape == (3072, 6144)
+    assert specs["kernel_workspace"].init == "zeros"
 
 
 @pytest.mark.parametrize(
@@ -452,7 +536,7 @@ def test_typed_packed_planning_keeps_representation_axes_independent(
         ("w4a16", "fp4_e8m0_k32", "w31", "mma_packed"),
         ("nvfp4", "modelopt_nvfp4", "w31", "source_native"),
         ("w4a8_nvfp4", "modelopt_nvfp4", "w31", "source_native"),
-        ("w4a16", "modelopt_nvfp4", "w13", "source_native"),
+        ("w4a16", "modelopt_nvfp4", "w13", "mma_packed"),
     ),
 )
 def test_vllm_1_2_6_planning_contract_remains_supported(
@@ -593,6 +677,64 @@ def test_canonical_lifecycle_keeps_planning_axes_visible() -> None:
     assert execution.is_prewarmed
 
 
+def test_canonical_plan_execution_carries_explicit_policy() -> None:
+    weight_plan = fused_moe.plan_weights(
+        source=fused_moe.PackedSource(
+            format=fused_moe.PackedSourceFormat.MODELOPT_NVFP4,
+            w13_layout=fused_moe.W13Layout.W31,
+        ),
+        activation=fused_moe.ActivationSpec(
+            mode=fused_moe.ActivationMode.A4,
+            nonlinearity="silu",
+            io_dtype=torch.bfloat16,
+        ),
+        geometry=fused_moe.MoEGeometry(
+            num_experts=2,
+            hidden_size=128,
+            intermediate_size=64,
+        ),
+    )
+    experts = fused_moe.prepare_weights(
+        plan=weight_plan,
+        weights=fused_moe.PackedWeights(
+            w13=torch.zeros((2, 128, 64), dtype=torch.uint8),
+            w2=torch.zeros((2, 128, 32), dtype=torch.uint8),
+            w13_block_scales=torch.ones(
+                (2, 128, 8),
+                dtype=torch.float8_e4m3fn,
+            ),
+            w2_block_scales=torch.ones(
+                (2, 128, 4),
+                dtype=torch.float8_e4m3fn,
+            ),
+            w13_global_scales=torch.ones(2),
+            w2_global_scales=torch.ones(2),
+            input_scale=torch.ones(2),
+            intermediate_scale=torch.ones(2),
+        ),
+    )
+    policy = PolicyContext.for_identity(None).with_override(
+        "moe.decode",
+        fused_moe.MoeDecodeConfig(
+            backend="dynamic",
+            route_planner="internal",
+            max_active_clusters=None,
+            dynamic_tile_m=128,
+            dynamic_route_mode="grouped",
+        ),
+    )
+
+    execution = fused_moe.plan_execution(
+        experts=experts,
+        capacity=fused_moe.ExecutionCapacity(max_tokens=4, top_k=1),
+        policy=policy,
+    )
+
+    assert execution.policy is policy
+    assert execution._caps.policy_context is policy
+    assert execution.variant_for(4).implementation == "dynamic"
+
+
 def test_canonical_w4a8_lifecycle_preserves_activation_and_packing() -> None:
     weight_plan = fused_moe.plan_weights(
         source=fused_moe.PackedSource(
@@ -660,3 +802,262 @@ def test_config_keyword_is_not_a_public_planning_contract() -> None:
             activation="silu",
             dtype=torch.bfloat16,
         )
+
+
+@pytest.mark.parametrize("num_tokens", [4, 5, 6, 7])
+def test_gb10_qwen38_flash_next_decode_selects_dynamic(
+    monkeypatch: pytest.MonkeyPatch,
+    num_tokens: int,
+) -> None:
+    monkeypatch.delenv("B12X_MICRO_DYNAMIC_CUTOVER_PAIRS", raising=False)
+    monkeypatch.setattr(
+        fused_moe_impl,
+        "_current_moe_policy_context",
+        lambda: _policy_context(_GB10_IDENTITY),
+    )
+    fused_moe_impl.clear_tp_moe_caches()
+
+    implementation, state_experts, max_rows = fused_moe_impl._resolve_workspace_layout(
+        num_tokens=num_tokens,
+        weight_E=512,
+        num_topk=10,
+        k=2560,
+        n=640,
+        activation="silu",
+        quant_mode="nvfp4",
+    )
+
+    assert implementation == "dynamic"
+    assert state_experts == 512
+    assert max_rows >= num_tokens * 10
+
+
+def test_qwen38_flash_next_decode_override_is_gb10_specific(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("B12X_MICRO_DYNAMIC_CUTOVER_PAIRS", raising=False)
+    monkeypatch.setattr(
+        fused_moe_impl,
+        "_current_moe_policy_context",
+        lambda: _policy_context(
+            DeviceIdentity(
+                vendor="nvidia",
+                compute_capability=(12, 1),
+                sm_count=47,
+                product_name="NVIDIA GB10",
+            )
+        ),
+    )
+    fused_moe_impl.clear_tp_moe_caches()
+
+    implementation, _, _ = fused_moe_impl._resolve_workspace_layout(
+        num_tokens=4,
+        weight_E=512,
+        num_topk=10,
+        k=2560,
+        n=640,
+        activation="silu",
+        quant_mode="nvfp4",
+    )
+
+    assert implementation == "micro"
+
+
+def test_moe_decode_heuristic_never_labels_unsupported_micro_shape() -> None:
+    resolution = fused_moe_impl._resolve_moe_decode_policy(
+        num_tokens=1,
+        num_topk=2,
+        num_experts=8,
+        k=192,
+        n=64,
+        activation="silu",
+        quant_mode="nvfp4",
+        context=PolicyContext.for_identity(None),
+    )
+
+    assert resolution.source is PolicySource.HEURISTIC
+    assert resolution.config.backend == "dynamic"
+
+
+def test_tp_moe_plan_retains_one_policy_resolution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    resolution = PolicyResolution(
+        config=fused_moe_impl.MoeDecodeConfig(
+            backend="dynamic",
+            route_planner="triton",
+            max_active_clusters=12,
+            dynamic_tile_m=128,
+            dynamic_route_mode="grouped",
+        ),
+        source=PolicySource.PREPLANNED,
+        component_id="moe.decode",
+        device=None,
+        profile_id="synthetic",
+        rule_name="synthetic-rule",
+    )
+    calls = 0
+
+    def resolve(**_kwargs):
+        nonlocal calls
+        calls += 1
+        return resolution
+
+    monkeypatch.setattr(fused_moe_impl, "_resolve_moe_decode_policy", resolve)
+    weight_plan = fused_moe.plan_weights(
+        quant_modes="nvfp4",
+        source_format="modelopt_nvfp4",
+        activation="silu",
+        params_dtype=torch.bfloat16,
+        num_experts=8,
+        hidden_size=256,
+        intermediate_size=128,
+        w13_layout="w31",
+    )
+
+    plan = fused_moe_impl.plan_tp_moe_execution(
+        num_tokens=4,
+        num_topk=2,
+        device="cpu",
+        weight_plan=weight_plan,
+        quant_mode="nvfp4",
+        deterministic_output=False,
+        policy_context=PolicyContext.for_identity(None),
+    )
+
+    assert calls == 1
+    assert plan.policy_resolution is resolution
+    assert plan.implementation == "dynamic"
+    assert plan.execution.tile_m == 128
+
+
+@pytest.mark.parametrize(
+    ("tile_m", "external", "direct", "cluster_cap"),
+    (
+        (16, False, False, -1),
+        (16, False, True, 0),
+        (32, True, False, 12),
+        (64, False, False, 48),
+        (128, True, False, 188),
+    ),
+)
+def test_dynamic_launch_policy_round_trips_planned_tile(
+    tile_m: int,
+    external: bool,
+    direct: bool,
+    cluster_cap: int,
+) -> None:
+    encoded = fused_moe_impl._encode_dynamic_launch_policy(
+        volatile_launch_state=True,
+        external_route_plan_requested=external,
+        policy_max_active_clusters=cluster_cap,
+        planned_tile_m=tile_m,
+        planned_direct_routing=direct,
+    )
+
+    assert fused_moe_impl._decode_dynamic_launch_policy(encoded) == (
+        True,
+        external,
+        tile_m,
+        direct,
+        cluster_cap,
+    )
+
+
+@pytest.mark.parametrize(
+    ("num_tokens", "expected"),
+    [(4, "micro"), (7, "dynamic")],
+)
+def test_w4a8_nvfp4_micro_respects_direct_routing_capacity(
+    num_tokens: int,
+    expected: str,
+) -> None:
+    implementation, _, _ = fused_moe_impl._resolve_workspace_layout(
+        num_tokens=num_tokens,
+        weight_E=256,
+        num_topk=8,
+        k=6144,
+        n=160,
+        activation="silu",
+        quant_mode="w4a8_nvfp4",
+    )
+
+    assert implementation == expected
+
+
+def test_gb10_qwen38_flash_next_decode_honors_explicit_cutover(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("B12X_MICRO_DYNAMIC_CUTOVER_PAIRS", "64")
+    monkeypatch.setattr(
+        fused_moe_impl,
+        "_current_moe_policy_context",
+        lambda: _policy_context(_GB10_IDENTITY),
+    )
+    fused_moe_impl.clear_tp_moe_caches()
+
+    implementation, _, _ = fused_moe_impl._resolve_workspace_layout(
+        num_tokens=4,
+        weight_E=512,
+        num_topk=10,
+        k=2560,
+        n=640,
+        activation="silu",
+        quant_mode="nvfp4",
+    )
+
+    assert implementation == "micro"
+
+
+def test_gb10_qwen38_flash_next_decode_reports_profile_provenance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("B12X_MICRO_DYNAMIC_CUTOVER_PAIRS", raising=False)
+    monkeypatch.setattr(
+        fused_moe_impl,
+        "_current_moe_policy_context",
+        lambda: _policy_context(_GB10_IDENTITY),
+    )
+
+    resolution = fused_moe_impl._resolve_moe_decode_policy(
+        num_tokens=4,
+        num_topk=10,
+        num_experts=512,
+        k=2560,
+        n=640,
+        activation="silu",
+        quant_mode="nvfp4",
+    )
+
+    assert resolution.source is PolicySource.PREPLANNED
+    assert resolution.profile_id == "nvidia.gb10.48sm"
+    assert resolution.rule_name is not None
+    assert resolution.rule_name.startswith("config-")
+    assert resolution.config.dynamic_tile_m == 16
+    assert resolution.config.backend == "dynamic"
+    assert resolution.config.route_planner == "triton"
+    assert resolution.config.max_active_clusters == 36
+
+
+@pytest.mark.parametrize(
+    ("num_tokens", "route_mode"),
+    ((1, "direct"), (2, "direct"), (4, "direct"), (8, "packed")),
+)
+def test_gb10_uniform_nvfp4_a16_uses_packed_layout_heuristic(
+    num_tokens: int,
+    route_mode: str,
+) -> None:
+    resolution = fused_moe_impl._resolve_moe_decode_policy(
+        num_tokens=num_tokens,
+        num_topk=8,
+        num_experts=288,
+        k=4096,
+        n=1024,
+        activation="silu",
+        quant_mode="w4a16",
+        context=_policy_context(_GB10_IDENTITY),
+    )
+
+    assert resolution.source is PolicySource.HEURISTIC
+    assert resolution.config.backend == "w4a16"
+    assert resolution.config.w4a16_route_mode == route_mode

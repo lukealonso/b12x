@@ -1,0 +1,22 @@
+cell        ROCE-final tok/sNCCL-final tok/s    deltaROCE-final itlNCCL-final itl
+c1@0k                   40.8            39.4     3.7%        62ms        65ms
+c1@16k                  37.0            39.1    -5.5%        64ms        66ms
+c1@32k                  40.8            36.5    11.8%        64ms        66ms
+c2@0k                   61.9            58.4     6.0%        89ms        88ms
+c2@16k                  54.4            53.7     1.4%        88ms        88ms
+c2@32k                  59.4            55.9     6.3%        86ms        89ms
+c4@0k                  108.9            92.1    18.2%        99ms       107ms
+c4@16k                  94.8            89.6     5.8%       105ms       107ms
+c4@32k                  97.9            80.4    21.8%       102ms       113ms
+c8@0k                  126.3           120.9     4.5%       148ms       160ms
+c8@16k                 130.7           114.2    14.4%       151ms       165ms
+c8@32k                 131.3           122.2     7.5%       160ms       166ms
+c16@0k                 215.2           163.7    31.5%       194ms       246ms
+c16@16k                193.9           159.2    21.8%       212ms       256ms
+c16@32k                191.6           152.2    25.9%       211ms       259ms
+coding_peak ROCE-final: runs_requested=5, runs_ok=5, max_tokens=2000
+coding_peak NCCL-final: runs_requested=5, runs_ok=5, max_tokens=2000
+prefill     ROCE-final tok/sNCCL-final tok/s    delta
+8192                    2601            2599     0.1%
+32768                   2763            2758     0.2%
+131072                  2701            2702    -0.0%

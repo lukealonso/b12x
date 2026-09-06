@@ -18,6 +18,8 @@ from typing import Literal
 import torch
 from torch.profiler import record_function
 
+from b12x.policy import PolicyContext
+
 from b12x.attention.paged.planner import (
     PagedPlan,
     PagedPlanBudget,
@@ -113,6 +115,7 @@ class B12XPagedAttentionScratchCaps:
     copy_runtime_metadata: bool = True
     msa_block_sparse: bool = False
     msa_union_tile: bool | None = None
+    policy_context: PolicyContext | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "msa_block_sparse", bool(self.msa_block_sparse))
@@ -162,6 +165,10 @@ class B12XPagedAttentionScratchCaps:
             "max_page_table_width",
             _page_table_width_for_scratch(self),
         )
+        if self.policy_context is not None:
+            if not isinstance(self.policy_context, PolicyContext):
+                raise TypeError("policy_context must be a PolicyContext")
+            self.policy_context.require_device(self.device)
 
 
 @dataclass(frozen=True)
@@ -303,6 +310,8 @@ def plan_decode_graph_scratch_envelope(
     max_partial_rows: int | None = None,
     force_split_kv: bool | None = None,
     copy_runtime_metadata: bool = True,
+    kv_cache_layout: str = "separate",
+    policy: PolicyContext | None = None,
 ) -> B12XPagedDecodeGraphScratchEnvelope:
     """Return the exact maximum scratch layout for decode batches ``1..N``.
 
@@ -354,6 +363,8 @@ def plan_decode_graph_scratch_envelope(
             max_work_items=max_work_items,
             max_partial_rows=max_partial_rows,
             force_split_kv=force_split_kv,
+            kv_cache_layout=kv_cache_layout,
+            policy=policy,
         )
         bucket_caps = B12XPagedAttentionScratchCaps(
             device=device,
@@ -478,6 +489,7 @@ class B12XPagedAttentionScratch:
     _plan: PagedPlan | None = None
     _plan_metadata_cache: _B12XPagedPlanMetadataCache | None = None
     _planner_budget: PagedPlanBudget | None = None
+    _policy_context: PolicyContext | None = None
     _decode_graph_chunk_pages_lut: torch.Tensor | None = None
     _decode_graph_max_chunks_per_req: int | None = None
     _use_regular_decode_graph_replay: bool = False
@@ -1845,6 +1857,7 @@ def _materialize_paged_attention_scratch(
         _plan=plan,
         _plan_metadata_cache=plan_metadata_cache,
         _planner_budget=planner_budget,
+        _policy_context=caps.policy_context,
         _decode_graph_chunk_pages_lut=decode_graph_chunk_pages_lut,
         _decode_graph_max_chunks_per_req=decode_graph_max_chunks_per_req,
         _use_regular_decode_graph_replay=use_regular_decode_graph_replay,
@@ -2218,6 +2231,7 @@ class B12XPagedAttentionScratchPlan:
             max_work_items=self.caps.max_work_items,
             max_partial_rows=self.caps.max_partial_rows,
             force_split_kv=force_split_kv,
+            policy=self.caps.policy_context,
         )
         decode_chunk_pages_lut = capacity.chunk_pages_lut
         max_chunks_per_req = capacity.max_chunks_per_request

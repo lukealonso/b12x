@@ -16,6 +16,7 @@ from ._impl import (
     run,
     run_kda,
 )
+from ._policy import GdnConfig, GdnQuery
 
 
 def is_supported(device=None) -> bool:
@@ -25,15 +26,17 @@ def is_supported(device=None) -> bool:
 
 
 __all__ = [
-    "Caps",
-    "Plan",
     "Binding",
+    "Caps",
+    "GdnConfig",
+    "GdnQuery",
     "KdaBinding",
-    "plan",
+    "Plan",
     "bind",
     "bind_kda",
+    "is_supported",
+    "plan",
+    "reference",
     "run",
     "run_kda",
-    "reference",
-    "is_supported",
 ]

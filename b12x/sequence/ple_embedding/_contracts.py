@@ -15,7 +15,10 @@ from b12x._lib.scratch_layout import (
     dtype_nbytes,
     materialize_scratch_view,
 )
+from b12x.policy import PolicyContext, get_auto_policy
 from b12x.sequence import ple_hash
+
+from ._policy import PLE_EMBEDDING_POLICY, PleEmbeddingQuery
 
 if TYPE_CHECKING:
     from ._storage import TableStorage
@@ -269,6 +272,7 @@ class Plan:
     _layout: _ScratchLayout
     _hash_plan: ple_hash.Plan
     _scratch_specs: tuple[ScratchBufferSpec, ...]
+    policy_resolution: object | None = None
 
     @property
     def head_count(self) -> int:
@@ -331,10 +335,31 @@ def plan(
     prime_sizes: torch.Tensor | None = None,
     table_offsets: torch.Tensor | None = None,
     multipliers: torch.Tensor | None = None,
+    policy: PolicyContext | None = None,
 ) -> Plan:
     """Plan hash geometry, TP-local table storage, and caller-owned scratch."""
     if not isinstance(caps, Caps):
         raise TypeError(f"caps must be Caps, got {type(caps)!r}")
+    policy = policy or get_auto_policy(caps.device)
+    if not isinstance(policy, PolicyContext):
+        raise TypeError("policy must be a PolicyContext")
+    policy.require_device(caps.device)
+    resolution = policy.resolve(
+        PLE_EMBEDDING_POLICY,
+        PleEmbeddingQuery(
+            quant_mode=caps.quant_mode,
+            table_memory=caps.table_memory,
+            output_dtype=str(caps.output_dtype).removeprefix("torch."),
+            max_tokens=caps.max_tokens,
+            max_seqs=caps.max_seqs,
+            vocab_size=caps.vocab_size,
+            max_order=caps.max_order,
+            heads_per_order=caps.heads_per_order,
+            base_table_size=caps.base_table_size,
+            embedding_dim=caps.embedding_dim,
+            tp_size=caps.tp_size,
+        ),
+    )
     hash_plan = ple_hash.plan(
         ple_hash.Caps(
             device=caps.device,
@@ -351,6 +376,7 @@ def plan(
         prime_sizes=prime_sizes,
         table_offsets=table_offsets,
         multipliers=multipliers,
+        policy=policy,
     )
     padded_vocab_size = int(hash_plan.padded_vocab_size)
     if padded_vocab_size % caps.tp_size:
@@ -426,6 +452,7 @@ def plan(
         _layout=layout,
         _hash_plan=hash_plan,
         _scratch_specs=(scratch_spec,),
+        policy_resolution=resolution,
     )
 
 
@@ -572,16 +599,24 @@ def bind(
     )
 
 
-def run(binding: Binding) -> torch.Tensor:
-    """Execute the fused-expressed hash, local gather, and dequantization op."""
+def run(binding: Binding, *, token_count: int | None = None) -> torch.Tensor:
+    """Hash and gather up to token_count rows from the planned storage.
+
+    The device num_tokens must fit this host launch bound. Rows after the
+    bound are untouched. The bound changes grids, not kernel specializations.
+    """
     if binding.plan.caps.device.type != "cuda":
         raise ValueError(
             "PLE embedding GPU run requires CUDA; use the explicit reference oracle"
         )
     from ._kernels import run_pipeline
 
-    run_pipeline(binding)
-    return binding.out
+    if token_count is None:
+        token_count = binding.plan.caps.max_tokens
+    if not 0 <= token_count <= binding.plan.caps.max_tokens:
+        raise ValueError("token_count must fit the planned token capacity")
+    run_pipeline(binding, token_count=token_count)
+    return binding.out[:token_count]
 
 
 __all__ = [

@@ -23,16 +23,18 @@ def _reset_validation_kernel(
         tl.store(error_code, 0)
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=["token_capacity", "sequence_capacity", "state_index_columns"]
+)
 def _validate_packed_metadata_kernel(
     query_start_loc,
     num_accepted_tokens,
     num_seqs,
     num_tokens,
     error_code,
-    MAX_SEQS: tl.constexpr,
-    MAX_TOKENS: tl.constexpr,
-    STATE_INDEX_COLUMNS: tl.constexpr,
+    token_capacity,
+    sequence_capacity,
+    state_index_columns,
 ):
     request = tl.program_id(0)
     live_seqs = tl.load(num_seqs).to(tl.int32)
@@ -41,17 +43,17 @@ def _validate_packed_metadata_kernel(
     if request == 0:
         counts_invalid = (
             (live_seqs < 0)
-            | (live_seqs > MAX_SEQS)
+            | (live_seqs > sequence_capacity)
             | (live_tokens < 0)
-            | (live_tokens > MAX_TOKENS)
+            | (live_tokens > token_capacity)
         )
         first = tl.load(query_start_loc).to(tl.int32)
-        safe_last = tl.maximum(0, tl.minimum(live_seqs, MAX_SEQS))
+        safe_last = tl.maximum(0, tl.minimum(live_seqs, sequence_capacity))
         last = tl.load(query_start_loc + safe_last).to(tl.int32)
         if counts_invalid | (first != 0) | (last != live_tokens):
             tl.atomic_or(error_code, 2)
 
-    if request < tl.maximum(0, tl.minimum(live_seqs, MAX_SEQS)):
+    if request < tl.maximum(0, tl.minimum(live_seqs, sequence_capacity)):
         start = tl.load(query_start_loc + request).to(tl.int32)
         end = tl.load(query_start_loc + request + 1).to(tl.int32)
         accepted = tl.load(num_accepted_tokens + request).to(tl.int32)
@@ -60,15 +62,22 @@ def _validate_packed_metadata_kernel(
             (start < 0)
             | (end < start)
             | (end > live_tokens)
-            | (length > STATE_INDEX_COLUMNS)
+            | (length > state_index_columns)
             | (accepted < 1)
-            | (accepted > STATE_INDEX_COLUMNS)
+            | (accepted > state_index_columns)
         )
         if invalid:
             tl.atomic_or(error_code, 2)
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=[
+        "sequence_capacity",
+        "state_index_columns",
+        "stride_indices_request",
+        "stride_indices_column",
+    ]
+)
 def _validate_active_state_slots_kernel(
     query_start_loc,
     num_accepted_tokens,
@@ -76,20 +85,20 @@ def _validate_active_state_slots_kernel(
     num_seqs,
     duplicate_slots,
     error_code,
-    stride_indices_request: tl.constexpr,
-    stride_indices_column: tl.constexpr,
-    MAX_SEQS: tl.constexpr,
+    sequence_capacity,
+    state_index_columns,
+    stride_indices_request,
+    stride_indices_column,
     MAX_STATE_SLOTS: tl.constexpr,
-    STATE_INDEX_COLUMNS: tl.constexpr,
     TABLE_SIZE: tl.constexpr,
     HAS_NULL_STATE_INDEX: tl.constexpr,
     NULL_STATE_INDEX: tl.constexpr,
 ):
     cell = tl.program_id(0)
-    request = cell // STATE_INDEX_COLUMNS
-    column = cell % STATE_INDEX_COLUMNS
+    request = cell // state_index_columns
+    column = cell % state_index_columns
     live_seqs = tl.load(num_seqs).to(tl.int32)
-    if request >= tl.maximum(0, tl.minimum(live_seqs, MAX_SEQS)):
+    if request >= tl.maximum(0, tl.minimum(live_seqs, sequence_capacity)):
         return
 
     start = tl.load(query_start_loc + request).to(tl.int32)
@@ -101,7 +110,7 @@ def _validate_active_state_slots_kernel(
 
     if HAS_NULL_STATE_INDEX:
         safe_accepted_column = tl.maximum(
-            0, tl.minimum(accepted_column, STATE_INDEX_COLUMNS - 1)
+            0, tl.minimum(accepted_column, state_index_columns - 1)
         )
         source_idx = tl.load(
             state_indices
@@ -140,7 +149,14 @@ def _validate_active_state_slots_kernel(
         tl.atomic_or(error_code, 1)
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=[
+        "sequence_capacity",
+        "state_index_columns",
+        "stride_indices_request",
+        "stride_indices_column",
+    ]
+)
 def _packed_sequential_kda_decode_kernel(
     mixed_qkv,
     a,
@@ -156,6 +172,8 @@ def _packed_sequential_kda_decode_kernel(
     error_code,
     scale,
     lower_bound,
+    sequence_capacity,
+    state_index_columns,
     stride_mixed_token: tl.constexpr,
     stride_a_token: tl.constexpr,
     stride_a_head: tl.constexpr,
@@ -165,8 +183,8 @@ def _packed_sequential_kda_decode_kernel(
     stride_state_slot: tl.constexpr,
     stride_state_head: tl.constexpr,
     stride_state_v: tl.constexpr,
-    stride_indices_request: tl.constexpr,
-    stride_indices_column: tl.constexpr,
+    stride_indices_request,
+    stride_indices_column,
     stride_output_token: tl.constexpr,
     stride_output_head: tl.constexpr,
     MAX_SEQS: tl.constexpr,
@@ -179,6 +197,7 @@ def _packed_sequential_kda_decode_kernel(
     QK_L2NORM: tl.constexpr,
     HAS_NULL_STATE_INDEX: tl.constexpr,
     NULL_STATE_INDEX: tl.constexpr,
+    VALIDATE_METADATA: tl.constexpr,
 ):
     value_tile = tl.program_id(0)
     request_value_head = tl.program_id(1)
@@ -187,10 +206,11 @@ def _packed_sequential_kda_decode_kernel(
     key_head = value_head
 
     live_seqs = tl.load(num_seqs).to(tl.int32)
-    if (request >= tl.maximum(0, tl.minimum(live_seqs, MAX_SEQS))) | (
-        tl.load(error_code).to(tl.int32) != 0
-    ):
+    if request >= tl.maximum(0, tl.minimum(live_seqs, sequence_capacity)):
         return
+    if VALIDATE_METADATA:
+        if tl.load(error_code).to(tl.int32) != 0:
+            return
 
     start = tl.load(query_start_loc + request).to(tl.int32)
     end = tl.load(query_start_loc + request + 1).to(tl.int32)
@@ -212,7 +232,9 @@ def _packed_sequential_kda_decode_kernel(
     if HAS_NULL_STATE_INDEX:
         if source_idx == NULL_STATE_INDEX:
             for relative_token in range(STATE_INDEX_COLUMNS):
-                if relative_token < (end - start):
+                if (relative_token < state_index_columns) & (
+                    relative_token < (end - start)
+                ):
                     token = start + relative_token
                     output_offsets = (
                         token.to(tl.int64) * stride_output_token
@@ -235,7 +257,7 @@ def _packed_sequential_kda_decode_kernel(
     )
 
     for relative_token in range(STATE_INDEX_COLUMNS):
-        if relative_token < (end - start):
+        if (relative_token < state_index_columns) & (relative_token < (end - start)):
             token = start + relative_token
             token_i64 = token.to(tl.int64)
             mixed_base = token_i64 * stride_mixed_token
@@ -259,9 +281,7 @@ def _packed_sequential_kda_decode_kernel(
             q *= scale
 
             b_value = tl.load(
-                b
-                + token_i64 * stride_b_token
-                + value_head.to(tl.int64) * stride_b_head
+                b + token_i64 * stride_b_token + value_head.to(tl.int64) * stride_b_head
             ).to(tl.float32)
             A_log_value = tl.load(A_log + value_head).to(tl.float32)
             raw_gate = tl.load(
@@ -317,7 +337,7 @@ def _packed_sequential_kda_decode_kernel(
             )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["token_capacity"])
 def _gated_rmsnorm_kernel(
     output,
     z,
@@ -325,16 +345,17 @@ def _gated_rmsnorm_kernel(
     num_tokens,
     error_code,
     eps,
+    token_capacity,
     stride_output_token: tl.constexpr,
     stride_output_head: tl.constexpr,
     stride_z_token: tl.constexpr,
     stride_z_head: tl.constexpr,
-    MAX_TOKENS: tl.constexpr,
     VALUE_HEADS: tl.constexpr,
     VALUE_HEAD_DIM: tl.constexpr,
     SIGMOID_GATE: tl.constexpr,
     NORM_WEIGHT_FP32: tl.constexpr,
     KDA_NORM_FP32: tl.constexpr,
+    VALIDATE_METADATA: tl.constexpr = True,
 ):
     token_value_head = tl.program_id(0)
     token = token_value_head // VALUE_HEADS
@@ -347,12 +368,13 @@ def _gated_rmsnorm_kernel(
         + value_head.to(tl.int64) * stride_output_head
         + cols.to(tl.int64)
     )
-    error = tl.load(error_code).to(tl.int32)
-    if error != 0:
-        tl.store(output + output_offsets, float("nan"), mask=mask)
-        return
+    if VALIDATE_METADATA:
+        error = tl.load(error_code).to(tl.int32)
+        if error != 0:
+            tl.store(output + output_offsets, float("nan"), mask=mask)
+            return
     live_tokens = tl.load(num_tokens).to(tl.int32)
-    if token >= tl.maximum(0, tl.minimum(live_tokens, MAX_TOKENS)):
+    if token >= tl.maximum(0, tl.minimum(live_tokens, token_capacity)):
         tl.store(output + output_offsets, 0.0, mask=mask)
         return
 
@@ -413,7 +435,7 @@ def _make_qwen_binding(
     null_state_index: int | None,
     duplicate_table_size: int,
 ):
-    from ._impl import Binding, Caps, plan
+    from ._impl import Binding, Caps, _materialize_plan
 
     caps = Caps(
         device=mixed_qkv.device,
@@ -431,7 +453,7 @@ def _make_qwen_binding(
         qk_l2norm=qk_l2norm,
         null_state_index=null_state_index,
     )
-    launch_plan = plan(caps)
+    launch_plan = _materialize_plan(caps, policy_resolution=None)
     if launch_plan.duplicate_table_size != duplicate_table_size:
         raise ValueError("GDN duplicate-table capacity does not match the plan")
     return Binding(
@@ -493,6 +515,7 @@ def _launch_gdn_decode(
     duplicate_table_size: int,
     recurrent_num_warps: int,
     norm_num_warps: int,
+    validate_metadata: bool,
 ) -> None:
     if lower_bounded_kda:
         if key_heads != value_heads or not sigmoid_gate:
@@ -500,50 +523,62 @@ def _launch_gdn_decode(
                 "GLM/KDA decode requires equal Q/K/V head counts and a "
                 "sigmoid output gate"
             )
+        token_capacity = int(output.shape[0])
+        sequence_capacity = int(state_indices.shape[0])
+        live_state_index_columns = int(state_indices.shape[1])
     elif value_heads != 3 * key_heads:
         raise RuntimeError(
             "Qwen GDN decode requires three value heads per key head, got "
             f"key_heads={key_heads}, value_heads={value_heads}"
         )
+    else:
+        token_capacity = int(max_tokens)
+        sequence_capacity = int(max_seqs)
+        live_state_index_columns = int(state_index_columns)
 
-    _reset_validation_kernel[(triton.cdiv(duplicate_table_size, _VALIDATION_BLOCK),)](
-        duplicate_slots,
-        error_code,
-        TABLE_SIZE=int(duplicate_table_size),
-        BLOCK=_VALIDATION_BLOCK,
-        num_warps=1,
-        num_stages=1,
-    )
-    _validate_packed_metadata_kernel[(max_seqs,)](
-        query_start_loc,
-        num_accepted_tokens,
-        num_seqs,
-        num_tokens,
-        error_code,
-        MAX_SEQS=int(max_seqs),
-        MAX_TOKENS=int(max_tokens),
-        STATE_INDEX_COLUMNS=int(state_index_columns),
-        num_warps=1,
-        num_stages=1,
-    )
-    _validate_active_state_slots_kernel[(max_seqs * state_index_columns,)](
-        query_start_loc,
-        num_accepted_tokens,
-        state_indices,
-        num_seqs,
-        duplicate_slots,
-        error_code,
-        stride_indices_request=int(state_indices.stride(0)),
-        stride_indices_column=int(state_indices.stride(1)),
-        MAX_SEQS=int(max_seqs),
-        MAX_STATE_SLOTS=int(max_state_slots),
-        STATE_INDEX_COLUMNS=int(state_index_columns),
-        TABLE_SIZE=int(duplicate_table_size),
-        HAS_NULL_STATE_INDEX=bool(has_null_state_index),
-        NULL_STATE_INDEX=int(null_state_index),
-        num_warps=1,
-        num_stages=1,
-    )
+    if validate_metadata:
+        _reset_validation_kernel[
+            (triton.cdiv(duplicate_table_size, _VALIDATION_BLOCK),)
+        ](
+            duplicate_slots,
+            error_code,
+            TABLE_SIZE=int(duplicate_table_size),
+            BLOCK=_VALIDATION_BLOCK,
+            num_warps=1,
+            num_stages=1,
+        )
+        _validate_packed_metadata_kernel[(sequence_capacity,)](
+            query_start_loc,
+            num_accepted_tokens,
+            num_seqs,
+            num_tokens,
+            error_code,
+            token_capacity,
+            sequence_capacity,
+            live_state_index_columns,
+            num_warps=1,
+            num_stages=1,
+        )
+        _validate_active_state_slots_kernel[
+            (sequence_capacity * live_state_index_columns,)
+        ](
+            query_start_loc,
+            num_accepted_tokens,
+            state_indices,
+            num_seqs,
+            duplicate_slots,
+            error_code,
+            sequence_capacity,
+            live_state_index_columns,
+            stride_indices_request=int(state_indices.stride(0)),
+            stride_indices_column=int(state_indices.stride(1)),
+            MAX_STATE_SLOTS=int(max_state_slots),
+            TABLE_SIZE=int(duplicate_table_size),
+            HAS_NULL_STATE_INDEX=bool(has_null_state_index),
+            NULL_STATE_INDEX=int(null_state_index),
+            num_warps=1,
+            num_stages=1,
+        )
     if not lower_bounded_kda:
         binding = _make_qwen_binding(
             mixed_qkv,
@@ -572,9 +607,7 @@ def _launch_gdn_decode(
             value_head_dim=value_head_dim,
             sigmoid_gate=sigmoid_gate,
             qk_l2norm=qk_l2norm,
-            null_state_index=(
-                null_state_index if has_null_state_index else None
-            ),
+            null_state_index=(null_state_index if has_null_state_index else None),
             duplicate_table_size=duplicate_table_size,
         )
         from ._cute_kernels import run_packed_recurrent_qwen
@@ -583,7 +616,7 @@ def _launch_gdn_decode(
     else:
         value_tiles = triton.cdiv(value_head_dim, block_v)
         _packed_sequential_kda_decode_kernel[
-            (value_tiles, max_seqs * value_heads)
+            (value_tiles, sequence_capacity * value_heads)
         ](
             mixed_qkv,
             a,
@@ -599,6 +632,8 @@ def _launch_gdn_decode(
             error_code,
             float(scale),
             float(lower_bound),
+            sequence_capacity,
+            live_state_index_columns,
             stride_mixed_token=int(mixed_qkv.stride(0)),
             stride_a_token=int(a.stride(0)),
             stride_a_head=int(a.stride(1)),
@@ -622,26 +657,28 @@ def _launch_gdn_decode(
             QK_L2NORM=bool(qk_l2norm),
             HAS_NULL_STATE_INDEX=bool(has_null_state_index),
             NULL_STATE_INDEX=int(null_state_index),
+            VALIDATE_METADATA=bool(validate_metadata),
             num_warps=int(recurrent_num_warps),
             num_stages=3,
         )
-    _gated_rmsnorm_kernel[(max_tokens * value_heads,)](
+    _gated_rmsnorm_kernel[(token_capacity * value_heads,)](
         output,
         z,
         norm_weight,
         num_tokens,
         error_code,
         float(eps),
+        token_capacity,
         stride_output_token=int(output.stride(0)),
         stride_output_head=int(output.stride(1)),
         stride_z_token=int(z.stride(0)),
         stride_z_head=int(z.stride(1)),
-        MAX_TOKENS=int(max_tokens),
         VALUE_HEADS=int(value_heads),
         VALUE_HEAD_DIM=int(value_head_dim),
         SIGMOID_GATE=bool(sigmoid_gate),
         NORM_WEIGHT_FP32=norm_weight.dtype == torch.float32,
         KDA_NORM_FP32=bool(lower_bounded_kda),
+        VALIDATE_METADATA=bool(validate_metadata),
         num_warps=int(norm_num_warps),
         num_stages=1,
     )
@@ -693,6 +730,7 @@ def _gdn_decode_op(
     duplicate_table_size: int,
     recurrent_num_warps: int,
     norm_num_warps: int,
+    validate_metadata: bool,
 ) -> None:
     _launch_gdn_decode(
         mixed_qkv,
@@ -731,6 +769,7 @@ def _gdn_decode_op(
         duplicate_table_size,
         recurrent_num_warps,
         norm_num_warps,
+        validate_metadata,
     )
 
 
@@ -772,6 +811,7 @@ def _gdn_decode_fake(
     duplicate_table_size: int,
     recurrent_num_warps: int,
     norm_num_warps: int,
+    validate_metadata: bool,
 ) -> None:
     del mixed_qkv, a, b, z, A_log, dt_bias, norm_weight
     del recurrent_state, query_start_loc, num_accepted_tokens, state_indices
@@ -781,7 +821,7 @@ def _gdn_decode_fake(
     del key_heads, value_heads, key_head_dim, value_head_dim, sigmoid_gate
     del qk_l2norm, lower_bounded_kda, has_null_state_index, null_state_index
     del block_v, duplicate_table_size
-    del recurrent_num_warps, norm_num_warps
+    del recurrent_num_warps, norm_num_warps, validate_metadata
 
 
 def run_gdn_decode(
@@ -821,6 +861,7 @@ def run_gdn_decode(
     duplicate_table_size: int,
     recurrent_num_warps: int,
     norm_num_warps: int,
+    validate_metadata: bool = True,
 ) -> None:
     torch.ops.b12x.gdn_decode(
         mixed_qkv,
@@ -859,6 +900,7 @@ def run_gdn_decode(
         int(duplicate_table_size),
         int(recurrent_num_warps),
         int(norm_num_warps),
+        bool(validate_metadata),
     )
 
 

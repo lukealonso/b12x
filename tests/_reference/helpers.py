@@ -87,7 +87,7 @@ def prepare_tp_moe_fp4_experts(
     source_format: str = "modelopt_nvfp4",
     w13_layout: str = "w13",
 ):
-    """Prepare one explicit expert owner from source tensors for a test."""
+    """Prepare an expert owner, retaining NVFP4 oracle inputs via shared recipes."""
     from b12x.moe.fused_moe._impl import (
         plan_b12x_fp4_moe_weights,
         prepare_b12x_fp4_moe_weights,
@@ -97,7 +97,11 @@ def prepare_tp_moe_fp4_experts(
     weight_E = int(w1_fp4.shape[0])
     n = int(w2_fp4.shape[2]) * 2
     weight_plan = plan_b12x_fp4_moe_weights(
-        quant_modes=normalized_mode,
+        quant_modes=(
+            ("nvfp4", "w4a16")
+            if normalized_mode == "w4a16" and source_format == "modelopt_nvfp4"
+            else normalized_mode
+        ),
         source_format=source_format,
         activation=activation,
         params_dtype=a.dtype,
@@ -143,12 +147,14 @@ def make_tp_moe_fp4_binding(
     from b12x.moe import fused_moe
 
     modes = experts.plan.quant_modes
-    if len(modes) != 1:
-        raise ValueError("test helper requires a single private recipe")
-    planned_mode = next(iter(modes))
-    if quant_mode is not None and quant_mode.lower() != planned_mode:
+    planned_mode = (
+        quant_mode.lower() if quant_mode is not None
+        else "w4a16" if modes == {"nvfp4", "w4a16"}
+        else next(iter(modes))
+    )
+    if planned_mode not in modes:
         raise ValueError(
-            f"requested test recipe {quant_mode!r} does not match {planned_mode!r}"
+            f"requested test recipe {planned_mode!r} is not prepared: {sorted(modes)}"
         )
     plan = fused_moe.plan(
         fused_moe.Caps(

@@ -17,8 +17,6 @@ def supports_combine_norm(
     *,
     streams: int,
     hidden_size: int,
-    device: torch.device | None = None,
-    compute_capability: tuple[int, int] | None = None,
 ) -> bool:
     """Return whether the Qwen contract has a production CuTe implementation."""
     if not is_qwen_combine_norm_contract(
@@ -26,7 +24,6 @@ def supports_combine_norm(
         hidden_size=hidden_size,
     ):
         return False
-    del device, compute_capability
     return True
 
 

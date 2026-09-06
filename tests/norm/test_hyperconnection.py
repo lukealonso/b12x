@@ -171,17 +171,10 @@ def test_cute_combine_norm_dispatch_contract_is_explicit() -> None:
     assert _cute_config.supports_combine_norm(
         streams=4,
         hidden_size=2560,
-        compute_capability=(12, 0),
-    )
-    assert _cute_config.supports_combine_norm(
-        streams=4,
-        hidden_size=2560,
-        compute_capability=(12, 1),
     )
     assert not _cute_config.supports_combine_norm(
         streams=3,
         hidden_size=2560,
-        compute_capability=(12, 0),
     )
 
 
@@ -727,8 +720,6 @@ def test_cute_backend_uses_tensor_device_for_resolution_and_launch(
     target_index = next(
         index for index in range(torch.cuda.device_count()) if index != current_index
     )
-    if torch.cuda.get_device_capability(target_index) != (12, 0):
-        pytest.skip("requires an SM120 non-current CUDA device")
     target = torch.device("cuda", target_index)
     projected = torch.randn((1, 320), dtype=torch.bfloat16, device=target).contiguous()
     output = torch.empty_like(projected)

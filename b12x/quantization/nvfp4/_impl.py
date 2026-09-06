@@ -114,7 +114,12 @@ def allocate_bf16_to_fp4_tma_outputs(
     )
 
 
-def compile_bf16_to_fp4_tma(M: int, K: int):
+def compile_bf16_to_fp4_tma(
+    M: int,
+    K: int,
+    *,
+    liveness_strategy: str | None = None,
+):
     """Compile the BF16→FP4 TMA kernel for (M, K). Returns a launch callable.
 
     The callable signature is: ``launch(bf16_input, global_scale, packed_a_flat, scale_flat)``
@@ -138,15 +143,20 @@ def compile_bf16_to_fp4_tma(M: int, K: int):
         assumed_align=16,
     )
     mac = min(get_max_active_clusters(1), get_num_sm(torch.device("cuda")))
-    if M == _TILE_M:
+    if liveness_strategy is None and M == _TILE_M:
         # CUTLASS DSL 4.6 already lowers the register count for these shapes;
         # retain their original instruction schedule.
         liveness_strategy = "retain"
-    else:
+    elif liveness_strategy is None:
         # CUTLASS DSL 4.6 otherwise keeps two BF16-derived FP32 values live
         # across exact scale division.  Preserve the pair losslessly in one
         # raw register to shorten that live range without adding memory work.
         liveness_strategy = "packed"
+    if liveness_strategy not in {"retain", "packed"}:
+        raise ValueError(
+            "liveness_strategy must be 'retain' or 'packed', got "
+            f"{liveness_strategy!r}"
+        )
     cache_key = (M, K, liveness_strategy, mac)
     cached = _KERNEL_CACHE.get(cache_key)
     if cached is not None:

@@ -15,6 +15,7 @@ from ._contracts import (
     run,
 )
 from ._storage import TableStorage, allocate_storage
+from ._policy import PleEmbeddingConfig, PleEmbeddingQuery
 
 
 def is_supported(device=None) -> bool:
@@ -29,6 +30,8 @@ __all__ = [
     "Caps",
     "Plan",
     "Binding",
+    "PleEmbeddingConfig",
+    "PleEmbeddingQuery",
     "plan",
     "allocate_storage",
     "bind",

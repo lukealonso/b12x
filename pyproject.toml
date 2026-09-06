@@ -33,10 +33,20 @@ build-backend = "setuptools.build_meta"
 
 [project.entry-points."vllm.general_plugins"]
 b12x_fp6 = "b12x.integration.vllm.plugin:register_b12x_fp6"
+b12x_loader = "b12x.integration.vllm.loader:register_b12x_loader"
+
+[project.scripts]
+b12x-generate-gpu-profile = "b12x.tools.generate_gpu_profile:main"
+b12x-inspect-model-policy = "b12x.tools.inspect_model_policy:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["b12x*"]
+
+[tool.setuptools.package-data]
+"b12x.policy._profiles" = ["data/*.json.gz"]
+"b12x.comm.roce" = ["*.c"]
+"b12x.loader" = ["*.c"]
 
 [tool.ruff.lint]
 select = ["E", "F", "B", "SIM"]

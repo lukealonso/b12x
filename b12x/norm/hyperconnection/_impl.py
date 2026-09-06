@@ -8,7 +8,12 @@ from dataclasses import dataclass
 import torch
 
 from b12x._lib.scratch import ScratchBufferSpec
+from b12x.policy import PolicyContext, get_auto_policy
 
+from ._policy import (
+    HYPERCONNECTION_POLICY,
+    HyperConnectionQuery,
+)
 
 _MAX_TRITON_REDUCTION_WIDTH = 65_536
 
@@ -91,6 +96,7 @@ class HyperConnectionPlan:
     reduction_block_h: int
     pointwise_block: int
     reduction_num_warps: int
+    policy_resolution: object | None = None
 
     def scratch_specs(self) -> tuple[ScratchBufferSpec, ...]:
         """HyperConnection primitives use no anonymous scratch allocation."""
@@ -162,17 +168,36 @@ class HyperConnectionPlan:
         )
 
 
-def plan_hyperconnection(caps: HyperConnectionCaps) -> HyperConnectionPlan:
+def plan_hyperconnection(
+    caps: HyperConnectionCaps,
+    *,
+    policy: PolicyContext | None = None,
+) -> HyperConnectionPlan:
     """Plan fixed launch geometry for the supplied serving capacity."""
 
     if not isinstance(caps, HyperConnectionCaps):
         raise TypeError(f"caps must be HyperConnectionCaps, got {type(caps)!r}")
-    reduction_block_h = 1 << (caps.hidden_size - 1).bit_length()
+    policy = policy or get_auto_policy(caps.device)
+    if not isinstance(policy, PolicyContext):
+        raise TypeError("policy must be a PolicyContext")
+    policy.require_device(caps.device)
+    resolution = policy.resolve(
+        HYPERCONNECTION_POLICY,
+        HyperConnectionQuery(
+            dtype=str(caps.dtype).removeprefix("torch."),
+            max_tokens=caps.max_tokens,
+            hidden_size=caps.hidden_size,
+            streams=caps.streams,
+            lowrank=caps.lowrank,
+        ),
+    )
+    config = resolution.config
     return HyperConnectionPlan(
         caps=caps,
-        reduction_block_h=reduction_block_h,
-        pointwise_block=256,
-        reduction_num_warps=8 if reduction_block_h >= 2048 else 4,
+        reduction_block_h=config.reduction_block_h,
+        pointwise_block=config.pointwise_block,
+        reduction_num_warps=config.reduction_num_warps,
+        policy_resolution=resolution,
     )
 
 

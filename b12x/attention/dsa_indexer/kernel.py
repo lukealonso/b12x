@@ -139,6 +139,9 @@ class IndexerPagedSupertileLogitsKernelBinding:
     tile_block_q: int = _PAGED_TILED_BLOCK_Q
     tile_block_k: int = _PAGED_TILED_BLOCK_K
     preinitialize_tile_logits: bool = True
+    stream_scorer: bool | None = None
+    persistent_ctas: int | None = None
+    stream_ctas: int | None = None
 
     def run(self) -> torch.Tensor:
         return run_paged_supertile_logits_kernel(binding=self)
@@ -219,6 +222,9 @@ def build_indexer_paged_supertile_logits_kernel_binding(
     tile_block_q: int = _PAGED_TILED_BLOCK_Q,
     tile_block_k: int = _PAGED_TILED_BLOCK_K,
     preinitialize_tile_logits: bool = True,
+    stream_scorer: bool | None = None,
+    persistent_ctas: int | None = None,
+    stream_ctas: int | None = None,
 ) -> IndexerPagedSupertileLogitsKernelBinding:
     return IndexerPagedSupertileLogitsKernelBinding(
         q_fp8=q_fp8,
@@ -234,6 +240,9 @@ def build_indexer_paged_supertile_logits_kernel_binding(
         tile_block_q=int(tile_block_q),
         tile_block_k=int(tile_block_k),
         preinitialize_tile_logits=bool(preinitialize_tile_logits),
+        stream_scorer=stream_scorer,
+        persistent_ctas=persistent_ctas,
+        stream_ctas=stream_ctas,
     )
 
 
@@ -2603,6 +2612,9 @@ def run_paged_supertile_logits_kernel(
     tile_block_q: int | None = None,
     tile_block_k: int | None = None,
     preinitialize_tile_logits: bool | None = None,
+    stream_scorer: bool | None = None,
+    persistent_ctas: int | None = None,
+    stream_ctas: int | None = None,
     binding: IndexerPagedSupertileLogitsKernelBinding | None = None,
 ) -> torch.Tensor:
     if binding is not None:
@@ -2622,6 +2634,9 @@ def run_paged_supertile_logits_kernel(
                 ("tile_block_q", tile_block_q),
                 ("tile_block_k", tile_block_k),
                 ("preinitialize_tile_logits", preinitialize_tile_logits),
+                ("stream_scorer", stream_scorer),
+                ("persistent_ctas", persistent_ctas),
+                ("stream_ctas", stream_ctas),
             )
             if value is not None
         ]
@@ -2640,6 +2655,9 @@ def run_paged_supertile_logits_kernel(
         tile_block_q = binding.tile_block_q
         tile_block_k = binding.tile_block_k
         preinitialize_tile_logits = binding.preinitialize_tile_logits
+        stream_scorer = binding.stream_scorer
+        persistent_ctas = binding.persistent_ctas
+        stream_ctas = binding.stream_ctas
 
     q_fp8 = _require_bound_arg(
         q_fp8,
@@ -2692,6 +2710,11 @@ def run_paged_supertile_logits_kernel(
     preinitialize_tile_logits = (
         True if preinitialize_tile_logits is None else bool(preinitialize_tile_logits)
     )
+    stream_scorer = (
+        _env_indexer_stream_scorer_enabled()
+        if stream_scorer is None
+        else bool(stream_scorer)
+    )
     return _run_paged_tiled_logits_kernel_common(
         q_fp8=q_fp8,
         weights=weights,
@@ -2707,6 +2730,9 @@ def run_paged_supertile_logits_kernel(
         source_page_offset=source_page_offset,
         output_width_tokens=output_width_tokens,
         supertile=True,
+        stream_scorer=stream_scorer,
+        persistent_ctas=persistent_ctas,
+        stream_ctas=stream_ctas,
     )
 
 
@@ -2726,6 +2752,9 @@ def _run_paged_tiled_logits_kernel_common(
     source_page_offset: int = 0,
     output_width_tokens: int | None = None,
     supertile: bool,
+    stream_scorer: bool = False,
+    persistent_ctas: int | None = None,
+    stream_ctas: int | None = None,
 ) -> torch.Tensor:
     if page_size != _PAGE_SIZE:
         raise ValueError(
@@ -2879,14 +2908,16 @@ def _run_paged_tiled_logits_kernel_common(
             dynamic_dims=(0,),
         ),
     )
-    persistent_ctas = _resolve_dsa_persistent_ctas(
-        device_index=device_index,
-        q_rows=rows,
+    persistent_ctas = (
+        _resolve_dsa_persistent_ctas(device_index=device_index, q_rows=rows)
+        if persistent_ctas is None
+        else max(1, int(persistent_ctas))
     )
-    if supertile and _env_indexer_stream_scorer_enabled():
-        stream_ctas = _resolve_stream_scorer_ctas(
-            device_index=device_index,
-            q_rows=rows,
+    if supertile and stream_scorer:
+        stream_ctas = (
+            _resolve_stream_scorer_ctas(device_index=device_index, q_rows=rows)
+            if stream_ctas is None
+            else max(1, int(stream_ctas))
         )
         kernel = _build_dsa_paged_stream_supertile_kernel(
             stream_ctas,

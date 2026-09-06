@@ -1380,6 +1380,7 @@ def _make_glm_sparse_scratch(device, *, topk, max_chunks, num_heads, s_kv):
     )
 
     caps = B12XSparseMLAScratchCaps(
+        softmax_scale=1.0,
         device=device,
         num_q_heads=num_heads,
         max_q_rows=1,
@@ -1627,6 +1628,7 @@ def test_unified_decode_glm_multitoken_per_token_length(num_tokens) -> None:
 
     n_chunks = (topk + 64 - 1) // 64
     caps = B12XSparseMLAScratchCaps(
+        softmax_scale=1.0,
         device=device,
         num_q_heads=_GLM_NUM_HEADS,
         max_q_rows=num_tokens,
@@ -1667,6 +1669,135 @@ def test_unified_decode_glm_multitoken_per_token_length(num_tokens) -> None:
             f"GLM T={num_tokens} token {t} (len={int(lengths[t])}) O cos={cos}"
         )
         assert (got[t] - exp_O[t]).abs().max().item() < 3e-2
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("num_tokens", [1, 4])
+@pytest.mark.parametrize("high_page_ids", [False, True], ids=["low-pages", "high-pages"])
+def test_unified_decode_glm_serial_chunks_rescale_late_maximum(
+    num_tokens, high_page_ids
+) -> None:
+    """Rescale accumulated values when every row-0 head peaks in the last chunk.
+
+    Compare a serial ten-chunk walk and one chunk per split with the reference,
+    using both ordinary page IDs and page offsets beyond signed 32-bit range.
+    """
+    device = require_b12x_sparse_mla()
+    from b12x.attention._shared.mla.kernel import run_unified_decode
+    from b12x.attention.sparse_mla._scratch import (
+        B12XSparseMLAScratchCaps,
+        plan_sparse_mla_scratch,
+    )
+
+    topk = 640
+    n_chunks = topk // 64
+    boost = 60.0
+    nblk = max(1, (topk + _GLM_PAGE - 1) // _GLM_PAGE)
+    case = glm_ref.make_glm_decode_case(
+        num_heads=_GLM_NUM_HEADS,
+        topk=topk,
+        num_tokens=num_tokens,
+        num_blocks=nblk,
+        page_block_size=_GLM_PAGE,
+        invalidate_half=False,
+        seed=7900 + num_tokens,
+        device=device,
+    )
+    q = case["q"].contiguous()
+    kv_cache = case["kv_cache"].contiguous()
+    # Distinct slots keep boosted keys out of the first nine chunks.
+    idx = torch.arange(topk, dtype=torch.int32, device=device)
+    idx = idx.expand(num_tokens, -1).contiguous()
+    sm_scale = case["sm_scale"]
+    s_kv = kv_cache.shape[0]
+    # Heads h and h + 64 of row 0 share key h in the last chunk; the key's rope
+    # part points along the mean of their (unit) query rope parts.
+    rope = q[0, :, 512:].float()
+    rope = rope / rope.norm(dim=-1, keepdim=True)
+    pair_mean = rope.view(-1, 64, rope.shape[-1]).sum(dim=0)
+    pair_mean = boost * pair_mean / pair_mean.norm(dim=-1, keepdim=True)
+    for key in range(64):
+        slot = int(idx[0, topk - 64 + key])
+        kv_cache[slot, 0, 528:656] = pair_mean[key].to(torch.bfloat16).view(torch.uint8)
+    kv = glm_ref.unpack_mla_kv_cache_reference(kv_cache).squeeze(1).float()
+    scores = q[0].float() @ kv[idx[0].long()].T * sm_scale
+    assert (scores.argmax(dim=-1) >= topk - 64).all(), "maximum must arrive late"
+    lengths = torch.full((num_tokens,), topk, dtype=torch.int32, device=device)
+    exp_O = glm_ref.glm_decode_reference(
+        q, kv_cache, idx, sm_scale, active_token_counts=lengths
+    ).float()
+    assert torch.isfinite(exp_O).all() and exp_O.norm() > 0
+
+    if high_page_ids:
+        page_stride_bytes = _GLM_PAGE * _GLM_KV_BYTES_PER_TOKEN
+        int32_max = torch.iinfo(torch.int32).max
+        high_page = int32_max // page_stride_bytes + 2
+        slot_bias = high_page * _GLM_PAGE
+        required_bytes = (slot_bias + s_kv) * _GLM_KV_BYTES_PER_TOKEN
+        free_bytes, _ = torch.cuda.mem_get_info(device)
+        if free_bytes < required_bytes + 2 * 1024**3:
+            pytest.skip(
+                "GLM high-page rescale test requires "
+                f"{required_bytes + 2 * 1024**3} bytes free, found {free_bytes}"
+            )
+        pool = torch.empty(
+            (slot_bias + s_kv, 1, _GLM_KV_BYTES_PER_TOKEN),
+            dtype=torch.uint8,
+            device=device,
+        )
+        # Relocate the oracle's initialized keys without reading the unused pool.
+        pool[slot_bias:].copy_(kv_cache)
+        kv_cache = pool
+        idx = idx + slot_bias
+        s_kv = pool.shape[0]
+        assert high_page * page_stride_bytes > int32_max
+        assert s_kv < int32_max
+
+    def run(forced_num_splits: int) -> torch.Tensor:
+        caps = B12XSparseMLAScratchCaps(
+            softmax_scale=1.0,
+            device=device,
+            num_q_heads=_GLM_NUM_HEADS,
+            max_q_rows=num_tokens,
+            max_batch=num_tokens,
+            max_width=topk,
+            max_kv_rows=s_kv,
+            head_dim=glm_ref.GLM_Q_HEAD_DIM,
+            v_head_dim=glm_ref.GLM_D_V,
+            max_chunks_per_row=max(8, n_chunks),
+            page_size=_GLM_PAGE,
+        )
+        plan = plan_sparse_mla_scratch(caps)
+        (spec,) = plan.scratch_specs()
+        storage = torch.zeros(spec.shape, dtype=spec.dtype, device=device)
+        cache_seqlens = torch.full((num_tokens,), s_kv, dtype=torch.int32, device=device)
+        binding = plan.bind(
+            scratch=storage,
+            q=q,
+            selected_indices=idx,
+            cache_seqlens_int32=cache_seqlens,
+            nsa_cache_seqlens_int32=lengths,
+        )
+        out = run_unified_decode(
+            q_all=q,
+            swa_k_cache=kv_cache,
+            swa_indices=idx,
+            swa_topk_lengths=lengths,
+            workspace=binding.scratch,
+            sm_scale=sm_scale,
+            swa_page_size=_GLM_PAGE,
+            forced_num_splits=forced_num_splits,
+        )
+        torch.cuda.synchronize()
+        return out.float().clone()
+
+    serial = run(1)
+    per_chunk = run(n_chunks)
+    for label, got in (("serial", serial), ("per_chunk", per_chunk)):
+        rel = ((got - exp_O).norm() / exp_O.norm()).item()
+        assert rel < 2e-2, f"{label} rel-L2 vs reference {rel}"
+    rel = ((serial - per_chunk).norm() / exp_O.norm()).item()
+    assert rel < 1e-2, f"serial vs per-chunk rel-L2 {rel}"
 
 
 @torch.inference_mode()
@@ -2383,3 +2514,61 @@ def test_unified_prefill_glm_mixed_per_token_length_with_zero_row(
             f"neg_pad={neg_pad_past_len}) O cos={cos}"
         )
         assert (got[t] - exp_O[t]).abs().max().item() < 3e-2
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("topk", [192, 100])
+def test_unified_prefill_dsv4_sub_container_topk_matches_ref(topk: int) -> None:
+    """A short prefill clamps the runtime top-k below index_topk (192 for a
+    192-token sequence); the entry must widen the rows to the 512 container and
+    match both the reference and a caller-padded 512-wide call."""
+    device = require_b12x_sparse_mla()
+    from b12x.attention._shared.mla.kernel import run_unified_prefill
+
+    num_tokens, num_heads = 16, _DSV4_HEADS
+    num_blocks = 8
+    case = prefill_ref.make_dsv4_prefill_case(
+        num_tokens=num_tokens,
+        num_heads=num_heads,
+        topk=topk,
+        num_blocks=num_blocks,
+        page_block_size=_DSV4_PAGE,
+        with_sink=False,
+        invalidate_half=True,
+        device=device,
+        seed=192,
+    )
+    q = case["q"].contiguous()
+    swa_cache = _repack_dsv4_to_compressed(case["kv_cache"], _DSV4_PAGE, num_blocks)
+    idx = case["topk_indices"].contiguous()
+    lengths = case["topk_lengths"].contiguous()
+
+    O, lse = run_unified_prefill(
+        q=q,
+        kv_cache=swa_cache,
+        topk_indices=idx,
+        topk_length=lengths,
+        sm_scale=case["sm_scale"],
+        page_block_size=_DSV4_PAGE,
+    )
+    padded_idx = torch.nn.functional.pad(idx, (0, 512 - topk), value=-1).contiguous()
+    O_padded, lse_padded = run_unified_prefill(
+        q=q,
+        kv_cache=swa_cache,
+        topk_indices=padded_idx,
+        topk_length=lengths,
+        sm_scale=case["sm_scale"],
+        page_block_size=_DSV4_PAGE,
+    )
+    torch.cuda.synchronize()
+
+    got = O.float()
+    exp = case["expected_O"].float()
+    assert got.shape == (num_tokens, num_heads, _DSV4_HEAD_DIM)
+    assert torch.isfinite(got).all()
+    assert torch.equal(O, O_padded)
+    assert torch.equal(lse, lse_padded)
+    cos = _cosine(got, exp)
+    assert cos > 0.999, f"DSV4 prefill topk={topk} O cos={cos}"
+    assert (got - exp).abs().max().item() < 2e-2
+    assert (lse.float() - case["expected_lse"].float()).abs().max().item() < 5e-2

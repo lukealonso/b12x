@@ -2273,6 +2273,45 @@ def test_pool_coordinates_ipc_teardown_across_ranks(monkeypatch):
     assert pool._channels == {3: retained}
 
 
+def test_pool_binds_cuda_device_for_teardown_barriers(monkeypatch):
+    barriers = []
+    synchronizations = []
+
+    class FakeChannel:
+        def _close_ipc_imports(self):
+            pass
+
+        def _free_ipc_exports(self):
+            pass
+
+    group = object()
+    pool = PCIeOneshotAllReducePool(
+        rank=0,
+        world_size=2,
+        device=torch.device("cuda:3"),
+        exchange_group=group,
+        channel_factory=lambda stream_key: _make_runtime(eager=True),
+    )
+    retained = FakeChannel()
+    transient = FakeChannel()
+    pool._all_channels = [retained]
+    checkpoint = pool.checkpoint_channels()
+    pool._all_channels.append(transient)
+    monkeypatch.setattr(
+        "b12x.comm.pcie.pcie_oneshot.torch.cuda.synchronize",
+        lambda device: synchronizations.append(device),
+    )
+    monkeypatch.setattr(
+        "b12x.comm.pcie.pcie_oneshot.dist.barrier",
+        lambda *, group, device_ids=None: barriers.append((group, device_ids)),
+    )
+
+    pool.rollback_channels(checkpoint)
+
+    assert synchronizations == [torch.device("cuda:3")]
+    assert barriers == [(group, [3])] * 3
+
+
 def test_channel_destructor_retains_all_cuda_ownership_without_side_effects():
     events = []
 

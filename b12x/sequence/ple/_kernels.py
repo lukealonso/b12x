@@ -25,7 +25,7 @@ def _reset_error_kernel(error_code_ptr):
     tl.store(error_code_ptr, 0)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["launch_tokens"])
 def _validate_metadata_kernel(
     query_start_loc_ptr,
     state_slot_ids_ptr,
@@ -34,6 +34,7 @@ def _validate_metadata_kernel(
     num_seqs_ptr,
     num_tokens_ptr,
     error_code_ptr,
+    launch_tokens,
     MAX_TOKENS: tl.constexpr,
     MAX_SEQS: tl.constexpr,
     MAX_STATE_SLOTS: tl.constexpr,
@@ -52,6 +53,7 @@ def _validate_metadata_kernel(
             | (num_seqs > MAX_SEQS)
             | (num_tokens < 0)
             | (num_tokens > MAX_TOKENS)
+            | (num_tokens > launch_tokens)
             | ((num_seqs == 0) & (num_tokens > 0))
         )
         tl.atomic_or(
@@ -570,6 +572,7 @@ def _launch_layer_pipeline(
     mixed: bool,
 ) -> None:
     """Launch the allocation-free PLE pipeline on the current CUDA stream."""
+    launch_tokens = residual.shape[0]
     channels = streams * hidden_size
     state_length = dilation * (kernel_size - 1)
     state_capacity = state_length + max_speculative_tokens
@@ -585,6 +588,7 @@ def _launch_layer_pipeline(
         num_seqs,
         num_tokens,
         error_code,
+        launch_tokens,
         MAX_TOKENS=max_tokens,
         MAX_SEQS=max_seqs,
         MAX_STATE_SLOTS=max_state_slots,
@@ -594,7 +598,7 @@ def _launch_layer_pipeline(
         BLOCK_R=request_block,
         num_warps=1,
     )
-    _request_ids_kernel[(max_tokens,)](
+    _request_ids_kernel[(launch_tokens,)](
         query_start_loc,
         num_seqs,
         num_tokens,
@@ -626,7 +630,7 @@ def _launch_layer_pipeline(
     )
     block_h = max(16, triton.next_power_of_2(hidden_size))
     reduction_warps = 8 if block_h >= 2048 else 4
-    _gated_u_norm_kernel[(max_tokens, streams)](
+    _gated_u_norm_kernel[(launch_tokens, streams)](
         residual,
         key,
         value,
@@ -646,7 +650,7 @@ def _launch_layer_pipeline(
         BLOCK_H=block_h,
         num_warps=reduction_warps,
     )
-    _dilated_conv_kernel[(max_tokens, channel_grid)](
+    _dilated_conv_kernel[(launch_tokens, channel_grid)](
         normalized_u,
         gathered_state,
         conv_weight,
@@ -956,13 +960,15 @@ def run_layer_kernels(binding: LayerBinding, *, eps: float, decode: bool) -> Non
     )
 
 
-def run_layer_mixed_kernels(binding: LayerBinding, *, eps: float) -> None:
+def run_layer_mixed_kernels(
+    binding: LayerBinding, *, eps: float, token_count: int
+) -> None:
     """Dispatch the opaque mixed packed PLE pipeline."""
     caps = binding.plan.caps
     request_is_prefill = binding.request_is_prefill
     assert request_is_prefill is not None
     torch.ops.b12x.ple_layer_mixed_pipeline(
-        binding.residual,
+        binding.residual[:token_count],
         binding.key,
         binding.value,
         binding.k_norm_weight,

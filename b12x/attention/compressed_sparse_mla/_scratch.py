@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
+from typing import Literal
 
 import torch
 
@@ -44,10 +45,18 @@ class B12XCompressedSparseMLAScratchCaps:
     v_head_dim: int = COMPRESSED_SPARSE_MLA_HEAD_DIM
     max_batch: int | None = None
     max_kv_rows: int = 0
-    max_chunks_per_row: int = 64
+    max_chunks_per_row: int | None = None
     max_q_chunks: int | None = None
     decode_row_capacity: int | None = None
     page_size: int = 64
+    layout: str = "compressed_dsv4"
+    mode: Literal["decode", "extend"] = "decode"
+    swa_width: int | None = None
+    indexed_width: int | None = None
+    swa_page_size: int | None = None
+    indexed_page_size: int | None = None
+    use_cuda_graph: bool = False
+    shared_width_capacity: bool | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         device = torch.device(self.device)
@@ -57,6 +66,43 @@ class B12XCompressedSparseMLAScratchCaps:
         object.__setattr__(self, "num_q_heads", max(int(self.num_q_heads), 1))
         object.__setattr__(self, "max_q_rows", max(int(self.max_q_rows), 1))
         object.__setattr__(self, "max_width", max(int(self.max_width), 1))
+        if self.layout != "compressed_dsv4":
+            raise ValueError(f"unsupported compressed sparse MLA layout {self.layout!r}")
+        if self.mode not in ("decode", "extend"):
+            raise ValueError(f"unsupported compressed sparse MLA mode {self.mode!r}")
+        legacy_shared_width = (
+            self.swa_width is None and self.indexed_width is None
+            if self.shared_width_capacity is None
+            else bool(self.shared_width_capacity)
+        )
+        if legacy_shared_width:
+            if self.swa_width is None and self.indexed_width is None:
+                swa_width = indexed_width = self.max_width
+            else:
+                swa_width = int(self.swa_width)
+                indexed_width = int(self.indexed_width)
+                if swa_width != self.max_width or indexed_width != self.max_width:
+                    raise ValueError(
+                        "shared width capacity must equal max_width for both routes"
+                    )
+        elif self.swa_width is None:
+            indexed_width = int(self.indexed_width)
+            swa_width = self.max_width - indexed_width
+        elif self.indexed_width is None:
+            swa_width = int(self.swa_width)
+            indexed_width = self.max_width - swa_width
+        else:
+            swa_width = int(self.swa_width)
+            indexed_width = int(self.indexed_width)
+        if swa_width < 0 or indexed_width < 0:
+            raise ValueError("swa_width and indexed_width must be non-negative")
+        if not legacy_shared_width and swa_width + indexed_width != self.max_width:
+            raise ValueError(
+                "swa_width + indexed_width must equal max_width"
+            )
+        object.__setattr__(self, "swa_width", swa_width)
+        object.__setattr__(self, "indexed_width", indexed_width)
+        object.__setattr__(self, "shared_width_capacity", legacy_shared_width)
         max_page_table_width = (
             self.max_width
             if self.max_page_table_width is None
@@ -70,9 +116,12 @@ class B12XCompressedSparseMLAScratchCaps:
         max_batch = self.max_q_rows if self.max_batch is None else self.max_batch
         object.__setattr__(self, "max_batch", max(int(max_batch), 1))
         object.__setattr__(self, "max_kv_rows", max(int(self.max_kv_rows), 0))
-        object.__setattr__(
-            self, "max_chunks_per_row", max(int(self.max_chunks_per_row), 1)
-        )
+        if self.max_chunks_per_row is not None:
+            object.__setattr__(
+                self,
+                "max_chunks_per_row",
+                max(int(self.max_chunks_per_row), 1),
+            )
         if self.max_q_chunks is not None:
             object.__setattr__(self, "max_q_chunks", max(int(self.max_q_chunks), 1))
         if self.decode_row_capacity is not None:
@@ -82,7 +131,19 @@ class B12XCompressedSparseMLAScratchCaps:
                     f"decode_row_capacity must be positive, got {decode_row_capacity}"
                 )
             object.__setattr__(self, "decode_row_capacity", decode_row_capacity)
-        object.__setattr__(self, "page_size", max(int(self.page_size), 1))
+        swa_page_size = (
+            self.page_size if self.swa_page_size is None else self.swa_page_size
+        )
+        swa_page_size = max(int(swa_page_size), 1)
+        indexed_page_size = (
+            swa_page_size
+            if self.indexed_page_size is None
+            else max(int(self.indexed_page_size), 1)
+        )
+        object.__setattr__(self, "page_size", swa_page_size)
+        object.__setattr__(self, "swa_page_size", swa_page_size)
+        object.__setattr__(self, "indexed_page_size", indexed_page_size)
+        object.__setattr__(self, "use_cuda_graph", bool(self.use_cuda_graph))
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -115,6 +176,10 @@ class B12XCompressedSparseMLAScratch:
     max_kv_rows: int
     max_chunks_per_row: int
     page_size: int
+    max_swa_width: int
+    max_indexed_width: int
+    indexed_page_size: int
+    layout: str
     mode: str = "decode"
     fixed_capacity: bool = True
     use_cuda_graph: bool = False
@@ -371,6 +436,12 @@ def _materialize_compressed_sparse_mla_scratch(
         max_kv_rows=caps.max_kv_rows,
         max_chunks_per_row=caps.max_chunks_per_row,
         page_size=caps.page_size,
+        max_swa_width=caps.swa_width,
+        max_indexed_width=caps.indexed_width,
+        indexed_page_size=caps.indexed_page_size,
+        layout=caps.layout,
+        mode=caps.mode,
+        use_cuda_graph=caps.use_cuda_graph,
         tmp_output=tmp_output,
         tmp_lse=tmp_lse,
         output_buffer=_split_output_buffer_from_tmp(tmp_output),
@@ -503,6 +574,12 @@ def build_compressed_sparse_mla_binding(
         raise ValueError(
             f"swa_indices width {int(swa_indices.shape[1])} exceeds scratch topk {scratch.topk}"
         )
+    max_swa_width = int(getattr(scratch, "max_swa_width", scratch.topk))
+    if int(swa_indices.shape[1]) > max_swa_width:
+        raise ValueError(
+            f"swa_indices width {int(swa_indices.shape[1])} exceeds "
+            f"planned SWA width {max_swa_width}"
+        )
     swa_lengths = _validate_i32_vector(
         swa_lengths,
         scratch=scratch,
@@ -522,6 +599,14 @@ def build_compressed_sparse_mla_binding(
             name="indexed_indices",
         )
         indexed_width = int(indexed_indices.shape[1])
+        max_indexed_width = int(
+            getattr(scratch, "max_indexed_width", scratch.topk)
+        )
+        if indexed_width > max_indexed_width:
+            raise ValueError(
+                f"indexed_indices width {indexed_width} exceeds planned "
+                f"indexed width {max_indexed_width}"
+            )
         indexed_lengths = _validate_i32_vector(
             indexed_lengths,  # type: ignore[arg-type]
             scratch=scratch,
@@ -578,6 +663,7 @@ class B12XCompressedSparseMLAScratchPlan:
     caps: B12XCompressedSparseMLAScratchCaps
     layout: _B12XCompressedSparseMLAScratchLayout
     _scratch_specs: tuple[ScratchBufferSpec, ...]
+    policy_resolution: object | None = None
 
     def scratch_specs(self) -> tuple[ScratchBufferSpec, ...]:
         return self._scratch_specs
@@ -620,6 +706,8 @@ class B12XCompressedSparseMLAScratchPlan:
 def plan_compressed_sparse_mla_scratch(
     caps: B12XCompressedSparseMLAScratchCaps,
 ) -> B12XCompressedSparseMLAScratchPlan:
+    if caps.max_chunks_per_row is None:
+        caps = replace(caps, max_chunks_per_row=64)
     layout = _compressed_sparse_mla_scratch_layout(caps)
     return B12XCompressedSparseMLAScratchPlan(
         caps=caps,

@@ -27,8 +27,6 @@ def supports_prefill(
     tokens: int,
     streams: int,
     hidden_size: int,
-    device: torch.device | None = None,
-    compute_capability: tuple[int, int] | None = None,
 ) -> bool:
     """Return whether the mandatory Qwen3.8 CuTe projection path applies."""
     token_count = int(tokens)
@@ -37,7 +35,6 @@ def supports_prefill(
         hidden_size=hidden_size,
     ):
         return False
-    del device, compute_capability
     return True
 
 
@@ -46,8 +43,6 @@ def projection_capacity_rows(
     max_tokens: int,
     streams: int,
     hidden_size: int,
-    device: torch.device | None = None,
-    compute_capability: tuple[int, int] | None = None,
 ) -> tuple[int, int]:
     """Return capacity-shaped rows for the two mandatory CuTe projections."""
     capacity = int(max_tokens)
@@ -64,7 +59,6 @@ def projection_capacity_rows(
             f"S={stream_count},H={int(hidden_size)}"
         )
 
-    del device, compute_capability
     return _padded_rows(capacity), _padded_rows(capacity * stream_count)
 
 

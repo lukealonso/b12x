@@ -6,6 +6,7 @@ from ..._lib.gating import default_is_supported
 from .._shared.contiguous.api import (
     AttentionBinding as BatchedBinding,
 )
+from ._policy import VarlenAttentionConfig, VarlenAttentionQuery
 from .._shared.contiguous.api import (
     AttentionPlan as BatchedPlan,
 )

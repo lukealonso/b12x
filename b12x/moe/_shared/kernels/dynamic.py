@@ -127,7 +127,6 @@ from b12x.moe._shared.kernels.activations import (
 from b12x.moe._shared.kernels.w4a8_trellis_decode import (
     _w4a8_had128_quad,
     _w4a8_stage_trellis_b_tile,
-    _w4a8_trellis_decode_half,
     _w4a8_trellis_lane_geom,
     _w4a8_trellis_pair_words,
     _w4a8_trellis_permute_k32,
@@ -693,9 +692,11 @@ class MoEDynamicKernelBackend:
         deterministic_output: bool = False,
         num_topk: int = 1,
         swap_ab: bool = False,
+        separate_w13_halves: bool = False,
         quant_recipe: str = "nvfp4",
         w4a8_repacked: bool = False,
         direct_routing: bool = False,
+        external_route_plan: bool = False,
         materialize_intermediate: bool = False,
         work_source: str = _WORK_SOURCE_MATERIALIZED_QUEUE,
         swiglu_limit: float | None = None,
@@ -838,6 +839,7 @@ class MoEDynamicKernelBackend:
         self.trellis_direct_lut = bool(trellis_direct_lut) and self.w4a8_trellis
         self.w4a8_repacked = bool(w4a8_repacked)
         self.direct_routing = bool(direct_routing)
+        self.external_route_plan = bool(external_route_plan)
         self.materialize_intermediate = bool(materialize_intermediate)
         self.w4a8_m1_materialized = bool(
             self.w4a8_repacked
@@ -945,6 +947,15 @@ class MoEDynamicKernelBackend:
                 "direct routing requires non-streaming NVFP4 or repacked "
                 "W4A8 MX (materialized execution is M16-only)"
             )
+        if self.external_route_plan and not (
+            quant_recipe == "nvfp4"
+            and not self.direct_routing
+            and work_source == _WORK_SOURCE_MATERIALIZED_QUEUE
+        ):
+            raise ValueError(
+                "external route planning requires grouped NVFP4 with the "
+                "materialized work source"
+            )
         if self.is_w4a8 and swap_ab:
             raise ValueError("w4a8 recipes do not support swap_ab yet")
         if self.is_w4a8 and share_input_across_experts and not self.w4a8_repacked:
@@ -966,14 +977,13 @@ class MoEDynamicKernelBackend:
         self.deterministic_output = bool(deterministic_output)
         # swap_ab runs the gated FC1 with the intermediate (logical N) on the
         # MMA M-role (mirrors dense.py), so a sub-64 tile_n that divides a
-        # non-128 per-shard n (e.g. 32 | 352) is legal and the gate-half base
-        # rides the sub-128 M-atom SF slice instead of straddling N SF atoms.
+        # non-128 per-shard n is legal and the gate-half base rides the
+        # sub-128 M-atom SF slice instead of straddling N SF atoms.
         # FC2 stays in the normal orientation, so FC1 builds its own tiled_mma.
         self.swap_ab = bool(swap_ab) and self.is_gated
-        # FC1 swap produce-tile width (intermediate cols per swapped MMA tile).
-        # 32: for any 32-aligned n the gate-half base n%128 in {0,32,64,96}, so
-        # offset+32 <= 128 always fits one 128-row SF atom; and tile_m=32 keeps
-        # the base atom_shape (2,2,1)/4-warps, so FC1 and FC2 share warp count.
+        self.separate_w13_halves = bool(separate_w13_halves) and self.is_gated
+        if self.separate_w13_halves and self.swap_ab:
+            raise ValueError("separate_w13_halves and swap_ab are mutually exclusive")
         self._fc1_int_tile = 32
         # FP4 packs two elements per byte, so its K-tile is sf_vec_size*8 with
         # a 64-byte SW atom; the FP6/FP8 byte-container path carries one
@@ -2154,6 +2164,8 @@ class MoEDynamicKernelBackend:
         max_active_clusters: cutlass.Int32,
         stream: cuda.CUstream,
         *,
+        b_w13_gate: cute.Tensor | None = None,
+        sfb_w13_gate_ptr: cute.Pointer | None = None,
         # w4a8 recipe operands (placeholders under the nvfp4 recipe): plain
         # (unswizzled) UE8M0 K/32 weight scale grids and, for w4a8_nvfp4, the
         # per-K/16 E4M3 residual grids from the NVFP4 scale decomposition.
@@ -2185,6 +2197,14 @@ class MoEDynamicKernelBackend:
         self.sf_dtype = sfa_ptr.dtype
         self.a_layout = utils.LayoutEnum.from_tensor(packed_a)
         self.b_layout = utils.LayoutEnum.from_tensor(b_w13)
+        if cutlass.const_expr(self.separate_w13_halves):
+            assert b_w13_gate is not None and sfb_w13_gate_ptr is not None, (
+                "separate FC1 halves require gate weight and scale operands"
+            )
+        if cutlass.const_expr(b_w13_gate is None):
+            b_w13_gate = b_w13
+        if cutlass.const_expr(sfb_w13_gate_ptr is None):
+            sfb_w13_gate_ptr = sfb_w13_ptr
         # Dynamic never materializes the intermediate C tensor. Preserve the
         # original row-major epilogue layout without carrying a dead memref.
         self.c_layout = utils.LayoutEnum.ROW_MAJOR
@@ -2212,7 +2232,16 @@ class MoEDynamicKernelBackend:
             b_w13_sf_shape, self.sf_vec_size
         )
         sfb_w13_tensor = cute.make_tensor(sfb_w13_ptr, sfb_w13_layout)
-
+        if cutlass.const_expr(self.separate_w13_halves):
+            sfb_w13_gate_layout = blockscaled_utils.tile_atom_to_shape_SF(
+                b_w13_gate.shape, self.sf_vec_size
+            )
+            sfb_w13_gate_tensor = cute.make_tensor(
+                sfb_w13_gate_ptr,
+                sfb_w13_gate_layout,
+            )
+        else:
+            sfb_w13_gate_tensor = sfb_w13_tensor
         # TMA descriptors
         tma_a, gA = self._dense_cls._make_tma_atoms_and_tensors(
             packed_a,
@@ -2252,6 +2281,27 @@ class MoEDynamicKernelBackend:
             1,
             internal_type=cutlass.Int16,
         )
+        if cutlass.const_expr(self.separate_w13_halves):
+            tma_b_w13_gate, gB_w13_gate = (
+                self._dense_cls._make_tma_atoms_and_tensors(
+                    b_w13_gate,
+                    self.b_smem_layout_staged,
+                    (self.tile_shape_mnk[1], self.tile_shape_mnk[2]),
+                    1,
+                )
+            )
+            tma_sfb_w13_gate, gSFB_w13_gate = (
+                self._dense_cls._make_tma_atoms_and_tensors(
+                    sfb_w13_gate_tensor,
+                    self.sfb_smem_layout_staged,
+                    self.sfb_tile_shape_nk,
+                    1,
+                    internal_type=cutlass.Int16,
+                )
+            )
+        else:
+            tma_b_w13_gate, gB_w13_gate = tma_b_w13, gB_w13
+            tma_sfb_w13_gate, gSFB_w13_gate = tma_sfb_w13, gSFB_w13
         # B_down TMA
         if cutlass.const_expr(self.is_w6a8):
             b_down_sf_shape = (
@@ -2287,7 +2337,12 @@ class MoEDynamicKernelBackend:
             internal_type=cutlass.Int16,
         )
 
-        if cutlass.const_expr(self.swap_ab):
+        if cutlass.const_expr(self.separate_w13_halves):
+            n_int = Int32(b_w13.shape[0])
+            gate_tile_cnt = (
+                n_int + Int32(self.tile_shape_mnk[1]) - Int32(1)
+            ) // Int32(self.tile_shape_mnk[1])
+        elif cutlass.const_expr(self.swap_ab):
             # Non-128-aligned n: the scheduler's slice count must CEIL so the
             # partial last intermediate slice is issued. The plain floor below
             # (b_w13.shape[0] // tile_n // 2) drops it -- e.g. n=352 -> 704//128
@@ -2393,6 +2448,10 @@ class MoEDynamicKernelBackend:
             gB_w13,
             tma_sfb_w13,
             gSFB_w13,
+            tma_b_w13_gate,
+            gB_w13_gate,
+            tma_sfb_w13_gate,
+            gSFB_w13_gate,
             tma_b_down,
             gB_down,
             tma_sfb_down,
@@ -2526,6 +2585,10 @@ class MoEDynamicKernelBackend:
         mB_w13: cute.Tensor,
         tma_sfb_w13: cute.CopyAtom,
         mSFB_w13: cute.Tensor,
+        tma_b_w13_gate: cute.CopyAtom,
+        mB_w13_gate: cute.Tensor,
+        tma_sfb_w13_gate: cute.CopyAtom,
+        mSFB_w13_gate: cute.Tensor,
         tma_b_down: cute.CopyAtom,
         mB_down: cute.Tensor,
         tma_sfb_down: cute.CopyAtom,
@@ -2582,6 +2645,9 @@ class MoEDynamicKernelBackend:
             cpasync.prefetch_descriptor(tma_sfa)
             cpasync.prefetch_descriptor(tma_b_w13)
             cpasync.prefetch_descriptor(tma_sfb_w13)
+            if cutlass.const_expr(self.separate_w13_halves):
+                cpasync.prefetch_descriptor(tma_b_w13_gate)
+                cpasync.prefetch_descriptor(tma_sfb_w13_gate)
             cpasync.prefetch_descriptor(tma_b_down)
             cpasync.prefetch_descriptor(tma_sfb_down)
 
@@ -2884,10 +2950,13 @@ class MoEDynamicKernelBackend:
         if cutlass.const_expr(not self.direct_routing):
             i = flat_tid
             while i < num_experts:
-                row_counts[i] = Int32(0)
                 expert_write_rows[i] = Int32(0)
+                if cutlass.const_expr(not self.external_route_plan):
+                    row_counts[i] = Int32(0)
                 i += flat_stride
-            if flat_tid < num_experts + Int32(1):
+            if cutlass.const_expr(
+                not self.external_route_plan
+            ) and flat_tid < num_experts + Int32(1):
                 expert_tile_base[flat_tid] = Int32(0)
 
         # Atomic scatter accumulates into the caller output and must start at
@@ -3017,7 +3086,11 @@ class MoEDynamicKernelBackend:
         # routing decode instead gives every routed pair its own physical M tile:
         # this removes the histogram, serial expert prefix, and two resident-
         # grid barriers while retaining the exact same compute/task body.
-        if cutlass.const_expr(not self.direct_routing):
+        # The external route-plan specialization gets the grouped histogram and
+        # prefix from an ordered Triton launch and skips the same control phase.
+        if cutlass.const_expr(
+            not self.direct_routing and not self.external_route_plan
+        ):
             hist_idx = flat_tid
             while hist_idx < total_pairs:
                 expert_id = topk_ids[hist_idx].to(Int32)
@@ -3979,17 +4052,33 @@ class MoEDynamicKernelBackend:
                 cute.slice_(self.tile_shape_mnk, (0, None, None)),
                 (None, None, None),
             )
+        if cutlass.const_expr(self.separate_w13_halves):
+            gB_w13_gate_tiled = cute.local_tile(
+                mB_w13_gate,
+                cute.slice_(self.tile_shape_mnk, (0, None, None)),
+                (None, None, None),
+            )
+        else:
+            gB_w13_gate_tiled = gB_w13_tiled
         # SF tiles use the 128-row atom shape; for sub-128 MMA tiles one SF
         # block backs `sfa_tiles_per_block` MMA tiles (offset applied below).
         gSFA = cute.local_tile(mSFA, self.sfa_tile_shape_mk, (None, None, None))
         gSFB_w13_tiled = cute.local_tile(
             mSFB_w13, self.sfb_tile_shape_nk, (None, None, None)
         )
+        if cutlass.const_expr(self.separate_w13_halves):
+            gSFB_w13_gate_tiled = cute.local_tile(
+                mSFB_w13_gate,
+                self.sfb_tile_shape_nk,
+                (None, None, None),
+            )
+        else:
+            gSFB_w13_gate_tiled = gSFB_w13_tiled
         # swap_ab gate feed: the gate half of w13 starts at row n, which for a
-        # 32-aligned non-128-aligned n is mid-SF-atom (n % 128 in {32,64,96}).
+        # 16-aligned non-128-aligned n can be mid-SF-atom.
         # A 128-row SF atom can only be TMA'd atom-aligned, so the gate's 128-int
         # slice is sourced from TWO adjacent 128-row atoms: atom-lo (the atom
-        # holding row n, at within-atom 32-sub gate_lo_sub) and atom-hi (the
+        # holding row n, at within-atom narrow-sub gate_lo_sub) and atom-hi (the
         # next). atom-lo loads into sB/sSFB (the existing gate buffers); atom-hi
         # loads into sB_up/sSFB_up (free during the gate pass; the up pass only
         # overwrites them after pass_gate_barrier). The consumer picks each
@@ -4069,10 +4158,30 @@ class MoEDynamicKernelBackend:
             cute.group_modes(sSFB_up, 0, 2),
             cute.group_modes(gSFB_w13_tiled, 0, 2),
         )
+        if cutlass.const_expr(self.separate_w13_halves):
+            tBsB_w13_gate, tBgB_w13_gate = cpasync.tma_partition(
+                tma_b_w13_gate,
+                b_cta_crd,
+                b_cta_layout,
+                cute.group_modes(sB, 0, 2),
+                cute.group_modes(gB_w13_gate_tiled, 0, 2),
+            )
+            tBsSFB_w13_gate, tBgSFB_w13_gate = cpasync.tma_partition(
+                tma_sfb_w13_gate,
+                b_cta_crd,
+                b_cta_layout,
+                cute.group_modes(sSFB, 0, 2),
+                cute.group_modes(gSFB_w13_gate_tiled, 0, 2),
+            )
+        else:
+            tBsB_w13_gate, tBgB_w13_gate = tBsB_w13, tBgB_w13
+            tBsSFB_w13_gate, tBgSFB_w13_gate = tBsSFB_w13, tBgSFB_w13
         tBsB_w13_up = cute.filter_zeros(tBsB_w13_up)
         tBsSFB_w13 = cute.filter_zeros(tBsSFB_w13)
         tBgSFB_w13 = cute.filter_zeros(tBgSFB_w13)
         tBsSFB_w13_up = cute.filter_zeros(tBsSFB_w13_up)
+        tBsSFB_w13_gate = cute.filter_zeros(tBsSFB_w13_gate)
+        tBgSFB_w13_gate = cute.filter_zeros(tBgSFB_w13_gate)
 
         # B_down TMA partitions
         if cutlass.const_expr(self.is_w6a8):
@@ -4186,7 +4295,7 @@ class MoEDynamicKernelBackend:
         # Gated FC1 packs [up, gate] across N; relu2 has a single FC1 pass.
         intermediate_tile_cnt = cute.size(gB_w13_tiled, mode=[2])
         gate_tile_cnt = intermediate_tile_cnt
-        if self.is_gated:
+        if self.is_gated and not self.separate_w13_halves:
             gate_tile_cnt = intermediate_tile_cnt // Int32(2)
         output_tile_cnt = cute.size(gB_down, mode=[2])
         phase1_output_tile_cnt = output_tile_cnt
@@ -7799,19 +7908,27 @@ class MoEDynamicKernelBackend:
                         (None, intermediate_slice, None, task_expert_idx)
                     ]
                     gate_slice_idx = intermediate_slice
-                    if self.is_gated:
+                    if self.is_gated and not self.separate_w13_halves:
                         gate_slice_idx = intermediate_slice + gate_tile_cnt
                     if cutlass.const_expr(self.swap_ab):
                         # swap: atom-lo is the 128-row atom holding gate row n
                         # (n//128 + slice); the consumer reads the gate's 32-int
                         # subs from it at within-atom offset gate_lo_sub.
                         gate_slice_idx = intermediate_slice + Int32(gate_lo_off)
-                    tBgB_w13_gate_nk = tBgB_w13[
-                        (None, gate_slice_idx, None, task_expert_idx)
-                    ]
-                    tBgSFB_w13_gate_nk = tBgSFB_w13[
-                        (None, gate_slice_idx, None, task_expert_idx)
-                    ]
+                    if cutlass.const_expr(self.separate_w13_halves):
+                        tBgB_w13_gate_nk = tBgB_w13_gate[
+                            (None, intermediate_slice, None, task_expert_idx)
+                        ]
+                        tBgSFB_w13_gate_nk = tBgSFB_w13_gate[
+                            (None, intermediate_slice, None, task_expert_idx)
+                        ]
+                    else:
+                        tBgB_w13_gate_nk = tBgB_w13[
+                            (None, gate_slice_idx, None, task_expert_idx)
+                        ]
+                        tBgSFB_w13_gate_nk = tBgSFB_w13[
+                            (None, gate_slice_idx, None, task_expert_idx)
+                        ]
                     if cutlass.const_expr(self.swap_ab and gate_lo_sub > 0):
                         gate_hi_idx = intermediate_slice + Int32(gate_lo_off + 1)
                         tBgB_w13_gate_hi_nk = tBgB_w13[
@@ -8670,6 +8787,16 @@ class MoEDynamicKernelBackend:
                                     w4a8_pend_epoch,
                                 )
                         w4a8_pend_epoch = Int32(0)
+                    if cutlass.const_expr(self.separate_w13_halves):
+                        gate_tma_b = tma_b_w13_gate
+                        gate_tma_sfb = tma_sfb_w13_gate
+                        gate_tBsB = tBsB_w13_gate
+                        gate_tBsSFB = tBsSFB_w13_gate
+                    else:
+                        gate_tma_b = tma_b_w13
+                        gate_tma_sfb = tma_sfb_w13
+                        gate_tBsB = tBsB_w13
+                        gate_tBsSFB = tBsSFB_w13
                     prod_state.reset_count()
                     for k_tile in range(
                         0, fc1_k_tile_cnt if not self.is_w4a8 else 0, 1, unroll=4
@@ -8688,15 +8815,15 @@ class MoEDynamicKernelBackend:
                             tma_bar_ptr=ml_pipeline.producer_get_barrier(prod_state),
                         )
                         cute.copy(
-                            tma_b_w13,
+                            gate_tma_b,
                             tBgB_w13_gate_nk[(None, k_tile)],
-                            tBsB_w13[(None, prod_state.index)],
+                            gate_tBsB[(None, prod_state.index)],
                             tma_bar_ptr=ml_pipeline.producer_get_barrier(prod_state),
                         )
                         cute.copy(
-                            tma_sfb_w13,
+                            gate_tma_sfb,
                             tBgSFB_w13_gate_nk[(None, k_tile)],
-                            tBsSFB_w13[(None, prod_state.index)],
+                            gate_tBsSFB[(None, prod_state.index)],
                             tma_bar_ptr=ml_pipeline.producer_get_barrier(prod_state),
                         )
                         if cutlass.const_expr(self.swap_ab and gate_lo_sub > 0):

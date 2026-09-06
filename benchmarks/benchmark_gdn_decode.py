@@ -585,8 +585,6 @@ def main(argv: list[str] | None = None) -> int:
         parser.error(str(error))
 
     device = require_sm120()
-    if tuple(torch.cuda.get_device_capability(device)) != (12, 0):
-        raise SystemExit("Qwen3.8 GDN CuTe benchmark requires SM120")
     l2_flush = make_l2_flush_fn(args.l2_flush, args.l2_flush_bytes)
     command_argv = list(sys.argv[1:] if argv is None else argv)
     gpu_mode_before = nvidia_smi_gpu_mode_snapshot()

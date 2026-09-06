@@ -13,6 +13,7 @@ from ._impl import run_combine_norm_impl as run_combine_norm
 from ._impl import run_gate_mean_impl as run_gate_mean
 from ._impl import run_grouped_rmsnorm_impl as run_grouped_rmsnorm
 from ._impl import run_scaled_silu_impl as run_scaled_silu
+from ._policy import HyperConnectionConfig, HyperConnectionQuery
 
 
 def bind(plan: Plan, **kwargs) -> Binding:
@@ -30,6 +31,8 @@ __all__ = [
     "Caps",
     "Plan",
     "Binding",
+    "HyperConnectionConfig",
+    "HyperConnectionQuery",
     "plan",
     "bind",
     "run_grouped_rmsnorm",

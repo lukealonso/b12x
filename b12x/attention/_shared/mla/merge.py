@@ -8,9 +8,19 @@ from functools import lru_cache
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
+import cutlass.utils as cutlass_utils
 import torch
-from cutlass import Float32, Int32
+from cutlass import Float32, Int32, Uint32
 from cutlass.cute.runtime import from_dlpack
+
+from b12x._lib.intrinsics import (
+    get_ptr_as_int64,
+    ld_global_v4_u32,
+    ld_shared_f32,
+    shared_ptr_to_u32,
+    st_shared_f32,
+    store_v4_bf16x2,
+)
 
 from b12x.attention._shared.cute import ops as attention_ops
 from b12x.attention._shared.workspace import _SPLIT_MAX_CHUNKS
@@ -22,7 +32,7 @@ from b12x._lib.compiler import (
 )
 from b12x._lib.utils import current_cuda_stream
 
-from .decode_math import _exp2_approx_ftz_f32
+from .decode_math import _exp2_approx_ftz_f32, _u32_to_f32
 from .reference import _MLA_GROUP_SIZE, _MLA_NOPE_DIM
 
 
@@ -209,11 +219,260 @@ def _split_lse_head_view(
     )
 
 
+# Merge CTA geometry: one CTA per (row, head, 128-wide output group) with
+# 128 threads. Thread ``t`` owns output vector ``t & 15`` (eight bf16) and
+# split lane ``t >> 4``. A pass covers 64 split slots (eight per lane), so
+# every partial vector of a pass is fetched by exactly one thread and all of
+# a thread's loads are issued before any is consumed; passes repeat until
+# ``num_chunks`` slots are covered, and the lanes are summed through shared
+# memory.
+_MERGE_THREADS = 128
+_MERGE_VECTORS = _MLA_GROUP_SIZE // 8
+_MERGE_SLOT_LANES = _MERGE_THREADS // _MERGE_VECTORS
+_MERGE_SLOTS_PER_LANE = 8
+_MERGE_PASS_SLOTS = _MERGE_SLOT_LANES * _MERGE_SLOTS_PER_LANE
+_MERGE_PASS_SHIFT = _MERGE_PASS_SLOTS.bit_length() - 1
+_MERGE_LSE_PER_LANE = _SPLIT_MAX_CHUNKS // _MLA_WARP_THREADS
+# Shared scratch: one weight per split slot, then 8 lanes x 16 vectors x 8 floats.
+_MERGE_SMEM_FLOATS = _SPLIT_MAX_CHUNKS + _MERGE_SLOT_LANES * _MERGE_VECTORS * 8
+_NEG_INF = float("-inf")
+
+assert _MERGE_PASS_SLOTS == 1 << _MERGE_PASS_SHIFT
+assert _SPLIT_MAX_CHUNKS % _MERGE_PASS_SLOTS == 0
+assert _SPLIT_MAX_CHUNKS % _MLA_WARP_THREADS == 0
+
+
+def _merge_pass_plan(static_num_chunks: int | None) -> tuple[int | None, int]:
+    """Return (static pass count or None, slots loaded per lane in a pass)."""
+    if static_num_chunks is None:
+        return None, _MERGE_SLOTS_PER_LANE
+    chunks = max(1, min(int(static_num_chunks), _SPLIT_MAX_CHUNKS))
+    passes = (chunks + _MERGE_PASS_SLOTS - 1) // _MERGE_PASS_SLOTS
+    if passes > 1:
+        return passes, _MERGE_SLOTS_PER_LANE
+    return 1, (chunks + _MERGE_SLOT_LANES - 1) // _MERGE_SLOT_LANES
+
+
+@cute.jit
+def _merge_accumulate_pass(
+    tmp_output: cute.Tensor,
+    acc: cute.Tensor,
+    weights_addr: Int32,
+    q_idx: Int32,
+    head_idx: Int32,
+    slot_base: Int32,
+    slot_lane: Int32,
+    last_slot: Int32,
+    dim0: Int32,
+    *,
+    slots_per_lane: cutlass.Constexpr,
+    vector_partials: cutlass.Constexpr,
+):
+    """Accumulate this thread's slots ``slot_base + slot_lane + 8k`` into ``acc``.
+
+    Load indices are clamped to ``last_slot`` so absent slots re-read a valid
+    partial; their weight is zero and the zero-weight guard keeps a poisoned
+    partial of an empty split out of the sum.
+    """
+    if cutlass.const_expr(vector_partials):
+        loaded = []
+        for k in cutlass.range_constexpr(slots_per_lane):
+            slot = slot_base + slot_lane + Int32(k * _MERGE_SLOT_LANES)
+            if slot > last_slot:
+                slot = last_slot
+            src = get_ptr_as_int64(
+                tmp_output,
+                cute.crd2idx((q_idx, head_idx, slot, dim0), tmp_output.layout),
+            )
+            loaded.append(ld_global_v4_u32(src))
+        for k in cutlass.range_constexpr(slots_per_lane):
+            w = ld_shared_f32(
+                weights_addr
+                + (slot_base + slot_lane + Int32(k * _MERGE_SLOT_LANES)) * Int32(4)
+            )
+            if w != Float32(0.0):
+                x0, x1, x2, x3 = loaded[k]
+                i = 0
+                for x in (x0, x1, x2, x3):
+                    acc[i] = acc[i] + w * _u32_to_f32(x << Uint32(16))
+                    acc[i + 1] = acc[i + 1] + w * _u32_to_f32(x & Uint32(0xFFFF0000))
+                    i += 2
+    else:
+        for k in cutlass.range_constexpr(slots_per_lane):
+            slot = slot_base + slot_lane + Int32(k * _MERGE_SLOT_LANES)
+            if slot > last_slot:
+                slot = last_slot
+            w = ld_shared_f32(
+                weights_addr
+                + (slot_base + slot_lane + Int32(k * _MERGE_SLOT_LANES)) * Int32(4)
+            )
+            if w != Float32(0.0):
+                for i in cutlass.range_constexpr(8):
+                    acc[i] = acc[i] + w * Float32(
+                        tmp_output[q_idx, head_idx, slot, dim0 + Int32(i)]
+                    )
+
+
+@cute.jit
+def _merge_split_partials(
+    tmp_output: cute.Tensor,
+    tmp_lse: cute.Tensor,
+    output: cute.Tensor,
+    attn_sink: cute.Tensor,
+    num_chunks: Int32,
+    scratch: cute.Tensor,
+    *,
+    has_sink: cutlass.Constexpr,
+    static_num_chunks: cutlass.Constexpr,
+    vector_output: cutlass.Constexpr,
+    vector_partials: cutlass.Constexpr,
+):
+    """Reduce ``num_chunks`` normalized split partials of one (row, head) into
+    the CTA's 128-dim output group.
+
+    Phase 1 (warp 0): each lane loads the base-2 split LSEs of slots
+    ``lane + 32j``, the warp reduces the max and the exp2 sum, folds the
+    optional sink into the normalizer exactly as the previous per-lane online
+    merge did, and stores every slot's normalized weight (zero past
+    ``num_chunks`` and for -inf LSEs) to shared memory.
+    Phase 2: passes of 64 slots accumulate weighted partials in fp32 with the
+    loads of a pass issued up front, and the eight split lanes are summed
+    through shared memory before the sixteen output vectors are stored.
+    """
+    static_passes, slots_per_lane = _merge_pass_plan(static_num_chunks)
+    tid = Int32(cute.arch.thread_idx()[0])
+    lane = cute.arch.lane_idx()
+    warp_id = tid >> Int32(5)
+    q_idx, head_idx, group_idx = cute.arch.block_idx()
+    q_idx = Int32(q_idx)
+    head_idx = Int32(head_idx)
+    group_idx = Int32(group_idx)
+
+    # Cross-warp exchange goes through explicit shared loads and stores in one
+    # allocation: one weight per split slot, then the lane-reduction buffer.
+    scratch_addr = shared_ptr_to_u32(scratch.iterator)
+    weights_addr = scratch_addr
+    red_addr = scratch_addr + Int32(_SPLIT_MAX_CHUNKS * 4)
+
+    if num_chunks > Int32(_SPLIT_MAX_CHUNKS):
+        num_chunks = Int32(_SPLIT_MAX_CHUNKS)
+    last_slot = num_chunks - Int32(1)
+    if last_slot < Int32(0):
+        last_slot = Int32(0)
+
+    lane_w = cute.make_rmem_tensor(_MERGE_LSE_PER_LANE, Float32)
+    acc = cute.make_rmem_tensor(8, Float32)
+    for i in cutlass.range_constexpr(8):
+        acc[i] = Float32(0.0)
+
+    if warp_id == Int32(0):
+        m = Float32(_NEG_INF)
+        for j in cutlass.range_constexpr(_MERGE_LSE_PER_LANE):
+            c = lane + Int32(j * _MLA_WARP_THREADS)
+            lse_j = Float32(_NEG_INF)
+            if c < num_chunks:
+                lse_j = Float32(tmp_lse[q_idx, head_idx, c])
+            lane_w[j] = lse_j
+            m = attention_ops.fmax(m, lse_j)
+        for off in (16, 8, 4, 2, 1):
+            m = attention_ops.fmax(m, cute.arch.shuffle_sync_bfly(m, offset=off))
+        d = Float32(0.0)
+        for j in cutlass.range_constexpr(_MERGE_LSE_PER_LANE):
+            w_j = Float32(0.0)
+            if lane_w[j] > Float32(_NEG_INF):
+                w_j = _exp2_approx_ftz_f32(lane_w[j] - m)
+            lane_w[j] = w_j
+            d = d + w_j
+        for off in (16, 8, 4, 2, 1):
+            d = d + cute.arch.shuffle_sync_bfly(d, offset=off)
+        scale = Float32(0.0)
+        if d > Float32(0.0):
+            if cutlass.const_expr(has_sink):
+                sink_m = Float32(attn_sink[head_idx] * attention_ops.LOG2_E)
+                new_m = attention_ops.fmax(m, sink_m)
+                prev_scale = _exp2_approx_ftz_f32(m - new_m)
+                sink_scale = _exp2_approx_ftz_f32(sink_m - new_m)
+                scale = prev_scale * cute.arch.rcp_approx(d * prev_scale + sink_scale)
+            else:
+                scale = cute.arch.rcp_approx(d)
+        for j in cutlass.range_constexpr(_MERGE_LSE_PER_LANE):
+            st_shared_f32(
+                weights_addr + (lane + Int32(j * _MLA_WARP_THREADS)) * Int32(4),
+                lane_w[j] * scale,
+            )
+    cute.arch.barrier()
+
+    vec = tid & Int32(_MERGE_VECTORS - 1)
+    slot_lane = tid >> Int32(4)
+    dim0 = group_idx * Int32(_MLA_GROUP_SIZE) + vec * Int32(8)
+    if cutlass.const_expr(static_passes is None):
+        num_passes = (num_chunks + Int32(_MERGE_PASS_SLOTS - 1)) >> Int32(_MERGE_PASS_SHIFT)
+        for p in cutlass.range(num_passes, unroll=1):
+            _merge_accumulate_pass(
+                tmp_output,
+                acc,
+                weights_addr,
+                q_idx,
+                head_idx,
+                Int32(p) * Int32(_MERGE_PASS_SLOTS),
+                slot_lane,
+                last_slot,
+                dim0,
+                slots_per_lane=slots_per_lane,
+                vector_partials=vector_partials,
+            )
+    else:
+        for p in cutlass.range_constexpr(static_passes):
+            _merge_accumulate_pass(
+                tmp_output,
+                acc,
+                weights_addr,
+                q_idx,
+                head_idx,
+                Int32(p * _MERGE_PASS_SLOTS),
+                slot_lane,
+                last_slot,
+                dim0,
+                slots_per_lane=slots_per_lane,
+                vector_partials=vector_partials,
+            )
+
+    red_base = red_addr + (slot_lane * Int32(_MERGE_VECTORS) + vec) * Int32(32)
+    for i in cutlass.range_constexpr(8):
+        st_shared_f32(red_base + Int32(i * 4), acc[i])
+    cute.arch.barrier()
+
+    if tid < Int32(_MERGE_VECTORS):
+        out = [Float32(0.0) for _ in range(8)]
+        for sl in cutlass.range_constexpr(_MERGE_SLOT_LANES):
+            base = red_addr + (Int32(sl * _MERGE_VECTORS) + tid) * Int32(32)
+            for i in cutlass.range_constexpr(8):
+                out[i] = out[i] + ld_shared_f32(base + Int32(i * 4))
+        out_dim0 = group_idx * Int32(_MLA_GROUP_SIZE) + tid * Int32(8)
+        if cutlass.const_expr(vector_output):
+            dst = get_ptr_as_int64(
+                output, cute.crd2idx((q_idx, head_idx, out_dim0), output.layout)
+            )
+            store_v4_bf16x2(dst, out[0], out[1], out[2], out[3], out[4], out[5], out[6], out[7])
+        else:
+            for i in cutlass.range_constexpr(8):
+                output[q_idx, head_idx, out_dim0 + Int32(i)] = out[i].to(
+                    output.element_type
+                )
+
+
 class SparseMLASplitDecodeMergeKernel:
     """Reduce normalized chunk partials into the final decode output."""
 
-    def __init__(self, static_num_chunks: int | None = None):
+    def __init__(
+        self,
+        static_num_chunks: int | None = None,
+        vector_output: bool = True,
+        vector_partials: bool = True,
+    ):
         self.static_num_chunks = static_num_chunks
+        self.vector_output = bool(vector_output)
+        self.vector_partials = bool(vector_partials)
 
     @cute.jit
     def __call__(
@@ -231,7 +490,7 @@ class SparseMLASplitDecodeMergeKernel:
             output,
         ).launch(
             grid=(output.shape[0], output.shape[1], _MLA_SCALE_GROUPS),
-            block=[_MLA_WARP_THREADS, 1, 1],
+            block=[_MERGE_THREADS, 1, 1],
             stream=stream,
         )
 
@@ -243,100 +502,38 @@ class SparseMLASplitDecodeMergeKernel:
         num_chunks_ptr: cute.Tensor,
         output: cute.Tensor,
     ):
-        lane = cute.arch.lane_idx()
-        q_idx, head_idx, group_idx = cute.arch.block_idx()
-        q_idx = Int32(q_idx)
-        head_idx = Int32(head_idx)
-        group_idx = Int32(group_idx)
-
-        acc = cute.make_rmem_tensor((4,), Float32)
-        for frag_idx in cutlass.range_constexpr(4):
-            acc[frag_idx] = Float32(0.0)
-
-        out_base = group_idx * Int32(_MLA_GROUP_SIZE) + lane * Int32(4)
-        tmp_output_lane = _split_output_lane_view(tmp_output, q_idx, head_idx, out_base)
-        tmp_lse_head = _split_lse_head_view(tmp_lse, q_idx, head_idx)
-        merged_m = Float32(-Float32.inf)
-        merged_d = Float32(1.0)
-        chunk_idx = Int32(0)
+        smem = cutlass_utils.SmemAllocator()
+        scratch = smem.allocate_tensor(Float32, cute.make_layout(_MERGE_SMEM_FLOATS), 16)
         if cutlass.const_expr(self.static_num_chunks is None):
             num_chunks = Int32(num_chunks_ptr[Int32(0)])
         else:
             num_chunks = Int32(self.static_num_chunks)
-        if num_chunks > Int32(_SPLIT_MAX_CHUNKS):
-            num_chunks = Int32(_SPLIT_MAX_CHUNKS)
-
-        while chunk_idx < num_chunks and merged_m == Float32(-Float32.inf):
-            part_lse = Float32(tmp_lse_head[chunk_idx])
-            if part_lse != Float32(-Float32.inf):
-                acc[0] = Float32(tmp_output_lane[chunk_idx, Int32(0)])
-                acc[1] = Float32(tmp_output_lane[chunk_idx, Int32(1)])
-                acc[2] = Float32(tmp_output_lane[chunk_idx, Int32(2)])
-                acc[3] = Float32(tmp_output_lane[chunk_idx, Int32(3)])
-                merged_m = Float32(part_lse)
-                merged_d = Float32(1.0)
-            chunk_idx += Int32(1)
-
-        while chunk_idx < num_chunks:
-            part_lse = Float32(tmp_lse_head[chunk_idx])
-            if part_lse != Float32(-Float32.inf):
-                new_m = attention_ops.fmax(merged_m, part_lse)
-                prev_scale = _exp2_approx_ftz_f32(merged_m - new_m)
-                part_scale = _exp2_approx_ftz_f32(part_lse - new_m)
-                merged_d = Float32(merged_d * prev_scale + part_scale)
-                acc[0] = Float32(
-                    acc[0] * prev_scale
-                    + Float32(tmp_output_lane[chunk_idx, Int32(0)]) * part_scale
-                )
-                acc[1] = Float32(
-                    acc[1] * prev_scale
-                    + Float32(tmp_output_lane[chunk_idx, Int32(1)]) * part_scale
-                )
-                acc[2] = Float32(
-                    acc[2] * prev_scale
-                    + Float32(tmp_output_lane[chunk_idx, Int32(2)]) * part_scale
-                )
-                acc[3] = Float32(
-                    acc[3] * prev_scale
-                    + Float32(tmp_output_lane[chunk_idx, Int32(3)]) * part_scale
-                )
-                merged_m = Float32(new_m)
-            chunk_idx += Int32(1)
-
-        if merged_m == Float32(-Float32.inf):
-            output[q_idx, head_idx, out_base + Int32(0)] = Float32(0.0).to(
-                output.element_type
-            )
-            output[q_idx, head_idx, out_base + Int32(1)] = Float32(0.0).to(
-                output.element_type
-            )
-            output[q_idx, head_idx, out_base + Int32(2)] = Float32(0.0).to(
-                output.element_type
-            )
-            output[q_idx, head_idx, out_base + Int32(3)] = Float32(0.0).to(
-                output.element_type
-            )
-        else:
-            inv_d = cute.arch.rcp_approx(merged_d)
-            output[q_idx, head_idx, out_base + Int32(0)] = Float32(acc[0] * inv_d).to(
-                output.element_type
-            )
-            output[q_idx, head_idx, out_base + Int32(1)] = Float32(acc[1] * inv_d).to(
-                output.element_type
-            )
-            output[q_idx, head_idx, out_base + Int32(2)] = Float32(acc[2] * inv_d).to(
-                output.element_type
-            )
-            output[q_idx, head_idx, out_base + Int32(3)] = Float32(acc[3] * inv_d).to(
-                output.element_type
-            )
+        _merge_split_partials(
+            tmp_output,
+            tmp_lse,
+            output,
+            tmp_lse,
+            num_chunks,
+            scratch,
+            has_sink=False,
+            static_num_chunks=self.static_num_chunks,
+            vector_output=self.vector_output,
+            vector_partials=self.vector_partials,
+        )
 
 
 class SparseMLASplitDecodeSinkMergeKernel:
     """Reduce chunk partials and fold a zero-value attention sink into softmax."""
 
-    def __init__(self, static_num_chunks: int | None = None):
+    def __init__(
+        self,
+        static_num_chunks: int | None = None,
+        vector_output: bool = True,
+        vector_partials: bool = True,
+    ):
         self.static_num_chunks = static_num_chunks
+        self.vector_output = bool(vector_output)
+        self.vector_partials = bool(vector_partials)
 
     @cute.jit
     def __call__(
@@ -356,7 +553,7 @@ class SparseMLASplitDecodeSinkMergeKernel:
             output,
         ).launch(
             grid=(output.shape[0], output.shape[1], _MLA_SCALE_GROUPS),
-            block=[_MLA_WARP_THREADS, 1, 1],
+            block=[_MERGE_THREADS, 1, 1],
             stream=stream,
         )
 
@@ -369,112 +566,52 @@ class SparseMLASplitDecodeSinkMergeKernel:
         attn_sink: cute.Tensor,
         output: cute.Tensor,
     ):
-        lane = cute.arch.lane_idx()
-        q_idx, head_idx, group_idx = cute.arch.block_idx()
-        q_idx = Int32(q_idx)
-        head_idx = Int32(head_idx)
-        group_idx = Int32(group_idx)
-
-        acc = cute.make_rmem_tensor((4,), Float32)
-        for frag_idx in cutlass.range_constexpr(4):
-            acc[frag_idx] = Float32(0.0)
-
-        out_base = group_idx * Int32(_MLA_GROUP_SIZE) + lane * Int32(4)
-        tmp_output_lane = _split_output_lane_view(tmp_output, q_idx, head_idx, out_base)
-        tmp_lse_head = _split_lse_head_view(tmp_lse, q_idx, head_idx)
-        merged_m = Float32(-Float32.inf)
-        merged_d = Float32(1.0)
-        chunk_idx = Int32(0)
+        smem = cutlass_utils.SmemAllocator()
+        scratch = smem.allocate_tensor(Float32, cute.make_layout(_MERGE_SMEM_FLOATS), 16)
         if cutlass.const_expr(self.static_num_chunks is None):
             num_chunks = Int32(num_chunks_ptr[Int32(0)])
         else:
             num_chunks = Int32(self.static_num_chunks)
-        if num_chunks > Int32(_SPLIT_MAX_CHUNKS):
-            num_chunks = Int32(_SPLIT_MAX_CHUNKS)
-
-        while chunk_idx < num_chunks and merged_m == Float32(-Float32.inf):
-            part_lse = Float32(tmp_lse_head[chunk_idx])
-            if part_lse != Float32(-Float32.inf):
-                acc[0] = Float32(tmp_output_lane[chunk_idx, Int32(0)])
-                acc[1] = Float32(tmp_output_lane[chunk_idx, Int32(1)])
-                acc[2] = Float32(tmp_output_lane[chunk_idx, Int32(2)])
-                acc[3] = Float32(tmp_output_lane[chunk_idx, Int32(3)])
-                merged_m = Float32(part_lse)
-                merged_d = Float32(1.0)
-            chunk_idx += Int32(1)
-
-        while chunk_idx < num_chunks:
-            part_lse = Float32(tmp_lse_head[chunk_idx])
-            if part_lse != Float32(-Float32.inf):
-                new_m = attention_ops.fmax(merged_m, part_lse)
-                prev_scale = _exp2_approx_ftz_f32(merged_m - new_m)
-                part_scale = _exp2_approx_ftz_f32(part_lse - new_m)
-                merged_d = Float32(merged_d * prev_scale + part_scale)
-                acc[0] = Float32(
-                    acc[0] * prev_scale
-                    + Float32(tmp_output_lane[chunk_idx, Int32(0)]) * part_scale
-                )
-                acc[1] = Float32(
-                    acc[1] * prev_scale
-                    + Float32(tmp_output_lane[chunk_idx, Int32(1)]) * part_scale
-                )
-                acc[2] = Float32(
-                    acc[2] * prev_scale
-                    + Float32(tmp_output_lane[chunk_idx, Int32(2)]) * part_scale
-                )
-                acc[3] = Float32(
-                    acc[3] * prev_scale
-                    + Float32(tmp_output_lane[chunk_idx, Int32(3)]) * part_scale
-                )
-                merged_m = Float32(new_m)
-            chunk_idx += Int32(1)
-
-        if merged_m == Float32(-Float32.inf):
-            output[q_idx, head_idx, out_base + Int32(0)] = Float32(0.0).to(
-                output.element_type
-            )
-            output[q_idx, head_idx, out_base + Int32(1)] = Float32(0.0).to(
-                output.element_type
-            )
-            output[q_idx, head_idx, out_base + Int32(2)] = Float32(0.0).to(
-                output.element_type
-            )
-            output[q_idx, head_idx, out_base + Int32(3)] = Float32(0.0).to(
-                output.element_type
-            )
-        else:
-            sink_m = Float32(attn_sink[head_idx] * attention_ops.LOG2_E)
-            new_m = attention_ops.fmax(merged_m, sink_m)
-            prev_scale = _exp2_approx_ftz_f32(merged_m - new_m)
-            sink_scale = _exp2_approx_ftz_f32(sink_m - new_m)
-            merged_d = Float32(merged_d * prev_scale + sink_scale)
-            inv_d = cute.arch.rcp_approx(merged_d)
-            output[q_idx, head_idx, out_base + Int32(0)] = Float32(
-                acc[0] * prev_scale * inv_d
-            ).to(output.element_type)
-            output[q_idx, head_idx, out_base + Int32(1)] = Float32(
-                acc[1] * prev_scale * inv_d
-            ).to(output.element_type)
-            output[q_idx, head_idx, out_base + Int32(2)] = Float32(
-                acc[2] * prev_scale * inv_d
-            ).to(output.element_type)
-            output[q_idx, head_idx, out_base + Int32(3)] = Float32(
-                acc[3] * prev_scale * inv_d
-            ).to(output.element_type)
+        _merge_split_partials(
+            tmp_output,
+            tmp_lse,
+            output,
+            attn_sink,
+            num_chunks,
+            scratch,
+            has_sink=True,
+            static_num_chunks=self.static_num_chunks,
+            vector_output=self.vector_output,
+            vector_partials=self.vector_partials,
+        )
 
 
 @lru_cache(maxsize=None)
 def _build_sparse_mla_split_merge_kernel(
     static_num_chunks: int | None = None,
+    vector_output: bool = True,
+    vector_partials: bool = True,
 ) -> SparseMLASplitDecodeMergeKernel:
-    return SparseMLASplitDecodeMergeKernel(static_num_chunks)
+    return SparseMLASplitDecodeMergeKernel(static_num_chunks, vector_output, vector_partials)
 
 
 @lru_cache(maxsize=None)
 def _build_sparse_mla_split_sink_merge_kernel(
     static_num_chunks: int | None = None,
+    vector_output: bool = True,
+    vector_partials: bool = True,
 ) -> SparseMLASplitDecodeSinkMergeKernel:
-    return SparseMLASplitDecodeSinkMergeKernel(static_num_chunks)
+    return SparseMLASplitDecodeSinkMergeKernel(static_num_chunks, vector_output, vector_partials)
+
+
+def _merge_vector_tensor(tensor: torch.Tensor) -> bool:
+    """True when every 8-element row segment of ``tensor`` is a 16-byte-aligned bf16 vector."""
+    return bool(
+        tensor.dtype == torch.bfloat16
+        and int(tensor.stride(-1)) == 1
+        and int(tensor.data_ptr()) % 16 == 0
+        and all((int(st) * 2) % 16 == 0 for st in tensor.stride()[:-1])
+    )
 
 
 def clear_sparse_mla_merge_kernel_cache() -> None:
@@ -497,8 +634,12 @@ def _sparse_mla_split_decode_merge_flat_launch(
     static_num_chunks_or_none = (
         int(static_num_chunks) if int(static_num_chunks) > 0 else None
     )
+    vector_output = _merge_vector_tensor(output)
+    vector_partials = _merge_vector_tensor(tmp_output)
     if not has_attn_sink:
-        merge_kernel = _build_sparse_mla_split_merge_kernel(static_num_chunks_or_none)
+        merge_kernel = _build_sparse_mla_split_merge_kernel(
+            static_num_chunks_or_none, vector_output, vector_partials
+        )
         merge_args = (
             _to_kernel_tensor(tmp_output, _torch_to_cutlass_dtype(tmp_output.dtype)),
             _to_kernel_tensor(tmp_lse, cutlass.Float32, assumed_align=4),
@@ -528,10 +669,12 @@ def _sparse_mla_split_decode_merge_flat_launch(
             str(tmp_output.dtype),
             str(output.dtype),
             static_num_chunks_or_none,
+            int(vector_output),
+            int(vector_partials),
         )
         merge_spec = KernelCompileSpec.from_key(
             "attention.mla.merge",
-            4,
+            6,
             merge_cache_key,
             labels=(
                 "tmp_output",
@@ -541,6 +684,8 @@ def _sparse_mla_split_decode_merge_flat_launch(
                 "tmp_output_dtype",
                 "output_dtype",
                 "static_num_chunks",
+                "vector_output",
+                "vector_partials",
             ),
         )
         b12x_launch(
@@ -551,7 +696,9 @@ def _sparse_mla_split_decode_merge_flat_launch(
         )
         return
 
-    merge_kernel = _build_sparse_mla_split_sink_merge_kernel(static_num_chunks_or_none)
+    merge_kernel = _build_sparse_mla_split_sink_merge_kernel(
+        static_num_chunks_or_none, vector_output, vector_partials
+    )
     merge_args = (
         _to_kernel_tensor(tmp_output, _torch_to_cutlass_dtype(tmp_output.dtype)),
         _to_kernel_tensor(tmp_lse, cutlass.Float32, assumed_align=4),
@@ -584,10 +731,12 @@ def _sparse_mla_split_decode_merge_flat_launch(
         str(output.dtype),
         "attn_sink",
         static_num_chunks_or_none,
+        int(vector_output),
+        int(vector_partials),
     )
     merge_spec = KernelCompileSpec.from_key(
         "attention.mla.sink_merge",
-        4,
+        6,
         merge_cache_key,
         labels=(
             "tmp_output",
@@ -599,6 +748,8 @@ def _sparse_mla_split_decode_merge_flat_launch(
             "output_dtype",
             "kind",
             "static_num_chunks",
+            "vector_output",
+            "vector_partials",
         ),
     )
     b12x_launch(

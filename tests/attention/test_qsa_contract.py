@@ -341,6 +341,7 @@ def _dynamic_inputs(
     positions: tuple[int, ...],
     request_ids: tuple[int, ...] | None = None,
     accepted_tokens: tuple[int, ...] | None = None,
+    is_prefilling: tuple[bool, ...] | None = None,
 ) -> dict[str, torch.Tensor]:
     caps = binding.plan.caps
     rows = len(positions)
@@ -353,6 +354,10 @@ def _dynamic_inputs(
         accepted_tokens = (1,) * active_count
     if len(accepted_tokens) != active_count:
         raise ValueError("accepted_tokens must cover the dense active request prefix")
+    if is_prefilling is None:
+        is_prefilling = (False,) * active_count
+    if len(is_prefilling) != active_count:
+        raise ValueError("is_prefilling must cover the dense active request prefix")
     generator = torch.Generator(device="cpu").manual_seed(98123 + sum(positions))
     query = torch.randn(
         (rows, caps.q_heads, caps.head_dim),
@@ -412,6 +417,11 @@ def _dynamic_inputs(
             query_start_loc_values, dtype=torch.int32, device=device
         ),
         "num_accepted_tokens": accepted,
+        "is_prefilling": torch.tensor(
+            (*is_prefilling, *((False,) * (caps.max_batch - active_count))),
+            dtype=torch.bool,
+            device=device,
+        ),
     }
 
 
@@ -510,6 +520,77 @@ def test_qsa_plan_is_one_caller_owned_scratch_buffer() -> None:
     assert planned.caps.group_budget == 512
     assert planned.caps.selection_width == 2051
     assert planned.caps.max_groups == 16
+
+
+def test_qsa_large_prefill_prewarm_preserves_bound_state() -> None:
+    from b12x.attention.paged import _selected_forward as selected_impl
+    from b12x.attention.qsa._policy import QsaConfig
+    from b12x.policy import PolicyContext, QSA_ATTENTION
+
+    device = require_sm120()
+    caps = qsa.Caps(
+        device=device,
+        max_batch=1,
+        max_raw_state_slots=1,
+        max_q_rows=65,
+        max_seq_len=64,
+        num_main_cache_pages=4,
+        num_compressed_cache_pages=4,
+        main_page_size=16,
+        compressed_page_size=4,
+        q_heads=24,
+        kv_heads=2,
+        head_dim=256,
+        index_heads=4,
+        index_kv_heads=1,
+        index_head_dim=128,
+        index_rotary_dim=64,
+        compress_ratio=4,
+        budget=2048,
+    )
+    policy = PolicyContext.for_device(device).with_override(
+        QSA_ATTENTION,
+        QsaConfig(
+            backend="cutedsl",
+            sparse_gqa_direct_kv_warps=1,
+        ),
+    )
+    binding = _allocate_binding(caps, plan=qsa.plan(caps, policy=policy))
+    tracked = (
+        binding.main_k_cache,
+        binding.main_v_cache,
+        binding.main_block_table,
+        binding.compressed_k_cache,
+        binding.compressed_block_table,
+        binding.raw_k_ring,
+        binding.raw_logical_positions,
+        binding.raw_rope_positions,
+        binding.raw_interval_start_positions,
+        binding.raw_state_slot_ids,
+    )
+    for tensor in tracked:
+        tensor.zero_()
+    before = tuple(tensor.clone() for tensor in tracked)
+
+    selected_impl.clear_caches()
+    try:
+        qsa.prewarm(binding)
+        torch.cuda.synchronize(device)
+
+        specializations = {
+            (int(key[3]), bool(key[8]), int(key[9]))
+            for key in selected_impl._KERNEL_CACHE
+        }
+        assert specializations == {
+            (32, False, 2),
+            (64, False, 2),
+            (32, True, 1),
+            (64, True, 1),
+        }
+        for actual, expected in zip(tracked, before, strict=True):
+            torch.testing.assert_close(actual, expected, rtol=0.0, atol=0.0)
+    finally:
+        selected_impl.clear_caches()
 
 
 def test_qsa_cache_requirements_are_pure_and_describe_shared_page_layout() -> None:
@@ -691,6 +772,38 @@ def test_qsa_target_caps_scale_caller_owned_topk_scratch(max_q_rows: int) -> Non
 
     assert planned._layout.topk_nbytes > 1024 * 1024
     assert planned._layout.total_nbytes > planned._layout.topk_offset_bytes
+
+
+def test_qsa_prefill_capacity_uses_full_row_workspace() -> None:
+    device = require_sm120()
+    common = {
+        "device": device,
+        "max_batch": 32,
+        "max_raw_state_slots": 32,
+        "max_seq_len": 262144,
+        "num_main_cache_pages": 88,
+        "num_compressed_cache_pages": 88,
+        "main_page_size": 3008,
+        "compressed_page_size": 752,
+        "max_speculative_tokens": 3,
+        "q_heads": 12,
+        "kv_heads": 1,
+        "head_dim": 256,
+        "index_heads": 4,
+        "index_kv_heads": 1,
+        "index_head_dim": 128,
+        "index_rotary_dim": 64,
+        "compress_ratio": 4,
+        "budget": 2048,
+        "kv_dtype": torch.float8_e4m3fn,
+    }
+    decode = qsa.plan(qsa.Caps(max_q_rows=128, **common))
+    prefill = qsa.plan(qsa.Caps(max_q_rows=4096, **common))
+
+    assert decode.workspace_q_rows == 128
+    assert prefill.workspace_q_rows == 4096
+    assert decode.max_split_row_product == 64 * 16
+    assert prefill.max_split_row_product == 64 * 16
 
 
 @pytest.mark.parametrize("rows", [1, 16, 32, 257, 513])
@@ -1066,6 +1179,7 @@ def test_qsa_shared_pool_runs_under_fullgraph_compile_and_checks_runtime_aliases
         "sequence_lengths",
         "query_start_loc",
         "num_accepted_tokens",
+        "is_prefilling",
     )
 
     def decode(
@@ -1078,6 +1192,7 @@ def test_qsa_shared_pool_runs_under_fullgraph_compile_and_checks_runtime_aliases
         sequence_lengths: torch.Tensor,
         query_start_loc: torch.Tensor,
         num_accepted_tokens: torch.Tensor,
+        is_prefilling: torch.Tensor,
     ) -> torch.Tensor:
         return qsa.run(
             binding,
@@ -1090,6 +1205,7 @@ def test_qsa_shared_pool_runs_under_fullgraph_compile_and_checks_runtime_aliases
             sequence_lengths=sequence_lengths,
             query_start_loc=query_start_loc,
             num_accepted_tokens=num_accepted_tokens,
+            is_prefilling=is_prefilling,
         )
 
     qsa.run(binding, **dynamic)
@@ -2596,6 +2712,7 @@ def test_qsa_checkpoint_geometry_matches_eight_step_mrope_ring_oracle() -> None:
             ),
             "query_start_loc": torch.tensor([0, 1], dtype=torch.int32, device=device),
             "num_accepted_tokens": torch.tensor([1], dtype=torch.int32, device=device),
+            "is_prefilling": torch.tensor([False], dtype=torch.bool, device=device),
         }
 
         actual = qsa.run(binding, **dynamic).clone()
