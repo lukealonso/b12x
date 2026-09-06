@@ -381,8 +381,8 @@ def test_gdn_policy_rejects_unsupported_tile_overrides(
         PolicyContext.for_identity(device).resolve(GDN_POLICY, query, override=config)
 
 
-def test_rtx_pro_6000_profile_covers_glm_5_3_kda_serving_capacities() -> None:
-    """Require planned tiles for four-way tensor-parallel serving graphs."""
+def test_max_q_gdn_profile_limits_v16_to_qualified_decode_capacity() -> None:
+    """Keep speculative and neighboring capacities on V32."""
 
     device = DeviceIdentity(
         vendor="NVIDIA",
@@ -395,11 +395,16 @@ def test_rtx_pro_6000_profile_covers_glm_5_3_kda_serving_capacities() -> None:
     assert component is not None
 
     serving_capacities = (
-        (16, 16, 1),  # One target token without speculative decoding.
-        (16, 64, 4),  # Target plus three multi-token-prediction draft tokens.
-        (16, 128, 8),  # One target token plus seven DFlash2 draft tokens.
+        (16, 16, 1, 16),  # One target token without speculative decoding.
+        (16, 64, 4, 32),  # Target plus three multi-token-prediction draft tokens.
+        (16, 128, 8, 32),  # One target token plus seven DFlash2 draft tokens.
+        (15, 15, 1, 32),
+        (17, 17, 1, 32),
+        (16, 15, 1, 32),
+        (16, 17, 1, 32),
+        (16, 16, 2, 32),
     )
-    for max_seqs, max_tokens, state_index_columns in serving_capacities:
+    for max_seqs, max_tokens, state_index_columns, tile in serving_capacities:
         query = GdnQuery(
             gate_activation="sigmoid",
             qk_l2norm=True,
@@ -418,10 +423,10 @@ def test_rtx_pro_6000_profile_covers_glm_5_3_kda_serving_capacities() -> None:
 
         assert leaf is not None
         assert leaf.config["backend"] == "triton"
-        assert leaf.config["recurrent_block_v"] == 16
+        assert leaf.config["recurrent_block_v"] == tile
         assert resolution.source is PolicySource.PREPLANNED
         assert resolution.config.backend == "triton"
-        assert resolution.config.recurrent_block_v == 16
+        assert resolution.config.recurrent_block_v == tile
 
     other_device = DeviceIdentity(
         vendor="NVIDIA",
