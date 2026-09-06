@@ -11,8 +11,9 @@ Supported (MG) shapes:
   * DSV4 single-cache: topk in {512, 1024, 2048} (FP8-QK) or 128 (BF16-QK)
     with 8-aligned heads split into a paired-head MG prefix plus optional
     single-group tails.
-  * DSV4 dual-cache (extra/indexed tokens): topk==128, heads % 8 == 0,
-    pbs_extra in {2, 64} (BF16-QK), using the same head partitioning.
+  * DSV4 dual-cache (extra/indexed tokens): topk==128 (BF16-QK) or
+    {512, 1024, 2048} (FP8-QK), heads % 8 == 0, using the same head
+    partitioning, and pbs_extra in {2, 64}.
   * GLM_NSA: topk in {512, 1024, 2048}
   * GLM_NEXT: topk in {512, 1024, 2048, 2051, 2112}; 2112 is an
     alignment-only container whose per-row ``topk_length`` remains 2051.
@@ -430,10 +431,10 @@ def run_unified_prefill(
             scale_format=ScaleFormat.UE8M0_BYTE,
         )
 
-    # ── DSV4 dual-cache (has_extra) -> MG (BF16-QK), with strip-and-raise. ──────
-    # FI ships DSV4 dual-cache as topk==128, BF16-QK. 8-aligned head counts split
-    # into a paired prefix plus optional 16/8-head single-group tails. Everything
-    # else RAISEs (the decode-reuse has_extra body has been removed -- no fallback).
+    # ── DSV4 dual-cache (has_extra) -> MG, with strip-and-raise. ────────────────
+    # 8-aligned head counts split into a paired prefix plus optional 16/8-head
+    # single-group tails. The FP8 path retains the dual-cache union in one online
+    # softmax; unsupported shapes still have no decode-reuse fallback.
     if has_extra:
         if model_type == ModelType.DSV4 and int(topk) == 128:
             return _run_partitioned_mg(
@@ -446,10 +447,28 @@ def run_unified_prefill(
                 extra_page_block_size=extra_page_block_size,
                 stride_extra_kv_block=stride_extra_kv_block,
             )
+        if (
+            _mg_enabled
+            and model_type == ModelType.DSV4
+            and compute_mode == ComputeMode.FP8
+            and scale_format == ScaleFormat.UE8M0_BYTE
+            and topk in (512, 1024, 2048)
+        ):
+            return _run_partitioned_mg(
+                compute_mode=ComputeMode.FP8,
+                model_type=ModelType.DSV4,
+                scale_format=ScaleFormat.UE8M0_BYTE,
+                extra_kv_cache=extra_kv_cache,
+                extra_indices=extra_indices,
+                extra_topk_length=extra_topk_length,
+                extra_page_block_size=extra_page_block_size,
+                stride_extra_kv_block=stride_extra_kv_block,
+            )
         raise ValueError(
             f"DSV4 dual-cache prefill (heads={heads}, topk={topk}, "
             f"pbs_extra={int(extra_page_block_size)}) requires MG dispatch; only "
-            "DSV4 topk==128 with heads divisible by 8 is supported. "
+            "DSV4 topk==128 (BF16-QK) or topk in {512,1024,2048} (FP8-QK) "
+            "with heads divisible by 8 is supported. "
             "No decode-reuse fallback."
         )
 
@@ -463,7 +482,8 @@ def run_unified_prefill(
         "Supported (MG) shapes: single-cache heads%8==0; "
         "DSV4 single-cache topk in {512, 1024, 2048} (FP8) or 128 "
         "(BF16-QK, heads%8==0); "
-        "DSV4 dual-cache topk==128 with heads%8==0 and pbs_extra in {2, 64}; "
+        "DSV4 dual-cache topk==128 (BF16-QK) or topk in {512, 1024, 2048} "
+        "(FP8-QK), heads%8==0, pbs_extra in {2, 64}; "
         "GLM_NSA topk in {512, 1024, 2048}; GLM_NEXT topk in "
         "{512, 1024, 2048, 2051, 2112}; "
         "NVFP4 (GLM-family, scale_format=2) topk in {128, 512, 1024, 2048}; "

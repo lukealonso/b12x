@@ -331,6 +331,7 @@ def s2_qk_rope_global_mg_dsv4(
     lane: Int32,
     page_block_size: Int32,
     stride_kv_block: Int64,
+    base_delta: Int64,
     *,
     d_rope: cutlass.Constexpr,
     q_rope_stride: cutlass.Constexpr,
@@ -354,7 +355,7 @@ def s2_qk_rope_global_mg_dsv4(
     a_col = (lane >> Int32(4)) * Int32(8)
     entry = warp_first_cand + gid
     idx = _ld_global_index_i32(index_base_ptr, entry)
-    rope_base = _dsv4_rope_base_off(idx, page_block_size, stride_kv_block)
+    rope_base = _dsv4_rope_base_off(idx, page_block_size, stride_kv_block) + base_delta
 
     for ks in cutlass.range_constexpr(d_rope // 16):
         ko = Int32(ks) * Int32(16)
@@ -2902,10 +2903,21 @@ class UnifiedPrefillMGKernel:
                     if ci >= num_main_tiles:
                         index_base_ptr = get_ptr_as_int64(extra_row, split_cand_start)
 
-                # MAIN rope geometry used by the non-dual FP8 / GLM arms.
+                # Keep the rope operand anchored to the main-cache tensor. For
+                # dual-cache EXTRA tiles, a scalar byte delta re-points that
+                # operand at the extra cache without dynamically rebinding a
+                # cute.Tensor inside this runtime section switch.
                 rope_cache = kv_cache_u8
                 rope_pbs = Int32(self.page_block_size)
                 rope_stride = stride_kv_block
+                rope_delta = Int64(0)
+                if cutlass.const_expr(has_extra):
+                    if ci >= num_main_tiles:
+                        rope_pbs = Int32(self.pbs_extra)
+                        rope_stride = stride_extra_kv_block
+                        rope_delta = get_ptr_as_int64(
+                            extra_kv_cache_u8, Int64(0)
+                        ) - get_ptr_as_int64(kv_cache_u8, Int64(0))
 
                 acc0 = [
                     [
@@ -3156,6 +3168,7 @@ class UnifiedPrefillMGKernel:
                             lane,
                             rope_pbs,
                             rope_stride,
+                            rope_delta,
                             d_rope=t.d_rope,
                             q_rope_stride=L.q_rope_stride,
                             n_hg=n_hg,

@@ -1184,6 +1184,85 @@ def test_unified_prefill_dual_cache_80_heads_split_tail_matches_extra_ref() -> N
 
 
 @torch.inference_mode()
+@pytest.mark.parametrize("num_heads", [16, 32])
+@pytest.mark.parametrize("topk", [512, 1024, 2048])
+def test_unified_prefill_dual_cache_fp8_matches_extra_ref(
+    num_heads: int, topk: int
+) -> None:
+    """FP8 DSV4 dual-cache prefill must use the extra cache for K-RoPE too."""
+    device = require_b12x_sparse_mla()
+    from b12x.attention._shared.mla.kernel import run_unified_prefill
+
+    extra_topk, pbs_extra = 128, 2
+    main_blocks = (topk + _DSV4_PAGE - 1) // _DSV4_PAGE
+    case = dsv4_extra_ref.make_dsv4_extra_decode_case(
+        num_heads=num_heads,
+        topk=topk,
+        extra_topk=extra_topk,
+        num_tokens=1,
+        num_blocks=main_blocks,
+        page_block_size=_DSV4_PAGE,
+        pbs_extra=pbs_extra,
+        invalidate_half=False,
+        with_sink=False,
+        device=device,
+        seed=9_200 + num_heads,
+    )
+    q = case["q"].contiguous()
+    main_cache = _repack_dsv4_to_compressed(case["kv_cache"], _DSV4_PAGE, main_blocks)
+    extra_blocks = case["extra_kv_cache"].shape[0]
+    extra_cache = _repack_dsv4_to_compressed(
+        case["extra_kv_cache"], pbs_extra, extra_blocks
+    )
+    main_indices = case["topk_indices"].contiguous()
+    extra_indices = case["extra_indices"].contiguous()
+    main_lengths = torch.full((1,), topk, dtype=torch.int32, device=device)
+    extra_lengths = torch.full((1,), extra_topk, dtype=torch.int32, device=device)
+
+    expected, expected_lse = dsv4_extra_ref.dsv4_extra_decode_reference(
+        q,
+        case["kv_cache"],
+        main_indices,
+        case["sm_scale"],
+        case["extra_kv_cache"],
+        extra_indices,
+        page_block_size=_DSV4_PAGE,
+        pbs_extra=pbs_extra,
+        topk_length=main_lengths,
+        extra_topk_length=extra_lengths,
+        main_kv_dequant=case["kv_dequant"],
+        extra_kv_dequant=case["extra_kv_dequant"],
+    )
+    output, lse = run_unified_prefill(
+        q=q,
+        kv_cache=main_cache,
+        topk_indices=main_indices,
+        topk_length=main_lengths,
+        sm_scale=case["sm_scale"],
+        page_block_size=_DSV4_PAGE,
+        extra_kv_cache=extra_cache,
+        extra_indices=extra_indices,
+        extra_topk_length=extra_lengths,
+        extra_page_block_size=pbs_extra,
+    )
+    torch.cuda.synchronize()
+    got = output[0].float()
+    expected = expected[0].float()
+    assert torch.isfinite(got).all()
+    assert torch.count_nonzero(got).item() > 0
+    assert torch.isfinite(lse).all()
+    torch.testing.assert_close(
+        lse.float(),
+        expected_lse.float(),
+        atol=6.0e-2,
+        rtol=2.0e-2,
+    )
+    cos = _cosine(got, expected)
+    assert cos > 0.999, f"DSV4 dual-cache FP8 prefill heads={num_heads} O cos={cos}"
+    assert (got - expected).abs().max().item() < 2e-2
+
+
+@torch.inference_mode()
 def test_unified_prefill_dsv4_valid_hpb_8_matches_prefill_ref() -> None:
     """DSV4 prefill heads=8 uses a single MG group with VALID_HPB=8 and must not
     read or reduce the zero-padded upper half of the HPB=16 tile."""
