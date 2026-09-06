@@ -14,6 +14,7 @@ from __future__ import annotations
 import logging
 import os
 import time
+from collections import OrderedDict
 from contextlib import suppress
 from functools import lru_cache
 from statistics import median
@@ -136,6 +137,45 @@ def _load_kernels():
     return DmaKernels(CudaRTLibrary())
 
 
+def _graph_replay_mode() -> bool:
+    """Opt-in CUDA-graph replay of eager ring all-reduces.
+
+    An eager call issues ~250 CUDA API calls from Python (per-piece copies,
+    flag kernels, adds and the cross-stream events); on prefill-size
+    tensors a Python-driven serving loop is bound by that issue time rather
+    than by the transfer. With replay enabled, every shape at or above
+    ``_graph_replay_min_bytes()`` is captured once into a CUDA graph over
+    static input/output buffers and later calls copy in, replay, and copy
+    out. The graph records the eager kernels in their eager order over the
+    same flag counters, so a replay computes the same bits as the eager
+    call (tests/comm/test_pcie_dma_gpu.py checks torch.equal). The
+    static buffers for every cache entry are reserved when the ring is
+    constructed (max_entries x 2 x max_bytes), so serving never allocates
+    and never falls back for lack of device memory.
+    """
+    return os.getenv("B12X_PCIE_DMA_GRAPH_REPLAY", "0") == "1"
+
+
+def _graph_replay_min_bytes() -> int:
+    return int(os.getenv("B12X_PCIE_DMA_GRAPH_REPLAY_MIN_BYTES", str(8 << 20)))
+
+
+def _graph_replay_max_entries() -> int:
+    """Upper bound on cached shapes; the least recently used one is dropped
+    first. Each entry holds two static buffers of the tensor size."""
+    return max(1, int(os.getenv("B12X_PCIE_DMA_GRAPH_REPLAY_MAX_ENTRIES", "4")))
+
+
+class _ReplayEntry:
+    __slots__ = ("inp", "out", "graph", "slot")
+
+    def __init__(self, inp: torch.Tensor, out: torch.Tensor, graph, slot: int) -> None:
+        self.inp = inp
+        self.out = out
+        self.graph = graph
+        self.slot = slot
+
+
 def _align_up(value: int, alignment: int) -> int:
     return (value + alignment - 1) // alignment * alignment
 
@@ -229,6 +269,32 @@ class PCIeDmaAllReduce:
             )
             self._fp8_stage_stride = stride
         self.min_bytes = 0
+        self._graph_replay = _graph_replay_mode()
+        self._graph_replay_min_bytes = _graph_replay_min_bytes()
+        self._graph_replay_max_entries = _graph_replay_max_entries()
+        # Shape key -> captured graph with its static buffers (insertion
+        # order doubles as the LRU order); a shape is captured on its second
+        # eager-eligible call so one-off sizes (prefill tail chunks) stay
+        # eager instead of churning captures.
+        self._replay_entries: "OrderedDict[tuple[int, torch.dtype], _ReplayEntry]" = (
+            OrderedDict()
+        )
+        self._replay_seen: dict[tuple[int, torch.dtype], int] = {}
+        self._replay_capture_stream: torch.cuda.Stream | None = None
+        # Static input/output storage for every cached shape is reserved
+        # here, once, so a capture during serving never allocates device
+        # memory (and can never fail for lack of it): one slot of
+        # 2 x max_bytes per cache entry, carved into views per shape.
+        self._replay_slot_bytes = 2 * _align_up(self.max_bytes, SCRATCH_ALIGN)
+        self._replay_arena: torch.Tensor | None = None
+        self._replay_free_slots: list[int] = []
+        if self._graph_replay:
+            self._replay_arena = torch.empty(
+                self._graph_replay_max_entries * self._replay_slot_bytes,
+                dtype=torch.uint8,
+                device=self.device,
+            )
+            self._replay_free_slots = list(range(self._graph_replay_max_entries))
         wire_modes = {
             "i8": "int8-ag",
             "i8_ring": "int8-ring",
@@ -340,7 +406,119 @@ class PCIeDmaAllReduce:
         self, inp: torch.Tensor, *, out: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         with torch.cuda.device(self.device):
+            if self._graph_replay and self._graph_replay_eligible(inp):
+                return self._all_reduce_replayed(inp, out)
             return self._all_reduce_on_device(inp, out=out)
+
+    def _graph_replay_eligible(self, inp: torch.Tensor) -> bool:
+        # Inside an enclosing capture the eager sequence is recorded into
+        # that graph as before; a graph cannot be replayed while capturing.
+        if torch.cuda.is_current_stream_capturing():
+            return False
+        if inp.numel() * inp.element_size() < self._graph_replay_min_bytes:
+            return False
+        return self.should_allreduce(inp)
+
+    def _check_out(self, inp: torch.Tensor, out: Optional[torch.Tensor]) -> None:
+        if out is not None and (
+            out.shape != inp.shape
+            or out.dtype != inp.dtype
+            or out.device != self.device
+            or not out.is_contiguous()
+        ):
+            raise ValueError(
+                "output must match input shape/dtype/device and be contiguous"
+            )
+
+    def _all_reduce_replayed(
+        self, inp: torch.Tensor, out: Optional[torch.Tensor]
+    ) -> torch.Tensor:
+        # The replay path copies out of the static buffer, and copy_ would
+        # silently convert dtypes, cross devices and scatter into strided
+        # storage, so it enforces the same output contract as the eager call.
+        self._check_out(inp, out)
+        key = (inp.numel(), inp.dtype)
+        entry = self._replay_entries.get(key)
+        if entry is None:
+            seen = self._replay_seen.get(key, 0) + 1
+            if len(self._replay_seen) > 1024:
+                self._replay_seen.clear()
+            self._replay_seen[key] = seen
+            if seen < 2:
+                return self._all_reduce_on_device(inp, out=out)
+            entry = self._capture_replay_entry(inp)
+        else:
+            self._replay_entries.move_to_end(key)
+        # Entries are keyed by element count: the ring treats its input as a
+        # flat buffer, so tensors of different shapes but equal size share a
+        # graph. Copy through flat views so a [768, 7168] call can reuse the
+        # [1536, 3584] entry (and vice versa).
+        entry.inp.view(-1).copy_(inp.view(-1))
+        entry.graph.replay()
+        if out is None:
+            out = torch.empty_like(inp)
+        out.view(-1).copy_(entry.out.view(-1))
+        return out
+
+    def _capture_replay_entry(self, inp: torch.Tensor) -> _ReplayEntry:
+        """Capture the eager ring sequence for ``inp``'s shape over static
+        buffers. Every rank captures the same shape sequence, so the
+        cache contents stay symmetric across the group; nothing executes
+        during capture, and the device-side flag counters advance only when
+        the graph runs, exactly as the eager kernels would."""
+        while len(self._replay_entries) >= self._graph_replay_max_entries:
+            evicted_key, evicted = self._replay_entries.popitem(last=False)
+            # An evicted shape earns its capture again with one eager call,
+            # so a cycle of more shapes than entries alternates eager and
+            # capture instead of capturing on every call.
+            self._replay_seen.pop(evicted_key, None)
+            self._replay_free_slots.append(evicted.slot)
+            del evicted
+        assert self._replay_arena is not None and self._replay_free_slots
+        slot = self._replay_free_slots.pop()
+        nbytes = inp.numel() * inp.element_size()
+        base = slot * self._replay_slot_bytes
+        half = self._replay_slot_bytes // 2
+        static_in = (
+            self._replay_arena[base : base + nbytes].view(inp.dtype).view(inp.shape)
+        )
+        static_out = (
+            self._replay_arena[base + half : base + half + nbytes]
+            .view(inp.dtype)
+            .view(inp.shape)
+        )
+        main = torch.cuda.current_stream(self.device)
+        side = self._replay_capture_stream
+        if side is None:
+            side = self._replay_capture_stream = torch.cuda.Stream(device=self.device)
+        # torch.cuda.graph() would also synchronize the device, run gc and
+        # empty the caching allocator; the ring allocates nothing inside the
+        # capture, so a bare capture on a joined side stream suffices.
+        side.wait_stream(main)
+        graph = torch.cuda.CUDAGraph()
+        try:
+            with torch.cuda.stream(side):
+                graph.capture_begin(capture_error_mode="thread_local")
+                try:
+                    self._all_reduce_on_device(static_in, out=static_out)
+                finally:
+                    graph.capture_end()
+        except BaseException:
+            # The slot is only owned by an entry once the capture succeeded;
+            # a failed capture returns it so later shapes can still capture.
+            self._replay_free_slots.append(slot)
+            raise
+        main.wait_stream(side)
+        entry = _ReplayEntry(static_in, static_out, graph, slot)
+        self._replay_entries[(inp.numel(), inp.dtype)] = entry
+        logger.debug(
+            "[PCIe DMA allreduce] captured replay graph for numel=%d dtype=%s "
+            "(%d cached)",
+            inp.numel(),
+            inp.dtype,
+            len(self._replay_entries),
+        )
+        return entry
 
     def _all_reduce_on_device(
         self, inp: torch.Tensor, *, out: Optional[torch.Tensor] = None
@@ -350,19 +528,11 @@ class PCIeDmaAllReduce:
                 "input does not satisfy ring allreduce requirements "
                 f"(shape={tuple(inp.shape)}, dtype={inp.dtype})"
             )
+        self._check_out(inp, out)
         if out is None:
             # Preserve normal out-of-place collective semantics. Callers can
             # retain this result while a later collective is in flight.
             out = torch.empty_like(inp)
-        elif (
-            out.shape != inp.shape
-            or out.dtype != inp.dtype
-            or out.device != self.device
-            or not out.is_contiguous()
-        ):
-            raise ValueError(
-                "output must match input shape/dtype/device and be contiguous"
-            )
         kernels = self._kernels
         world = self.world_size
         rank = self.rank
@@ -806,6 +976,8 @@ class PCIeDmaAllReduce:
         if self._closed:
             return
         self._closed = True
+        self._replay_entries.clear()
+        self._replay_arena = None
         # Drain the main and four auxiliary streams before any rank unmaps a
         # peer allocation.  Every importer must unmap before its owner frees
         # the exported slab.

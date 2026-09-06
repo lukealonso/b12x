@@ -153,6 +153,29 @@ Compressed transport requires BF16 input and a per-rank shard divisible by
 B12X_PCIE_DMA_FP8=i8_ring python -m your_server
 ```
 
+### Graph replay of eager ring all-reduces
+
+An eager `PCIeDmaAllReduce.all_reduce` call issues roughly 250 CUDA API calls
+from Python (per-piece copies, flag kernels, adds, cross-stream events), so a
+Python-driven serving loop that reduces prefill-size tensors is bound by that
+issue time rather than by the wire. `B12X_PCIE_DMA_GRAPH_REPLAY=1` captures
+each eligible shape once into a CUDA graph over static input/output buffers
+(on the shape's second call, so one-off sizes stay eager) and replays it
+afterward with a copy in and a copy out. The graph records the eager kernels
+in their eager order over the same flag counters, so a replay computes the
+same bits as the eager call (`tests/comm/test_pcie_dma_gpu.py` asserts
+`torch.equal` against the eager result across replays, shape reuse and an
+enclosing capture); calls made while an enclosing CUDA graph is being
+captured keep recording the eager sequence into that graph. A caller-supplied
+`out` must match the input shape and dtype, live on the ring's device and be
+contiguous on both paths.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `B12X_PCIE_DMA_GRAPH_REPLAY` | `0` | `1` enables replay for eager calls |
+| `B12X_PCIE_DMA_GRAPH_REPLAY_MIN_BYTES` | `8388608` | Smallest tensor size that is captured |
+| `B12X_PCIE_DMA_GRAPH_REPLAY_MAX_ENTRIES` | `4` | Cached shapes; least recently used is dropped first. The static buffers for all entries (`2 x max_bytes` each) are reserved when the ring is constructed, so serving never allocates for a capture |
+
 Compilation happens lazily per shape/config and is cached. For serving, warm
 up the shapes you need, then freeze:
 

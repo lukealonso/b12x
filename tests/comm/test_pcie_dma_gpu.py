@@ -155,6 +155,133 @@ def test_pcie_dma_all_reduce_eager_and_graph() -> None:
     mp.spawn(_worker, args=(world_size, _free_port()), nprocs=world_size, join=True)
 
 
+def _replay_worker(rank: int, world_size: int, port: int) -> None:
+    os.environ["B12X_PCIE_DMA_GRAPH_REPLAY"] = "1"
+    os.environ["B12X_PCIE_DMA_GRAPH_REPLAY_MIN_BYTES"] = "0"
+    os.environ["B12X_PCIE_DMA_GRAPH_REPLAY_MAX_ENTRIES"] = "1"
+    torch.cuda.set_device(rank)
+    device = torch.device(f"cuda:{rank}")
+    dist.init_process_group(
+        "nccl",
+        init_method=f"tcp://127.0.0.1:{port}",
+        rank=rank,
+        world_size=world_size,
+    )
+    hidden = 6144
+    max_rows = 512
+    row_multiple = (world_size * 8) // gcd(hidden, world_size * 8)
+    rows_a = ((256 + row_multiple - 1) // row_multiple) * row_multiple
+    rows_b = ((64 + row_multiple - 1) // row_multiple) * row_multiple
+    ring = PCIeDmaAllReduce(
+        exchange_group=dist.group.WORLD,
+        device=device,
+        max_bytes=max_rows * hidden * 4,
+    )
+    try:
+        assert ring._graph_replay
+
+        def eager(inp: torch.Tensor) -> torch.Tensor:
+            ring._graph_replay = False
+            try:
+                out = ring.all_reduce(inp)
+            finally:
+                ring._graph_replay = True
+            torch.cuda.synchronize(device)
+            return out
+
+        inputs = [
+            _make_input(rows_a, hidden, torch.bfloat16, device, rank, it)
+            for it in range(4)
+        ]
+        expected = [eager(inp) for inp in inputs]
+
+        # First call of a shape stays eager, the second captures and replays,
+        # later ones replay; all bit-identical to the eager sequence.
+        assert not ring._replay_entries
+        out0 = ring.all_reduce(inputs[0])
+        torch.cuda.synchronize(device)
+        assert not ring._replay_entries
+        assert torch.equal(out0, expected[0])
+        allocated_before_capture = torch.cuda.memory_allocated(device)
+        out1 = ring.all_reduce(inputs[1])
+        torch.cuda.synchronize(device)
+        # The capture carves its static buffers out of the arena reserved at
+        # construction, so the allocator grows by the returned output plus at
+        # most the small launch bookkeeping of the captured kernels, never by
+        # another pair of tensor-sized buffers.
+        capture_growth = torch.cuda.memory_allocated(device) - allocated_before_capture
+        assert capture_growth <= out1.numel() * out1.element_size() + (4 << 20), (
+            f"capture allocated {capture_growth} bytes beyond the output"
+        )
+        assert len(ring._replay_entries) == 1
+        entry = next(iter(ring._replay_entries.values()))
+        arena_start = ring._replay_arena.data_ptr()
+        arena_end = arena_start + ring._replay_arena.numel()
+        assert arena_start <= entry.inp.data_ptr() < arena_end
+        assert arena_start <= entry.out.data_ptr() < arena_end
+        assert torch.equal(out1, expected[1])
+        assert out1.data_ptr() not in (entry.inp.data_ptr(), entry.out.data_ptr())
+        out2 = ring.all_reduce(inputs[2])
+        out3 = ring.all_reduce(inputs[3])
+        torch.cuda.synchronize(device)
+        assert torch.equal(out2, expected[2])
+        assert torch.equal(out3, expected[3])
+        # Retained outputs are independent of later replays.
+        assert torch.equal(out1, expected[1])
+        _assert_close(out3, _reference(inputs[3]), world_size)
+
+        # A tensor of another shape but the same element count reuses the
+        # entry (the ring is a flat all-reduce) and matches the eager result.
+        reshaped = inputs[2].view(rows_a * 2, hidden // 2)
+        out_reshaped = ring.all_reduce(reshaped)
+        torch.cuda.synchronize(device)
+        assert len(ring._replay_entries) == 1
+        assert out_reshaped.shape == reshaped.shape
+        assert torch.equal(out_reshaped.view(rows_a, hidden), expected[2])
+
+        # A second shape evicts the first at max_entries=1 and still matches.
+        small = [
+            _make_input(rows_b, hidden, torch.bfloat16, device, rank, it)
+            for it in range(2)
+        ]
+        small_expected = [eager(inp) for inp in small]
+        ring.all_reduce(small[0])
+        out_small = ring.all_reduce(small[1])
+        torch.cuda.synchronize(device)
+        assert list(ring._replay_entries) == [(small[1].numel(), torch.bfloat16)]
+        assert torch.equal(out_small, small_expected[1])
+
+        # Inside an enclosing capture the eager sequence is recorded as before.
+        static_in = inputs[0].clone()
+        static_out = torch.empty_like(static_in)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            ring.all_reduce(static_in, out=static_out)
+        for it in range(1, 3):
+            static_in.copy_(inputs[it])
+            graph.replay()
+            torch.cuda.synchronize(device)
+            assert torch.equal(static_out, expected[it])
+        dist.barrier()
+    finally:
+        ring.close()
+        dist.destroy_process_group()
+
+
+def test_pcie_dma_all_reduce_graph_replay_matches_eager() -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is not available")
+    world_size = int(os.getenv("B12X_PCIE_DMA_WORLD_SIZE", "2"))
+    if torch.cuda.device_count() < world_size:
+        pytest.skip(
+            f"need {world_size} CUDA devices, found {torch.cuda.device_count()}"
+        )
+    _load_kernels()
+    mp.spawn(
+        _replay_worker, args=(world_size, _free_port()), nprocs=world_size, join=True
+    )
+
+
 def _fp8_worker(rank: int, world_size: int, port: int, mode: str) -> None:
     os.environ["B12X_PCIE_DMA_FP8"] = mode
     _worker(rank, world_size, port)
