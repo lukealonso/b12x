@@ -11503,6 +11503,48 @@ def _run_trellis256_dense_current_device(
     if c_tmp is not None and int(c_tmp.data_ptr()) % 16 != 0:
         raise ValueError("c_tmp must be at least 16-byte aligned")
 
+    # Weight preparation binds the cooperative launch only for an unpaired
+    # FP16 K6/MCG payload. Runtime admission therefore checks dynamic input and
+    # call controls without resolving a kernel or duplicating weight policy.
+    small_m_launch = getattr(prepared_dense, "k6_mcg_small_m_launch", None)
+    if (
+        small_m_launch is not None
+        and hadamard_128 is None
+        and _moe_block_size in (None, 64)
+        and _force_tile_config is None
+    ):
+        from b12x.gemm.trellis_linear._k6_mcg_cute import (
+            k6_mcg_small_m_scratch_elements,
+            run_k6_mcg_small_m,
+        )
+
+        if small_m_launch.accepts_input(x):
+            rotated_f16 = _trellis_dense_buffer(
+                "rotated_f16",
+                rotated_f16,
+                shape=(m, size_k),
+                dtype=torch.float16,
+                device=x.device,
+            )
+            if c_tmp is None:
+                if torch.cuda.is_current_stream_capturing():
+                    raise RuntimeError(
+                        "Trellis dense c_tmp is not initialized for CUDA graph "
+                        "capture; provide caller-owned storage"
+                    )
+                c_tmp = torch.empty(
+                    (k6_mcg_small_m_scratch_elements(size_k, size_n),),
+                    dtype=torch.float32,
+                    device=x.device,
+                )
+            return run_k6_mcg_small_m(
+                x,
+                prepared_dense,
+                output=output,
+                rotated=rotated_f16,
+                c_tmp=c_tmp,
+            )
+
     hadamard_128 = _resolve_exl3_hadamard_128(hadamard_128)
 
     gemm_output = _trellis_dense_buffer(
