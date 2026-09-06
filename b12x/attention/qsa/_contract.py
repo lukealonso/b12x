@@ -475,6 +475,8 @@ class Binding:
     request_errors: torch.Tensor
     partial_output: torch.Tensor
     partial_lse: torch.Tensor
+    selection_stream: torch.cuda.Stream | None = None
+    _selection_done: torch.cuda.Event | None = None
 
 
 @dataclass(frozen=True)
@@ -1027,8 +1029,9 @@ def bind(
     rope_sin: torch.Tensor,
     output: torch.Tensor,
     selected_positions: torch.Tensor,
+    selection_stream: torch.cuda.Stream | None = None,
 ) -> Binding:
-    """Bind runtime storage without allocating or mutating caller tensors.
+    """Bind runtime storage and optional selection-stream resources.
 
     ``rope_cos`` and ``rope_sin`` may be positive-row-stride views with unit
     inner stride.  This admits zero-copy slices of a combined cosine/sine
@@ -1037,6 +1040,11 @@ def bind(
 
     ``output`` may have fewer rows than the plan's capacity. Every execution
     must fit its live query rows in that caller-owned contiguous output.
+
+    With ``selection_stream``, :func:`run` requires an ``index_ready`` event
+    covering all selector inputs, metadata, and bound state. Bind and prewarm
+    before graph capture. Main Q/K/V producers execute on the calling stream;
+    run joins selection before attention. Calls sharing state must be ordered.
     """
     if not isinstance(plan, Plan):
         raise TypeError("plan must be a qsa.Plan")
@@ -1348,7 +1356,20 @@ def bind(
         shape=(int(plan.max_split_row_product), int(caps.q_heads)),
         dtype=torch.float32,
     )
+    selection_done = None
+    if selection_stream is not None:
+        if not isinstance(selection_stream, torch.cuda.Stream):
+            raise TypeError("selection_stream must be a CUDA stream")
+        if selection_stream.device != caps.device:
+            raise ValueError("selection_stream must match the QSA plan device")
+        with torch.cuda.device(caps.device):
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError("bind selection-stream resources before graph capture")
+            selection_done = torch.cuda.Event()
+            selection_done.record(selection_stream)
     return Binding(
+        selection_stream=selection_stream,
+        _selection_done=selection_done,
         plan=plan,
         shared_compressed_raw_pool=_overlaps(compressed_k_cache, raw_k_ring),
         scratch=scratch_storage,
@@ -1847,7 +1868,7 @@ def _qsa_decode_impl(
         )
 
         # Selection has no dependency on main Q/K/V contents. Its output and
-        # error mask remain live in caller storage until run_selected consumes it.
+        # error mask remain live until the attention stage consumes them.
         if query is None:
             continue
 
@@ -1900,7 +1921,7 @@ _QSA_MUTATED_ARGUMENTS = (
     mutates_args=_QSA_MUTATED_ARGUMENTS,
 )
 def _qsa_decode_op(
-    query: torch.Tensor | None,
+    query: torch.Tensor,
     index_query: torch.Tensor,
     raw_index_key: torch.Tensor,
     request_ids: torch.Tensor,
@@ -1959,6 +1980,7 @@ def _qsa_decode_op(
     partial_output_offset_bytes: int,
     partial_lse_offset_bytes: int,
     work_metadata_offset_bytes: int,
+    selection_only: bool,
 ) -> None:
     _require_mutation_alias_contract(
         mutable=(
@@ -1972,7 +1994,7 @@ def _qsa_decode_op(
             ("selected_positions", selected_positions),
         ),
         read_only=(
-            *((("query", query),) if query is not None else ()),
+            ("query", query),
             ("index_query", index_query),
             ("raw_index_key", raw_index_key),
             ("request_ids", request_ids),
@@ -1985,7 +2007,7 @@ def _qsa_decode_op(
         ),
     )
     _qsa_decode_impl(
-        query,
+        None if selection_only else query,
         index_query,
         raw_index_key,
         request_ids,
@@ -2049,7 +2071,7 @@ def _qsa_decode_op(
 
 @_qsa_decode_op.register_fake
 def _qsa_decode_fake(
-    query: torch.Tensor | None,
+    query: torch.Tensor,
     index_query: torch.Tensor,
     raw_index_key: torch.Tensor,
     request_ids: torch.Tensor,
@@ -2108,6 +2130,7 @@ def _qsa_decode_fake(
     partial_output_offset_bytes: int,
     partial_lse_offset_bytes: int,
     work_metadata_offset_bytes: int,
+    selection_only: bool,
 ) -> None:
     return None
 
@@ -2181,7 +2204,7 @@ _QSA_SHARED_MUTATED_ARGUMENTS = (
     mutates_args=_QSA_SHARED_MUTATED_ARGUMENTS,
 )
 def _qsa_decode_shared_op(
-    query: torch.Tensor | None,
+    query: torch.Tensor,
     index_query: torch.Tensor,
     raw_index_key: torch.Tensor,
     request_ids: torch.Tensor,
@@ -2238,6 +2261,7 @@ def _qsa_decode_shared_op(
     partial_output_offset_bytes: int,
     partial_lse_offset_bytes: int,
     work_metadata_offset_bytes: int,
+    selection_only: bool,
 ) -> None:
     _require_mutation_alias_contract(
         mutable=(
@@ -2247,7 +2271,7 @@ def _qsa_decode_shared_op(
             ("selected_positions", selected_positions),
         ),
         read_only=(
-            *((("query", query),) if query is not None else ()),
+            ("query", query),
             ("index_query", index_query),
             ("raw_index_key", raw_index_key),
             ("request_ids", request_ids),
@@ -2272,7 +2296,7 @@ def _qsa_decode_shared_op(
         position_axes=int(rope_positions.shape[1]),
     )
     _qsa_decode_impl(
-        query,
+        None if selection_only else query,
         index_query,
         raw_index_key,
         request_ids,
@@ -2336,7 +2360,7 @@ def _qsa_decode_shared_op(
 
 @_qsa_decode_shared_op.register_fake
 def _qsa_decode_shared_fake(
-    query: torch.Tensor | None,
+    query: torch.Tensor,
     index_query: torch.Tensor,
     raw_index_key: torch.Tensor,
     request_ids: torch.Tensor,
@@ -2393,14 +2417,15 @@ def _qsa_decode_shared_fake(
     partial_output_offset_bytes: int,
     partial_lse_offset_bytes: int,
     work_metadata_offset_bytes: int,
+    selection_only: bool,
 ) -> None:
     return None
 
 
-def run(
+def _run(
     binding: Binding,
     *,
-    query: torch.Tensor | None,
+    query: torch.Tensor,
     index_query: torch.Tensor,
     raw_index_key: torch.Tensor,
     request_ids: torch.Tensor,
@@ -2410,49 +2435,14 @@ def run(
     query_start_loc: torch.Tensor,
     num_accepted_tokens: torch.Tensor,
     is_prefilling: torch.Tensor,
+    selection_only: bool = False,
 ) -> torch.Tensor:
-    """Run one packed QSA decode transaction after main K/V is populated.
-
-    ``query=None`` executes only the selector and leaves ``output`` untouched;
-    prefer the named :func:`select` entry point for that split transaction.
-
-    Active request intervals are the dense prefix encoded by
-    ``query_start_loc``.  Remaining boundaries repeat the live-row count and
-    remaining query rows contain ``-1`` metadata.  ``sequence_lengths`` includes
-    every row in the corresponding current interval.  The read-only main K/V
-    cache must already contain every original-token K/V row selected here.
-
-    ``num_accepted_tokens`` commits the preceding verification interval:
-    each active value is in ``[1, 1 + max_speculative_tokens]`` and counts the
-    accepted prefix including its guaranteed or recovered token.  The mutable
-    ``raw_interval_start_positions`` entry for the request's persistent state
-    slot records the preceding interval's first row before the call and the
-    current interval's first row after it.  Candidate rows may
-    remain physically resident after rejection, but exact logical tags prevent
-    them from becoming eligible.  Invalid dynamic metadata is detected on the
-    device, suppresses persistent mutation for the whole request, and poisons
-    its output rows with NaNs.
-
-    With shared compressed/raw backing, requests that have no rows in the
-    current packed call remain live page owners until eviction.  Their
-    ``sequence_lengths``, ``compressed_block_table`` entries, and
-    ``raw_state_slot_ids`` mappings must remain valid.  Zero sequence lengths
-    and ``-1`` table or slot entries describe only unused or evicted capacity.
-
-    For the first decode interval beginning at logical position ``N``, seed
-    the persistent interval anchor to ``N - num_accepted_tokens``.  If the
-    interval can complete a group whose prefix came from prefill, the raw ring
-    must already contain exact logical tags, raw index keys, and RoPE positions
-    for the trailing open group.  An anchor of ``-1`` is valid only for the
-    position-zero initialization with one accepted token.  ``rope_positions``
-    may be any non-overlapping 2-D view with positive row and axis strides,
-    including ``positions_by_axis.T``.
-    Selector projections may be disjoint dense-row views of a fused Q/K
-    projection; their positive row strides are consumed without staging copies.
-    """
+    """Validate a complete transaction and launch its combined or selector stage."""
     if not isinstance(binding, Binding):
         raise TypeError("binding must be a qsa.Binding")
     caps = binding.plan.caps
+    if not isinstance(query, torch.Tensor):
+        raise TypeError("query must be a tensor")
     if index_query.device.type != "cuda":
         raise RuntimeError("QSA GPU decode requires a CUDA device")
     rows = int(index_query.shape[0])
@@ -2506,16 +2496,15 @@ def run(
             (torch.bool,),
         ),
     )
-    if query is not None:
-        dynamic_specs = (
-            (
-                query,
-                "query",
-                (rows, int(caps.q_heads), int(caps.head_dim)),
-                (torch.bfloat16,),
-            ),
-            *dynamic_specs,
-        )
+    dynamic_specs = (
+        (
+            query,
+            "query",
+            (rows, int(caps.q_heads), int(caps.head_dim)),
+            (torch.bfloat16,),
+        ),
+        *dynamic_specs,
+    )
     for tensor, name, shape, dtypes in dynamic_specs:
         _check_tensor(
             tensor,
@@ -2620,8 +2609,9 @@ def run(
             int(layout.partial_output_offset_bytes),
             int(layout.partial_lse_offset_bytes),
             int(layout.work_metadata_offset_bytes),
+            selection_only,
         )
-        return (binding.selected_positions if query is None else binding.output)[:rows]
+        return binding.output[:rows]
     _qsa_decode_op(
         query,
         index_query,
@@ -2682,13 +2672,15 @@ def run(
         int(layout.partial_output_offset_bytes),
         int(layout.partial_lse_offset_bytes),
         int(layout.work_metadata_offset_bytes),
+        selection_only,
     )
-    return (binding.selected_positions if query is None else binding.output)[:rows]
+    return binding.output[:rows]
 
 
-def select(
+def run(
     binding: Binding,
     *,
+    query: torch.Tensor,
     index_query: torch.Tensor,
     raw_index_key: torch.Tensor,
     request_ids: torch.Tensor,
@@ -2698,18 +2690,58 @@ def select(
     query_start_loc: torch.Tensor,
     num_accepted_tokens: torch.Tensor,
     is_prefilling: torch.Tensor,
+    index_ready: torch.cuda.Event | None = None,
 ) -> torch.Tensor:
-    """Update selector state and select positions without reading main Q/K/V.
+    """Run one packed QSA decode transaction after main K/V writes are enqueued.
 
-    Dynamic metadata and mutation semantics are identical to :func:`run`.
-    Before :func:`run_selected`, the caller must finish this operation, populate
-    main K/V and retain the selected positions, error mask and scratch storage.
-    Neither another selection nor scratch reuse may intervene. Stream ordering
-    is caller-owned, including during CUDA graph capture and replay.
+    Main Q/K/V writes precede this call on the calling stream. By default all
+    QSA work follows them on that stream. A binding with ``selection_stream``
+    instead requires ``index_ready``, recorded after all selector inputs,
+    metadata and prior state writes, before independent main Q/K/V work.
+    Selection waits for that event and runs on the bound stream; attention
+    joins it on the calling stream. Intermediate positions/errors remain an
+    internal handoff within this call. Bind and prewarm before graph capture,
+    and record the readiness event inside the graph for captured producers.
+
+    Active request intervals are the dense prefix encoded by
+    ``query_start_loc``.  Remaining boundaries repeat the live-row count and
+    remaining query rows contain ``-1`` metadata.  ``sequence_lengths`` includes
+    every row in the corresponding current interval.  The read-only main K/V
+    cache must contain every selected original-token K/V row before attention
+    executes on the calling stream.
+
+    ``num_accepted_tokens`` commits the preceding verification interval:
+    each active value is in ``[1, 1 + max_speculative_tokens]`` and counts the
+    accepted prefix including its guaranteed or recovered token.  The mutable
+    ``raw_interval_start_positions`` entry for the request's persistent state
+    slot records the preceding interval's first row before the call and the
+    current interval's first row after it.  Candidate rows may
+    remain physically resident after rejection, but exact logical tags prevent
+    them from becoming eligible.  Invalid dynamic metadata is detected on the
+    device, suppresses persistent mutation for the whole request, and poisons
+    its output rows with NaNs.
+
+    With shared compressed/raw backing, requests that have no rows in the
+    current packed call remain live page owners until eviction.  Their
+    ``sequence_lengths``, ``compressed_block_table`` entries, and
+    ``raw_state_slot_ids`` mappings must remain valid.  Zero sequence lengths
+    and ``-1`` table or slot entries describe only unused or evicted capacity.
+
+    For the first decode interval beginning at logical position ``N``, seed
+    the persistent interval anchor to ``N - num_accepted_tokens``.  If the
+    interval can complete a group whose prefix came from prefill, the raw ring
+    must already contain exact logical tags, raw index keys, and RoPE positions
+    for the trailing open group.  An anchor of ``-1`` is valid only for the
+    position-zero initialization with one accepted token.  ``rope_positions``
+    may be any non-overlapping 2-D view with positive row and axis strides,
+    including ``positions_by_axis.T``.
+    Selector projections may be disjoint dense-row views of a fused Q/K
+    projection; their positive row strides are consumed without staging copies.
     """
-    return run(
-        binding,
-        query=None,
+    if not isinstance(binding, Binding):
+        raise TypeError("binding must be a qsa.Binding")
+    inputs = dict(
+        query=query,
         index_query=index_query,
         raw_index_key=raw_index_key,
         request_ids=request_ids,
@@ -2720,10 +2752,35 @@ def select(
         num_accepted_tokens=num_accepted_tokens,
         is_prefilling=is_prefilling,
     )
+    stream = binding.selection_stream
+    if stream is None:
+        if index_ready is not None:
+            raise ValueError("index_ready requires a binding with selection_stream")
+        return _run(binding, **inputs)
+    if index_ready is None:
+        raise ValueError("selection_stream requires an index_ready event")
+    if not torch.compiler.is_compiling():
+        if not isinstance(index_ready, torch.cuda.Event):
+            raise TypeError("index_ready must be a recorded CUDA event")
+        if index_ready.device != binding.plan.caps.device:
+            raise ValueError("index_ready must be recorded on the QSA plan device")
+    with torch.cuda.device(binding.plan.caps.device):
+        main_stream = torch.cuda.current_stream()
+        stream.wait_event(index_ready)
+        with torch.cuda.stream(stream):
+            _run(binding, **inputs, selection_only=True)
+            binding._selection_done.record(stream)
+        main_stream.wait_event(binding._selection_done)
+        return _run_attention(
+            binding,
+            query=query,
+            request_ids=request_ids,
+            query_positions=query_positions,
+        )
 
 
-@torch.library.custom_op("b12x::qsa_selected", mutates_args=("scratch", "output"))
-def _qsa_selected_op(
+@torch.library.custom_op("b12x::qsa_attention", mutates_args=("scratch", "output"))
+def _qsa_attention_op(
     query: torch.Tensor,
     request_ids: torch.Tensor,
     query_positions: torch.Tensor,
@@ -2733,7 +2790,6 @@ def _qsa_selected_op(
     v_descale: torch.Tensor | None,
     main_block_table: torch.Tensor,
     selected_positions: torch.Tensor,
-    selection_errors: torch.Tensor | None,
     scratch: torch.Tensor,
     output: torch.Tensor,
     work_rows: int,
@@ -2755,22 +2811,15 @@ def _qsa_selected_op(
             ("request_ids", request_ids),
             ("query_positions", query_positions),
             ("selected_positions", selected_positions),
-            *(
-                (("selection_errors", selection_errors),)
-                if selection_errors is not None
-                else ()
-            ),
         ),
     )
     rows, q_heads, head_dim = map(int, query.shape)
-    errors = selection_errors
-    if errors is None:
-        errors = _scratch_view(
-            scratch,
-            offset_bytes=state_errors_offset,
-            shape=(int(output.shape[0]),),
-            dtype=torch.int32,
-        )
+    errors = _scratch_view(
+        scratch,
+        offset_bytes=state_errors_offset,
+        shape=(int(output.shape[0]),),
+        dtype=torch.int32,
+    )
     partial_output = _scratch_view(
         scratch,
         offset_bytes=partial_output_offset,
@@ -2819,8 +2868,8 @@ def _qsa_selected_op(
         )
 
 
-@_qsa_selected_op.register_fake
-def _qsa_selected_fake(
+@_qsa_attention_op.register_fake
+def _qsa_attention_fake(
     query: torch.Tensor,
     request_ids: torch.Tensor,
     query_positions: torch.Tensor,
@@ -2830,7 +2879,6 @@ def _qsa_selected_fake(
     v_descale: torch.Tensor | None,
     main_block_table: torch.Tensor,
     selected_positions: torch.Tensor,
-    selection_errors: torch.Tensor | None,
     scratch: torch.Tensor,
     output: torch.Tensor,
     work_rows: int,
@@ -2843,29 +2891,15 @@ def _qsa_selected_fake(
     return None
 
 
-def run_selected(
+def _run_attention(
     binding: Binding,
     *,
     query: torch.Tensor,
     request_ids: torch.Tensor,
     query_positions: torch.Tensor,
-    selected_positions: torch.Tensor | None = None,
-    selection_errors: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Consume the matching select result after main Q/K/V becomes available.
+    """Consume the bound selection and error mask within one run call."""
 
-    The binding must reference the same plan, scratch, metadata, cache and
-    selection storage used by :func:`select`. Attention cannot race selector
-    completion or main-cache writes. Failed selector requests remain poisoned;
-    this entry point does not reset their error mask or mutate selector state.
-
-    A speculative caller may instead provide an immutable captured selection
-    extended by ``caps.max_speculative_tokens`` columns and its captured int32
-    error mask. Both tensors must follow the query-row order. The caller owns
-    capture, request compaction, causal tail population and stream ordering;
-    this entry point never infers those errors from unrelated scratch rows.
-    The extended selection width is planned capacity, not a live token count.
-    """
     if not isinstance(binding, Binding):
         raise TypeError("binding must be a qsa.Binding")
     caps = binding.plan.caps
@@ -2874,31 +2908,6 @@ def run_selected(
         raise ValueError("query rows must be within the planned decode capacity")
     if rows > int(binding.output.shape[0]):
         raise ValueError("query rows exceed the bound QSA output capacity")
-    if (selected_positions is None) != (selection_errors is None):
-        raise ValueError(
-            "captured positions and selection errors must be supplied together"
-        )
-    if selected_positions is None:
-        selected_positions = binding.selected_positions
-    else:
-        if int(caps.max_speculative_tokens) <= 0:
-            raise ValueError("captured selections require planned speculative capacity")
-        _check_tensor(
-            selected_positions,
-            name="captured selected_positions",
-            device=caps.device,
-            shape=(rows, caps.selection_width + caps.max_speculative_tokens),
-            dtype=torch.int32,
-            contiguous=True,
-        )
-        _check_tensor(
-            selection_errors,
-            name="selection_errors",
-            device=caps.device,
-            shape=(rows,),
-            dtype=torch.int32,
-            contiguous=True,
-        )
     for tensor, name, shape, dtype in (
         (query, "query", (rows, caps.q_heads, caps.head_dim), torch.bfloat16),
         (request_ids, "request_ids", (rows,), (torch.int32, torch.int64)),
@@ -2913,7 +2922,7 @@ def run_selected(
             contiguous=True,
         )
     layout = binding.plan._layout
-    _qsa_selected_op(
+    _qsa_attention_op(
         query,
         request_ids,
         query_positions,
@@ -2922,8 +2931,7 @@ def run_selected(
         binding.k_descale,
         binding.v_descale,
         binding.main_block_table,
-        selected_positions,
-        selection_errors,
+        binding.selected_positions,
         binding.scratch,
         binding.output,
         binding.plan.workspace_q_rows,
@@ -2941,7 +2949,7 @@ def prewarm(binding: Binding, *, rows: int | None = None) -> None:
 
     Every synthetic row has an invalid request ID and position. The launch
     therefore warms the bound output capacity, cache-table stride, selector
-    workspace, and ordinary and captured-selection specializations. Cache accesses
+    workspace, selection, and attention specializations. Cache accesses
     and persistent selector-state writes remain masked. Scratch, output, and
     selected-position buffers are transient and have unspecified contents
     after this call.
@@ -2955,6 +2963,7 @@ def prewarm(binding: Binding, *, rows: int | None = None) -> None:
     if not 0 < requested_rows <= output_capacity:
         raise ValueError("prewarm rows must fit the bound QSA output capacity")
     device = caps.device
+    ready = torch.cuda.Event() if binding.selection_stream is not None else None
     sequence_lengths = torch.zeros(
         int(caps.max_batch), dtype=torch.int32, device=device
     )
@@ -3001,6 +3010,8 @@ def prewarm(binding: Binding, *, rows: int | None = None) -> None:
                 dtype=request_id_dtype,
                 device=device,
             )
+            if ready is not None:
+                ready.record(torch.cuda.current_stream(device))
             run(
                 binding,
                 query=query,
@@ -3013,26 +3024,8 @@ def prewarm(binding: Binding, *, rows: int | None = None) -> None:
                 query_start_loc=query_start_loc,
                 num_accepted_tokens=num_accepted_tokens,
                 is_prefilling=is_prefilling,
+                index_ready=ready,
             )
-            if int(caps.max_speculative_tokens):
-                selected = torch.full(
-                    (
-                        warm_row_count,
-                        int(caps.selection_width) + int(caps.max_speculative_tokens),
-                    ),
-                    -1,
-                    dtype=torch.int32,
-                    device=device,
-                )
-                errors = torch.zeros(warm_row_count, dtype=torch.int32, device=device)
-                run_selected(
-                    binding,
-                    query=query,
-                    request_ids=request_ids,
-                    query_positions=query_positions,
-                    selected_positions=selected,
-                    selection_errors=errors,
-                )
 
 
 def is_supported(device: torch.device | str | None = None) -> bool:

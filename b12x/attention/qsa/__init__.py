@@ -4,21 +4,43 @@ QSA keeps exact, original-token BF16 or globally scaled FP8 E4M3 GQA K/V and
 uses a second compressed BF16 key cache only to select groups of logical token
 positions. The public lifecycle is ``Caps -> plan -> bind -> prewarm -> run``.
 Planning owns split and scratch policy; binding validates tensors and creates
-references without allocating. ``prewarm`` compiles both request-ID widths and
+references without allocating tensors. Optional stream scheduling creates a
+completion event at bind time. ``prewarm`` compiles both request-ID widths and
 both sparse-GQA row regimes without reading or mutating cache state and may be
 omitted when first-use JIT latency is acceptable.
 
-``run`` executes the decode transaction behind one opaque mutating dispatcher
-boundary and never dispatches the slow functions in
+``run`` executes the decode transaction through opaque mutating dispatcher
+operations and never dispatches the slow functions in
 :mod:`b12x.attention.qsa.reference`.  The bound main K/V cache and both page
 tables are read-only.  The bound output, selected-position matrix, compressed
 selector cache, and raw selector state are mutable.  The caller writes the
-live original-token K/V before calling ``run``; QSA has no main-cache writer.
+live original-token K/V on the calling stream before ``run``; QSA has no main-cache writer.
 
-``select`` and ``run_selected`` split that same transaction so index projection
-and selection can overlap main Q/K/V projection and cache writes. Selection
-does not read main Q/K/V. The caller orders both producers before attention and
-retains the matching scratch, error mask and selection until consumption.
+An optional ``selection_stream`` on the binding lets ``run`` overlap selection
+with main Q/K/V production. The caller records ``index_ready`` after producing
+all selector inputs and metadata, before enqueuing independent main Q/K/V
+work. QSA joins selection before attention on the calling stream. Streams and
+synchronization resources are established before graph capture.
+
+For overlapped execution, create resources and prewarm before capture::
+
+    selection_stream = torch.cuda.Stream(device=caps.device)
+    index_ready = torch.cuda.Event()
+    binding = qsa.bind(plan, **buffers, selection_stream=selection_stream)
+    qsa.prewarm(binding)
+
+The caller's launch sequence, also used inside CUDA graph capture, is::
+
+    produce_selector_inputs_and_metadata()
+    index_ready.record()  # Includes prior writes to bound selector state.
+    produce_main_query_and_write_kv()
+    output = qsa.run(binding, **inputs, index_ready=index_ready)
+
+The producer names denote caller operations; QSA does not own projection or
+main-cache writes. ``inputs`` contains the same query, index projections and
+request metadata as serial ``run``. Compiled producers that mutate caller
+buffers must expose their writes at the event boundary; deferring writes to a
+compiler epilogue cannot establish producer readiness.
 
 Raw selector state is indexed by persistent state slots, not batch indices.
 ``request_ids[row]`` selects a batch entry and ``raw_state_slot_ids[batch]``
@@ -84,8 +106,6 @@ META = OpMeta(
         "bind",
         "prewarm",
         "run",
-        "select",
-        "run_selected",
         "is_supported",
     ),
     dtypes=("bf16",),
@@ -125,8 +145,6 @@ if TYPE_CHECKING:
         plan,
         prewarm,
         run,
-        run_selected,
-        select,
     )
 
 install_lazy_api(globals(), META)
