@@ -52,6 +52,9 @@ Selected positions are request-relative original-token positions.  Every row
 has fixed width ``budget + compress_ratio - 1``; valid positions are packed
 first and unused entries are ``-1``.  Completed groups are expanded in their
 selected order, followed by the causally visible incomplete-group tail.
+The selected-position reader supports widths of at least 2051. Width is a
+planned specialization; changing live rows preserves the warmed callable
+within each split or direct reader regime.
 """
 
 from __future__ import annotations

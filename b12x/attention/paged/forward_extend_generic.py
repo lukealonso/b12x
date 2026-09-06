@@ -63,6 +63,7 @@ from b12x._lib.intrinsics import (
     st_shared_v4_u32,
 )
 
+from ._selected_forward_config import SELECTION_WIDTH
 from .traits import PagedForwardTraits
 
 
@@ -3226,7 +3227,7 @@ class PagedForwardKernel:
         page_size: int,
         key_strides: tuple[int, int, int],
         value_strides: tuple[int, int, int],
-        selection_width: int = 2051,
+        selection_width: int = SELECTION_WIDTH,
     ):
         """Build the selected-position ABI of the paged forward engine.
 

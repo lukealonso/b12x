@@ -2320,7 +2320,10 @@ def test_qsa_raw_state_slot_addressing_crosses_signed_int32_products() -> None:
         torch.cuda.empty_cache()
 
 
-def test_qsa_checkpoint_geometry_executes_integrated_interleaved_mrope_decode() -> None:
+@pytest.mark.parametrize("budget", [2048, 8192])
+def test_qsa_checkpoint_geometry_executes_integrated_interleaved_mrope_decode(
+    budget: int,
+) -> None:
     device = require_sm120()
     caps = _caps(
         device,
@@ -2341,6 +2344,7 @@ def test_qsa_checkpoint_geometry_executes_integrated_interleaved_mrope_decode() 
         position_axes=3,
         mrope_sections=(11, 11, 10),
         mrope_interleaved=True,
+        budget=budget,
     )
     binding = _allocate_binding(caps)
     binding.main_block_table[0, 0] = 0
