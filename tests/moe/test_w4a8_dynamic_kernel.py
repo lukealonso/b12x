@@ -37,6 +37,17 @@ _TILE_M = 128
 _TILE_N = 128
 
 
+@pytest.mark.parametrize("recipe", ["w4a8_mx", "w4a8_nvfp4", "w4a8_trellis"])
+def test_w4a8_compute_only_phase_is_rejected(recipe: str) -> None:
+    with pytest.raises(ValueError, match="supports quant_recipe='nvfp4' only"):
+        MoEDynamicKernelBackend(
+            16,
+            (_TILE_M, _TILE_N),
+            quant_recipe=recipe,
+            split_phase="compute",
+        )
+
+
 def _pack_fp4_rows(values: torch.Tensor) -> torch.Tensor:
     nib = _fp4_encode_nibbles(values)
     pair = nib.view(*values.shape[:-1], values.shape[-1] // 2, 2)
