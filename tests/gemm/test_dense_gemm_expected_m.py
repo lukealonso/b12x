@@ -19,7 +19,7 @@ from b12x._lib.dense_gemm import (
     _DenseGemmPolicy,
     _dense_gemm_policy_for,
     _dense_gemm_target_occupancy,
-    _dense_spark_policy_for_sm_count,
+    _use_low_sm_dense_tactics,
     _tile_major_cluster_limit,
     _select_default_dense_gemm_plan,
     _select_default_mma_tiler_mn,
@@ -30,8 +30,8 @@ from b12x._lib.dense_gemm import (
     dense_gemm,
 )
 
-SM = 188  # RTX PRO 6000 Blackwell
-SPARK_SM = 20  # DGX Spark GB10
+HIGH_SM = 188
+LOW_SM = 48
 WIDE_N = 4096  # n > 1536 -> the MXFP8 wide-N regime that the hint tunes
 
 
@@ -96,7 +96,7 @@ def test_fp4_medium_m_deep_k_plan_uses_swapped_narrow_tile(plan_m: int) -> None:
         (96, 4096, 5376, 48),
         (64, 3968, 5376, 48),
         (64, 4096, 4992, 48),
-        (64, 4096, 5376, SM),
+        (64, 4096, 5376, HIGH_SM),
     ),
 )
 def test_fp4_swapped_medium_m_plan_preserves_unqualified_boundaries(
@@ -118,6 +118,58 @@ def test_fp4_swapped_medium_m_plan_preserves_unqualified_boundaries(
     assert not plan.swap_ab
 
 
+@pytest.mark.parametrize(
+    "plan_m,n,k",
+    (
+        (1, 512, 5376),
+        (6, 2048, 5376),
+        (64, 5120, 17408),
+        (128, 5120, 8704),
+    ),
+)
+def test_high_sm_fp4_small_batch_uses_square_bk256_plan(
+    plan_m: int,
+    n: int,
+    k: int,
+) -> None:
+    plan = _select_default_dense_gemm_plan(
+        plan_m,
+        n,
+        k,
+        HIGH_SM,
+        is_mxfp8=False,
+        expected_m=plan_m,
+    )
+
+    assert plan.mma_tiler_mn == (64, 64)
+    assert not plan.swap_ab
+    assert _select_fp4_tile_k(
+        plan_m, n, k, plan_m, HIGH_SM, plan.mma_tiler_mn
+    ) == 256
+
+
+def test_high_sm_fp4_wide_output_uses_grid_cutoff_for_bk256() -> None:
+    assert _select_fp4_tile_k(
+        128, 8704, 5120, 128, HIGH_SM, (64, 128)
+    ) == 256
+    assert _select_fp4_tile_k(
+        128, 7936, 5120, 128, HIGH_SM, (64, 128)
+    ) == 128
+
+
+def test_high_sm_fp4_underfilled_prefill_uses_64x128() -> None:
+    plan = _select_default_dense_gemm_plan(
+        2048,
+        512,
+        5376,
+        HIGH_SM,
+        is_mxfp8=False,
+        expected_m=2048,
+    )
+
+    assert plan.mma_tiler_mn == (64, 128)
+
+
 def test_mxfp8_split_k_slices_follow_the_served_policy() -> None:
     """The slice count groups the K reduction into partial sums that the
     atomic BF16 epilogue combines, so it is part of the served decode
@@ -137,19 +189,19 @@ def test_mxfp8_split_k_slices_follow_the_served_policy() -> None:
     for generalize in (False, True):
         assert (
             _dense_gemm_policy_for(
-                sm_count=48, generalize_mxfp8_split_k=generalize, **kwargs
+                sm_count=LOW_SM, generalize_mxfp8_split_k=generalize, **kwargs
             ).split_k_slices
             == 4
         )
         assert (
             _dense_gemm_policy_for(
-                sm_count=SM, generalize_mxfp8_split_k=generalize, **kwargs
+                sm_count=HIGH_SM, generalize_mxfp8_split_k=generalize, **kwargs
             ).split_k_slices
             == 4
         )
         assert (
             _dense_gemm_policy_for(
-                sm_count=SM,
+                sm_count=HIGH_SM,
                 generalize_mxfp8_split_k=generalize,
                 **(kwargs | {"n": 6144}),
             ).split_k_slices
@@ -157,12 +209,32 @@ def test_mxfp8_split_k_slices_follow_the_served_policy() -> None:
         )
         assert (
             _dense_gemm_policy_for(
-                sm_count=SM,
+                sm_count=HIGH_SM,
                 generalize_mxfp8_split_k=generalize,
                 **(kwargs | {"m": 4}),
             ).split_k_slices
             == 2
         )
+
+
+def test_high_sm_mxfp8_decode_keeps_two_slices_for_bounded_grid() -> None:
+    """The served slice policy (two slices for wide-N deep-K tiny M) is kept
+    on 188 SMs; the grid-capacity four-slice rule is not applied."""
+    policy = _dense_gemm_policy_for(
+        m=6,
+        n=4352,
+        k=5120,
+        l=1,
+        ab_dtype=cutlass.Float8E4M3FN,
+        c_dtype=cutlass.BFloat16,
+        mma_tiler_mn=(16, 128),
+        cluster_shape_mn=(1, 1),
+        sm_count=HIGH_SM,
+        expected_m=6,
+        generalize_mxfp8_split_k=True,
+    )
+
+    assert policy.split_k_slices == 2
 
 
 @pytest.mark.parametrize("m", (1, 6))
@@ -381,6 +453,45 @@ def test_low_sm_mxfp8_medium_prefill_preserves_boundaries(
     assert not (plan.mma_tiler_mn == (128, 128) and tile_k == 64)
 
 
+@pytest.mark.parametrize("expected_m", (2048, 4096))
+@pytest.mark.parametrize(
+    "n,k,expected_tile,expected_tile_k",
+    (
+        (32768, 1024, (128, 128), 64),
+        (8192, 1024, (128, 128), 64),
+        (17408, 5120, (128, 128), 64),
+        (8704, 5120, (128, 128), 64),
+        (4096, 5376, (128, 128), 64),
+        (6144, 1536, (128, 128), 64),
+        (5120, 17408, (128, 64), 128),
+        (4352, 5120, (128, 64), 128),
+        (2176, 5120, (128, 64), 128),
+        (1536, 4096, (128, 64), 128),
+        (1024, 4096, (128, 64), 128),
+    ),
+)
+def test_high_sm_mxfp8_prefill_plan_covers_tp_and_common_shapes(
+    expected_m: int,
+    n: int,
+    k: int,
+    expected_tile: tuple[int, int],
+    expected_tile_k: int,
+) -> None:
+    plan = _select_default_dense_gemm_plan(
+        1,
+        n,
+        k,
+        HIGH_SM,
+        is_mxfp8=True,
+        expected_m=expected_m,
+    )
+
+    assert plan.mma_tiler_mn == expected_tile
+    assert _select_mxfp8_tile_k(
+        1, n, k, expected_m, HIGH_SM
+    ) == expected_tile_k
+
+
 def test_non_mxfp8_split_k_policy_is_unchanged() -> None:
     policy = _dense_gemm_policy_for(
         m=8,
@@ -428,7 +539,6 @@ def test_low_sm_block_fp8_decode_uses_divisibility_based_slices(
         (8, 2048, 5120, 48),
         (6, 1984, 5120, 48),
         (6, 2048, 5376, 48),
-        (6, 2048, 5120, SM),
     ),
 )
 def test_low_sm_block_fp8_decode_preserves_unqualified_boundaries(
@@ -438,6 +548,117 @@ def test_low_sm_block_fp8_decode_preserves_unqualified_boundaries(
     sm_count: int,
 ) -> None:
     assert _select_block_fp8_decode_slices(m, n, k, sm_count) == 1
+
+
+@pytest.mark.parametrize(
+    "m,k,expected_slices,served_slices",
+    (
+        (1, 5120, 1, 2),
+        (2, 5120, 2, 2),
+        (6, 4096, 2, 2),
+        (6, 5376, 2, 2),
+        (6, 2176, 1, 1),
+        (8, 5120, 1, 2),
+    ),
+)
+def test_high_sm_block_fp8_decode_uses_bounded_two_way_split(
+    m: int,
+    k: int,
+    expected_slices: int,
+    served_slices: int,
+) -> None:
+    """``_select_block_fp8_decode_slices`` drives the (32, 64) tile choice;
+    the launched slice count is the served policy (two slices for every
+    wide-N deep-K tiny-M launch), not the grid-bounded selection."""
+    assert (
+        _select_block_fp8_decode_slices(m, 4096, k, HIGH_SM)
+        == expected_slices
+    )
+    plan = _select_default_dense_gemm_plan(
+        m,
+        4096,
+        k,
+        HIGH_SM,
+        is_mxfp8=True,
+        block_fp8=True,
+        expected_m=m,
+    )
+    policy = _dense_gemm_policy_for(
+        m=m,
+        n=4096,
+        k=k,
+        l=1,
+        ab_dtype=cutlass.Float8E4M3FN,
+        c_dtype=cutlass.BFloat16,
+        mma_tiler_mn=plan.mma_tiler_mn,
+        cluster_shape_mn=(1, 1),
+        sm_count=HIGH_SM,
+        expected_m=m,
+        generalize_block_fp8_split_k=True,
+    )
+
+    assert policy.split_k_slices == served_slices
+    if expected_slices > 1:
+        assert plan.mma_tiler_mn == (32, 64)
+
+
+@pytest.mark.parametrize(
+    "n,k",
+    (
+        (17408, 5120),
+        (5120, 17408),
+        (4096, 4096),
+        (16384, 1024),
+        (6144, 1536),
+    ),
+)
+@pytest.mark.parametrize("expected_m", (2048, 4096))
+def test_high_sm_block_fp8_prefill_uses_64x128(
+    n: int,
+    k: int,
+    expected_m: int,
+) -> None:
+    plan = _select_default_dense_gemm_plan(
+        expected_m,
+        n,
+        k,
+        HIGH_SM,
+        is_mxfp8=True,
+        block_fp8=True,
+        expected_m=expected_m,
+    )
+
+    assert plan.mma_tiler_mn == (64, 128)
+
+
+def test_high_sm_block_fp8_m128_uses_output_grid_window() -> None:
+    assert _select_default_dense_gemm_plan(
+        128,
+        8704,
+        5120,
+        HIGH_SM,
+        is_mxfp8=True,
+        block_fp8=True,
+        expected_m=128,
+    ).mma_tiler_mn == (64, 128)
+    assert _select_default_dense_gemm_plan(
+        128,
+        17408,
+        5120,
+        HIGH_SM,
+        is_mxfp8=True,
+        block_fp8=True,
+        expected_m=128,
+    ).mma_tiler_mn == (32, 128)
+    assert _select_default_dense_gemm_plan(
+        128,
+        4352,
+        5120,
+        HIGH_SM,
+        is_mxfp8=True,
+        block_fp8=True,
+        expected_m=128,
+    ).mma_tiler_mn == (32, 128)
 
 
 @pytest.mark.parametrize("k", (10240, 12288, 17408))
@@ -569,7 +790,7 @@ def test_fp4_tile_k_override_reaches_compiler(
         sf_dtype="float8_e4m3fn",
         c_dtype="bfloat16",
         sf_vec_size=16,
-        sm_count=SPARK_SM,
+        sm_count=LOW_SM,
         mma_tiler_mn=(64, 128),
         load_path="tma",
         swap_ab=False,
@@ -591,8 +812,62 @@ def test_fp4_tile_k_override_rejects_invalid_depth() -> None:
             sf_dtype="float8_e4m3fn",
             c_dtype="bfloat16",
             sf_vec_size=16,
-            sm_count=SPARK_SM,
+            sm_count=LOW_SM,
             _tile_k_override=384,
+        )
+
+
+def test_fp4_target_occupancy_override_reaches_compiler(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorded: dict[str, object] = {}
+
+    def compile_dense_gemm(**kwargs):
+        recorded.update(kwargs)
+
+        def launch(**_kwargs) -> None:
+            return None
+
+        return launch
+
+    monkeypatch.setattr(dense_module, "_get_compiled_dense_gemm", compile_dense_gemm)
+    lhs, rhs = _packed_fp4_operands(1, 128, 512)
+    out = torch.empty((1, 128, 1), dtype=torch.bfloat16)
+
+    result = dense_gemm(
+        lhs,
+        rhs,
+        out=out,
+        ab_dtype="float4_e2m1fn",
+        sf_dtype="float8_e4m3fn",
+        c_dtype="bfloat16",
+        sf_vec_size=16,
+        sm_count=LOW_SM,
+        _target_occupancy_override=3,
+    )
+
+    assert result is out
+    assert recorded["target_occupancy_override"] == 3
+
+
+@pytest.mark.parametrize("occupancy", (0, 5))
+def test_fp4_target_occupancy_override_rejects_invalid_value(
+    occupancy: int,
+) -> None:
+    lhs, rhs = _packed_fp4_operands(1, 128, 512)
+    out = torch.empty((1, 128, 1), dtype=torch.bfloat16)
+
+    with pytest.raises(ValueError, match="must be 1, 2, 3, or 4"):
+        dense_gemm(
+            lhs,
+            rhs,
+            out=out,
+            ab_dtype="float4_e2m1fn",
+            sf_dtype="float8_e4m3fn",
+            c_dtype="bfloat16",
+            sf_vec_size=16,
+            sm_count=LOW_SM,
+            _target_occupancy_override=occupancy,
         )
 
 
@@ -621,7 +896,7 @@ def test_mxfp8_tile_k_override_reaches_compiler(
         sf_dtype="float8_e8m0fnu",
         c_dtype="bfloat16",
         sf_vec_size=32,
-        sm_count=SPARK_SM,
+        sm_count=LOW_SM,
         mma_tiler_mn=(128, 128),
         load_path="tma",
         swap_ab=False,
@@ -643,7 +918,7 @@ def test_mxfp8_tile_k_override_rejects_invalid_depth() -> None:
             sf_dtype="float8_e8m0fnu",
             c_dtype="bfloat16",
             sf_vec_size=32,
-            sm_count=SPARK_SM,
+            sm_count=LOW_SM,
             mma_tiler_mn=(128, 128),
             _tile_k_override=256,
         )
@@ -676,7 +951,7 @@ def test_mxfp8_large_m_unroll_override_reaches_compiler(
         sf_dtype="float8_e8m0fnu",
         c_dtype="bfloat16",
         sf_vec_size=32,
-        sm_count=SPARK_SM,
+        sm_count=LOW_SM,
         mma_tiler_mn=(64, 128),
         _large_m_unroll_override=large_m_unroll,
     )
@@ -696,7 +971,7 @@ def test_large_m_unroll_override_rejects_non_bool() -> None:
             sf_dtype="float8_e8m0fnu",
             c_dtype="bfloat16",
             sf_vec_size=32,
-            sm_count=SPARK_SM,
+            sm_count=LOW_SM,
             _large_m_unroll_override=1,
         )
 
@@ -726,7 +1001,7 @@ def test_mxfp8_split_k_override_reaches_compiler(
         sf_dtype="float8_e8m0fnu",
         c_dtype="bfloat16",
         sf_vec_size=32,
-        sm_count=SPARK_SM,
+        sm_count=LOW_SM,
         mma_tiler_mn=(16, 128),
         load_path="tma",
         swap_ab=False,
@@ -771,7 +1046,7 @@ def test_block_fp8_split_k_override_reaches_compiler(
         c_dtype="bfloat16",
         sf_vec_size=128,
         block_fp8=True,
-        sm_count=SPARK_SM,
+        sm_count=LOW_SM,
         mma_tiler_mn=(16, 128),
         _split_k_slices_override=4,
     )
@@ -793,7 +1068,7 @@ def test_mxfp8_split_k_override_rejects_invalid_slice_count(slices: int) -> None
             sf_dtype="float8_e8m0fnu",
             c_dtype="bfloat16",
             sf_vec_size=32,
-            sm_count=SPARK_SM,
+            sm_count=LOW_SM,
             _split_k_slices_override=slices,
         )
 
@@ -809,7 +1084,7 @@ def test_mxfp8_split_k_override_rejects_uneven_k_tiles() -> None:
             sf_dtype="float8_e8m0fnu",
             c_dtype="bfloat16",
             sf_vec_size=32,
-            sm_count=SPARK_SM,
+            sm_count=LOW_SM,
             mma_tiler_mn=(16, 128),
             load_path="tma",
             swap_ab=False,
@@ -828,7 +1103,7 @@ def test_unswapped_tma_epilogue_rejects_unaligned_output_row_stride() -> None:
             sf_dtype="float8_e8m0fnu",
             c_dtype="bfloat16",
             sf_vec_size=32,
-            sm_count=SM,
+            sm_count=HIGH_SM,
             mma_tiler_mn=(64, 64),
             load_path="tma",
             swap_ab=False,
@@ -849,7 +1124,7 @@ def test_grouped_unaligned_output_requires_padding() -> None:
             sf_dtype="float8_e8m0fnu",
             c_dtype="bfloat16",
             sf_vec_size=32,
-            sm_count=SM,
+            sm_count=HIGH_SM,
             mma_tiler_mn=(64, 64),
             load_path="tma",
             swap_ab=False,
@@ -867,7 +1142,7 @@ def test_grouped_output_rejects_swapped_storage() -> None:
             sf_dtype="float8_e8m0fnu",
             c_dtype="bfloat16",
             sf_vec_size=32,
-            sm_count=SM,
+            sm_count=HIGH_SM,
             mma_tiler_mn=(64, 64),
             load_path="tma",
             swap_ab=True,
@@ -908,7 +1183,7 @@ def test_default_plan_adapts_to_output_storage(
         rows,
         columns,
         width,
-        SM,
+        HIGH_SM,
         is_mxfp8=True,
         expected_m=expected_m,
         select_swapped_output_storage=select_swapped_output_storage,
@@ -948,7 +1223,7 @@ def test_wide_unaligned_output_uses_supported_bk128_plan(
         sf_dtype="float8_e8m0fnu",
         c_dtype="bfloat16",
         sf_vec_size=32,
-        sm_count=SM,
+        sm_count=HIGH_SM,
         expected_m=2048,
         alpha=alpha,
         plain_fp8=True,
@@ -976,7 +1251,7 @@ def test_wide_unaligned_output_uses_supported_bk128_plan(
     )
 
 
-def _tile(m, *, expected_m=None, n=WIDE_N, k=None, sm_count=SM):
+def _tile(m, *, expected_m=None, n=WIDE_N, k=None, sm_count=HIGH_SM):
     return _select_default_mma_tiler_mn(
         m, n, sm_count, is_mxfp8=True, expected_m=expected_m, k=k
     )
@@ -1020,7 +1295,7 @@ def _bk64_launch(
         mma_tiler_mn=mma_tiler_mn,
         cluster_shape_mn=(1, 1),
         policy=policy,
-        sm_count=SM,
+        sm_count=HIGH_SM,
         sm_version="sm_120",
         load_path="tma",
         swap_ab=False,
@@ -1100,8 +1375,7 @@ def test_fused_quant_compile_key_is_distinct_and_exhaustive():
     assert fused.compile_key()[3:] == ordinary.compile_key()
 
 
-def test_expected_m_short_k_large_n_uses_production_bk64_plan():
-    # RTX keeps the BM128/BK64 q_b prefill plan measured by the SM120 audit.
+def test_high_sm_short_k_large_n_uses_bk64_plan():
     for em in (2048, 4096, 8192):
         for live_m in (1, 64, 4096):
             assert _tile(
@@ -1110,7 +1384,7 @@ def test_expected_m_short_k_large_n_uses_production_bk64_plan():
                 n=16384,
                 k=1024,
             ) == (128, 128)
-            assert _select_mxfp8_tile_k(live_m, 16384, 1024, em, SM) == 64
+            assert _select_mxfp8_tile_k(live_m, 16384, 1024, em, HIGH_SM) == 64
         policy = _dense_gemm_policy_for(
             m=64,
             n=16384,
@@ -1120,15 +1394,13 @@ def test_expected_m_short_k_large_n_uses_production_bk64_plan():
             c_dtype=cutlass.BFloat16,
             mma_tiler_mn=(128, 128),
             cluster_shape_mn=(1, 1),
-            sm_count=SM,
+            sm_count=HIGH_SM,
             expected_m=em,
         )
         assert policy.large_m_unroll == (em >= 8192)
 
 
-def test_expected_m_short_k_large_n_keeps_spark_prefill_plan():
-    # The candidate's BM64/BK128 and M>=4096 unroll choices remain selected on
-    # DGX Spark instead of being reverted globally to the RTX winners.
+def test_low_sm_short_k_large_n_keeps_bk128_plan():
     for em in (2048, 4096, 8192):
         for live_m in (1, 64, 4096):
             assert _tile(
@@ -1136,9 +1408,9 @@ def test_expected_m_short_k_large_n_keeps_spark_prefill_plan():
                 expected_m=em,
                 n=16384,
                 k=1024,
-                sm_count=SPARK_SM,
+                sm_count=LOW_SM,
             ) == (64, 128)
-            assert _select_mxfp8_tile_k(live_m, 16384, 1024, em, SPARK_SM) == 128
+            assert _select_mxfp8_tile_k(live_m, 16384, 1024, em, LOW_SM) == 128
         policy = _dense_gemm_policy_for(
             m=64,
             n=16384,
@@ -1148,13 +1420,13 @@ def test_expected_m_short_k_large_n_keeps_spark_prefill_plan():
             c_dtype=cutlass.BFloat16,
             mma_tiler_mn=(64, 128),
             cluster_shape_mn=(1, 1),
-            sm_count=SPARK_SM,
+            sm_count=LOW_SM,
             expected_m=em,
         )
         assert policy.large_m_unroll == (em >= 4096)
 
 
-def test_short_k_two_cta_occupancy_is_spark_only_for_q_b_decode():
+def test_short_k_two_cta_occupancy_is_low_sm_only():
     kwargs = dict(
         n=16384,
         k=1024,
@@ -1168,10 +1440,10 @@ def test_short_k_two_cta_occupancy_is_spark_only_for_q_b_decode():
         swap_ab=False,
         b_tile_major=False,
     )
-    assert _dense_gemm_target_occupancy(sm_count=SPARK_SM, **kwargs) == 2
-    assert _dense_gemm_target_occupancy(sm_count=SM, **kwargs) == 1
-    assert _dense_spark_policy_for_sm_count(SPARK_SM)
-    assert not _dense_spark_policy_for_sm_count(SM)
+    assert _dense_gemm_target_occupancy(sm_count=LOW_SM, **kwargs) == 2
+    assert _dense_gemm_target_occupancy(sm_count=HIGH_SM, **kwargs) == 1
+    assert _use_low_sm_dense_tactics(LOW_SM)
+    assert not _use_low_sm_dense_tactics(HIGH_SM)
 
 
 def test_wo_b_prefill_switches_to_bm128_bk64_at_2k():
@@ -1179,13 +1451,13 @@ def test_wo_b_prefill_switches_to_bm128_bk64_at_2k():
     # the 1K schedule that already wins end to end.
     n, k = 4096, 4096
     assert _tile(1024, expected_m=1024, n=n, k=k) == (64, 128)
-    assert _select_mxfp8_tile_k(1024, n, k, 1024, SM) == 128
+    assert _select_mxfp8_tile_k(1024, n, k, 1024, HIGH_SM) == 128
     for em in (2048, 4096, 8192):
         tiles = {
             _tile(live_m, expected_m=em, n=n, k=k) for live_m in (1, 64, 2048, 8192)
         }
         assert tiles == {(128, 128)}, (n, k, em, tiles)
-        assert _select_mxfp8_tile_k(1, n, k, em, SM) == 64
+        assert _select_mxfp8_tile_k(1, n, k, em, HIGH_SM) == 64
 
 
 def test_grouped_wo_a_prefill_keeps_bm64_bk128():
@@ -1194,18 +1466,18 @@ def test_grouped_wo_a_prefill_keeps_bm64_bk128():
     n, k = 1024, 512
     for em in (2048, 4096, 8192):
         assert _tile(1, expected_m=em, n=n, k=k) == (64, 128)
-        assert _select_mxfp8_tile_k(1, n, k, em, SM) == 128
+        assert _select_mxfp8_tile_k(1, n, k, em, HIGH_SM) == 128
 
 
 def test_wo_bk64_override_is_exact_shape_only():
     for n, k in ((1024, 640), (1152, 512), (4096, 3968), (4224, 4096)):
-        assert _select_mxfp8_tile_k(2048, n, k, 2048, SM) == 128
+        assert _select_mxfp8_tile_k(2048, n, k, 2048, HIGH_SM) == 128
 
 
 def test_short_k_1024_and_2048_hints_have_stable_distinct_keys():
     def specialization(live_m: int, expected_m: int | None):
         tile = _tile(live_m, expected_m=expected_m, n=16384, k=1024)
-        tile_k = _select_mxfp8_tile_k(live_m, 16384, 1024, expected_m, SM)
+        tile_k = _select_mxfp8_tile_k(live_m, 16384, 1024, expected_m, HIGH_SM)
         policy = _dense_gemm_policy_for(
             m=live_m,
             n=16384,
@@ -1215,7 +1487,7 @@ def test_short_k_1024_and_2048_hints_have_stable_distinct_keys():
             c_dtype=cutlass.BFloat16,
             mma_tiler_mn=tile,
             cluster_shape_mn=(1, 1),
-            sm_count=SM,
+            sm_count=HIGH_SM,
             expected_m=expected_m,
         )
         return tile, tile_k, policy
@@ -1237,7 +1509,7 @@ def test_short_k_no_hint_does_not_cross_bk64_cache_boundary():
     specializations = set()
     for live_m in (16, 1024, 2048, 4096, 8192):
         tile = _tile(live_m, expected_m=None, n=16384, k=1024)
-        tile_k = _select_mxfp8_tile_k(live_m, 16384, 1024, None, SM)
+        tile_k = _select_mxfp8_tile_k(live_m, 16384, 1024, None, HIGH_SM)
         policy = _dense_gemm_policy_for(
             m=live_m,
             n=16384,
@@ -1247,7 +1519,7 @@ def test_short_k_no_hint_does_not_cross_bk64_cache_boundary():
             c_dtype=cutlass.BFloat16,
             mma_tiler_mn=tile,
             cluster_shape_mn=(1, 1),
-            sm_count=SM,
+            sm_count=HIGH_SM,
             expected_m=None,
         )
         specializations.add((tile, tile_k, policy))
@@ -1284,7 +1556,7 @@ def test_no_hint_persistent_policy_keeps_unroll_m_independent():
             c_dtype=cutlass.BFloat16,
             mma_tiler_mn=(64, 64),
             cluster_shape_mn=(1, 1),
-            sm_count=SM,
+            sm_count=HIGH_SM,
             expected_m=None,
         )
         for live_m in (16, 512, 1824, 4096, 8192)
@@ -1308,15 +1580,139 @@ def test_expected_m_prefill_hint_for_narrow_n():
     # Narrow-N has its own occupancy heuristic. Exact M=1 uses the common-shape
     # decode winner, while declared prefill still moves to the prefill tile.
     narrow = 1024
-    base = _select_default_mma_tiler_mn(64, narrow, SM, is_mxfp8=True)
-    decode = _select_default_mma_tiler_mn(64, narrow, SM, is_mxfp8=True, expected_m=1)
-    small = _select_default_mma_tiler_mn(64, narrow, SM, is_mxfp8=True, expected_m=64)
+    base = _select_default_mma_tiler_mn(64, narrow, HIGH_SM, is_mxfp8=True)
+    decode = _select_default_mma_tiler_mn(64, narrow, HIGH_SM, is_mxfp8=True, expected_m=1)
+    small = _select_default_mma_tiler_mn(64, narrow, HIGH_SM, is_mxfp8=True, expected_m=64)
     prefill = _select_default_mma_tiler_mn(
-        64, narrow, SM, is_mxfp8=True, expected_m=512
+        64, narrow, HIGH_SM, is_mxfp8=True, expected_m=512
     )
-    no_hint_decode = _select_default_mma_tiler_mn(1, narrow, SM, is_mxfp8=True)
+    no_hint_decode = _select_default_mma_tiler_mn(1, narrow, HIGH_SM, is_mxfp8=True)
     assert base == (64, 64)
     assert decode == (16, 64)
     assert small == base
     assert prefill == (64, 128)
     assert no_hint_decode == (16, 64)
+
+
+# Served Kimi-K3 per-rank MXFP8 dense linears (TP9, 188 SMs): (K, N).
+_KIMI_K3_MXFP8_SHAPES = {
+    "kda_in_proj_qkv": (7168, 4608),
+    "kda_o_proj": (1536, 7168),
+    "mla_fused_qkv_a": (7168, 2112),
+    "mla_q_b": (1536, 2112),
+    "mla_o_proj": (1408, 7168),
+    "shared_gate_up": (7168, 1536),
+    "shared_down": (768, 7168),
+    "dense0_gate_up": (7168, 7680),
+    "dense0_down": (3840, 7168),
+}
+
+
+def _kimi_k3_plan(name: str, m: int) -> tuple[tuple[int, int], int, int, bool]:
+    k, n = _KIMI_K3_MXFP8_SHAPES[name]
+    plan = _select_default_dense_gemm_plan(
+        m, n, k, HIGH_SM, is_mxfp8=True, expected_m=m
+    )
+    tile_k = _select_mxfp8_tile_k(m, n, k, m, HIGH_SM)
+    policy = _dense_gemm_policy_for(
+        m=m,
+        n=n,
+        k=k,
+        l=1,
+        ab_dtype=cutlass.Float8E4M3FN,
+        c_dtype=cutlass.BFloat16,
+        mma_tiler_mn=plan.mma_tiler_mn,
+        cluster_shape_mn=(1, 1),
+        sm_count=HIGH_SM,
+        tile_k=tile_k,
+        expected_m=m,
+        generalize_mxfp8_split_k=True,
+    )
+    assert not plan.swap_ab and plan.load_path == "tma"
+    return plan.mma_tiler_mn, tile_k, policy.split_k_slices, policy.large_m_unroll
+
+
+@pytest.mark.parametrize(
+    "name,tile,tile_k",
+    (
+        # Short-K (<= 1536) wide outputs: 128x128 with BK64 scale staging.
+        ("kda_o_proj", (128, 128), 64),
+        ("mla_o_proj", (128, 128), 64),
+        ("shared_down", (128, 128), 64),
+        # Deep-K (>= 2048) outputs up to 8192 columns: 128x64.
+        ("kda_in_proj_qkv", (128, 64), 128),
+        ("mla_fused_qkv_a", (128, 64), 128),
+        ("shared_gate_up", (128, 64), 128),
+        ("dense0_gate_up", (128, 64), 128),
+        ("dense0_down", (128, 64), 128),
+        # K=1536 into 2112 columns matches neither rule: the 64x128 default.
+        ("mla_q_b", (64, 128), 128),
+    ),
+)
+def test_kimi_k3_prefill_chunk_plans_on_188_sms(
+    name: str, tile: tuple[int, int], tile_k: int
+) -> None:
+    """The 4,608-token prefill chunk (expected_m = live tokens) takes the
+    high-SM tile rules; the K accumulation stays a single sequential pass
+    (no split-K), so the output is bit-identical to the 64x128/BK128 plan."""
+    assert _kimi_k3_plan(name, 4608) == (tile, tile_k, 1, False)
+
+
+# The served plan for every Kimi-K3 shape below the 2,048-row rules, keyed by
+# (shape, M): tile, BK, split-K slices, atomic BF16 split-K epilogue.
+_KIMI_K3_SERVED_SMALL_M_PLANS = {
+    # Wide-N deep-K decode: 16x128 (16x64 at M=1), two atomic-BF16 slices.
+    **{
+        (name, m): ((16, 64) if m == 1 else (16, 128), 128, 2, True)
+        for name in ("kda_in_proj_qkv", "dense0_gate_up")
+        for m in (1, 2, 4, 8)
+    },
+    # Wide-N short-K or deep-K below the split-K floor: no split.
+    **{
+        (name, m): ((16, 64) if m == 1 else (16, 128), 128, 1, True)
+        for name in ("kda_o_proj", "mla_q_b", "mla_o_proj", "shared_down", "dense0_down")
+        for m in (1, 2, 4, 8)
+    },
+    # Narrow-N deep-K decode: the exact FP32 narrow split (never atomic).
+    ("mla_fused_qkv_a", 1): ((16, 64), 128, 4, False),
+    **{("mla_fused_qkv_a", m): ((16, 128), 128, 8, False) for m in (2, 4, 8)},
+    ("shared_gate_up", 1): ((16, 64), 128, 4, False),
+    **{("shared_gate_up", m): ((64, 64), 128, 4, False) for m in (2, 4, 8)},
+    # First persistent-regime M and a prefill tail chunk.
+    **{(name, 16): ((32, 128), 128, 1, True) for name in _KIMI_K3_MXFP8_SHAPES if name != "shared_gate_up"},
+    ("shared_gate_up", 16): ((64, 64), 128, 1, True),
+    **{(name, 830): ((64, 128), 128, 1, True) for name in _KIMI_K3_MXFP8_SHAPES},
+}
+
+
+@pytest.mark.parametrize("name", sorted(_KIMI_K3_MXFP8_SHAPES))
+@pytest.mark.parametrize("m", (1, 2, 4, 8, 16, 830))
+def test_kimi_k3_decode_and_tail_plans_keep_the_served_plan(name: str, m: int) -> None:
+    """Decode launches (M <= 16) and prefill tail chunks below the 2,048-row
+    rules keep the served tile, BK128, slice count and epilogue kind."""
+    k, n = _KIMI_K3_MXFP8_SHAPES[name]
+    plan = _select_default_dense_gemm_plan(
+        m, n, k, HIGH_SM, is_mxfp8=True, expected_m=m
+    )
+    tile_k = _select_mxfp8_tile_k(m, n, k, m, HIGH_SM)
+    policy = _dense_gemm_policy_for(
+        m=m,
+        n=n,
+        k=k,
+        l=1,
+        ab_dtype=cutlass.Float8E4M3FN,
+        c_dtype=cutlass.BFloat16,
+        mma_tiler_mn=plan.mma_tiler_mn,
+        cluster_shape_mn=(1, 1),
+        sm_count=HIGH_SM,
+        tile_k=tile_k,
+        expected_m=m,
+        generalize_mxfp8_split_k=True,
+    )
+    assert (
+        plan.mma_tiler_mn,
+        tile_k,
+        policy.split_k_slices,
+        policy.split_k_atomic_bf16,
+    ) == _KIMI_K3_SERVED_SMALL_M_PLANS[(name, m)]
+    assert not policy.large_m_unroll
