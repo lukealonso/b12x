@@ -58,6 +58,7 @@ class DenseMlaForwardKernel:
         num_heads: int,
         num_splits: int,
         chunks_per_split: int,
+        single_split_chunks: int,
         query_tile: int,
         fp8: bool,
         qk_dim: int,
@@ -70,11 +71,22 @@ class DenseMlaForwardKernel:
         self.head_tiles = (self.num_heads + HEADS_PER_TILE - 1) // HEADS_PER_TILE
         self.num_splits = int(num_splits)
         self.chunks_per_split = int(chunks_per_split)
+        self.single_split_chunks = int(single_split_chunks)
         self.query_tile = int(query_tile)
         self.fp8 = bool(fp8)
         self.qk_dim = int(qk_dim)
         self.value_dim = int(value_dim)
         self.window_size = None if window_size is None else int(window_size)
+        # The windowed producer derives the gathered chunk range from the
+        # tile's first query row (see the range computation in the kernel);
+        # the later rows of a wider tile would see up to query_tile - 1 more
+        # tokens than that range covers. The planner keeps windowed plans at
+        # one row per tile; the kernel refuses anything else.
+        if self.window_size is not None and self.query_tile != 1:
+            raise ValueError(
+                "windowed dense MLA scans one query row per tile, got "
+                f"query_tile={self.query_tile}"
+            )
         self.kv_stages = int(layout.kv_stages)
         self.math_warps = MATH_WARPS_PER_QUERY * self.query_tile
         self.math_threads = self.math_warps * 32
@@ -449,6 +461,8 @@ class DenseMlaForwardKernel:
         first_valid_chunk = Int32(0)
         visible_chunks_end = cache_length
         if cutlass.const_expr(self.window_size is not None):
+            # query_tile == 1 here (enforced at construction), so the tile's
+            # first row is its only row and this range is exact for it.
             tile_local_query = query_start - query_begin
             visible_chunks_end = (
                 cache_length - query_length + tile_local_query + Int32(1)
@@ -464,8 +478,30 @@ class DenseMlaForwardKernel:
         valid_chunks = (visible_chunks_end + Int32(CANDIDATES_PER_CHUNK - 1)) // Int32(
             CANDIDATES_PER_CHUNK
         )
-        split_first_chunk = first_valid_chunk + split * Int32(self.chunks_per_split)
-        split_last_chunk = split_first_chunk + Int32(self.chunks_per_split)
+        # Split ranges. A request whose scanned chunks (past any window
+        # start) fit within single_split_chunks is scanned by split 0 alone:
+        # one online-softmax chain in chunk order, written once, which is the
+        # fixed-range association of a kernel that scans chunks_per_split
+        # chunks per split, so those results match it bit for bit. Longer
+        # requests share their chunks evenly over the launched splits, so
+        # every launched CTA scans about scan_chunks / active_splits chunks
+        # whatever the live length; a fixed range per split would leave all
+        # but the first few splits idle on sequences much shorter than the
+        # planned capacity. Splits past the valid chunks stay empty and
+        # publish -inf partials.
+        scan_chunks = valid_chunks - first_valid_chunk
+        if scan_chunks < Int32(0):
+            scan_chunks = Int32(0)
+        balanced_chunks_per_split = (scan_chunks + active_splits - Int32(1)) // (
+            active_splits
+        )
+        if balanced_chunks_per_split < Int32(1):
+            balanced_chunks_per_split = Int32(1)
+        if cutlass.const_expr(self.single_split_chunks > 0):
+            if scan_chunks <= Int32(self.single_split_chunks):
+                balanced_chunks_per_split = Int32(self.single_split_chunks)
+        split_first_chunk = first_valid_chunk + split * balanced_chunks_per_split
+        split_last_chunk = split_first_chunk + balanced_chunks_per_split
         if split_last_chunk > valid_chunks:
             split_last_chunk = valid_chunks
         active_chunks = split_last_chunk - split_first_chunk

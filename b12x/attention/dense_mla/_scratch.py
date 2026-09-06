@@ -76,6 +76,19 @@ class Caps:
     window_size: int | None = None
     use_cuda_graph: bool = False
     budget: Budget | None = None
+    # Element type of the per-split partial outputs a multi-split launch
+    # writes for the merge. bf16 halves the scratch; float32 keeps the split
+    # partials exact, so a merged result is rounded once, like a one-split
+    # result. The split assignment still determines the online-softmax
+    # chains and the FP32 merge order, so multi-split results differ from a
+    # one-split result at the FP32 level.
+    partial_dtype: torch.dtype = torch.bfloat16
+    # A request whose scanned chunks number at most this many is scanned by
+    # split 0 alone (the fixed-range association a plan-run kernel used, so the
+    # bits match it there); longer requests spread their chunks evenly over
+    # the launched splits. None resolves to the plan's chunks_per_split; 0
+    # balances every request.
+    single_split_chunks: int | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "device", _canonical_device(self.device))
@@ -130,6 +143,13 @@ class Caps:
             raise ValueError("num_cache_pages must be positive")
         if self.budget is not None and not isinstance(self.budget, Budget):
             raise TypeError("budget must be dense_mla.Budget or None")
+        if self.partial_dtype not in (torch.bfloat16, torch.float32):
+            raise TypeError("partial_dtype must be torch.bfloat16 or torch.float32")
+        if self.single_split_chunks is not None:
+            single_split_chunks = int(self.single_split_chunks)
+            if single_split_chunks < 0:
+                raise ValueError("single_split_chunks must be >= 0 or None")
+            object.__setattr__(self, "single_split_chunks", single_split_chunks)
         for name in (
             "num_q_heads",
             "page_size",
@@ -153,6 +173,7 @@ class _ScratchLayout:
     nbytes: int
     num_splits: int
     chunks_per_split: int
+    single_split_chunks: int
     partial_output_offset_bytes: int | None
     partial_lse_offset_bytes: int | None
     final_lse_offset_bytes: int
@@ -191,6 +212,11 @@ def _dense_mla_scratch_layout(
     )
     num_chunks = (max_attended_tokens + 63) // 64
     chunks_per_split = (num_chunks + num_splits - 1) // num_splits
+    single_split_chunks = (
+        chunks_per_split
+        if caps.single_split_chunks is None
+        else int(caps.single_split_chunks)
+    )
     partial_rows = caps.max_total_q * num_splits
     if (
         caps.budget is not None
@@ -214,7 +240,7 @@ def _dense_mla_scratch_layout(
             * caps.num_q_heads
             * num_splits
             * caps.v_head_dim
-            * dtype_nbytes(torch.bfloat16)
+            * dtype_nbytes(caps.partial_dtype)
         )
         cursor = align_up(cursor, SCRATCH_ALIGN_BYTES)
         partial_lse_offset_bytes = cursor
@@ -240,6 +266,7 @@ def _dense_mla_scratch_layout(
         nbytes=max(cursor, SCRATCH_ALIGN_BYTES),
         num_splits=num_splits,
         chunks_per_split=chunks_per_split,
+        single_split_chunks=single_split_chunks,
         partial_output_offset_bytes=partial_output_offset_bytes,
         partial_lse_offset_bytes=partial_lse_offset_bytes,
         final_lse_offset_bytes=final_lse_offset_bytes,
@@ -267,6 +294,8 @@ class Scratch:
     window_size: int | None
     num_splits: int
     chunks_per_split: int
+    single_split_chunks: int
+    partial_dtype: torch.dtype
     query_tile: int
     use_cuda_graph: bool
     partial_output: torch.Tensor | None
@@ -550,7 +579,7 @@ def _materialize(
                 layout.num_splits,
                 caps.v_head_dim,
             ),
-            dtype=torch.bfloat16,
+            dtype=caps.partial_dtype,
         )
         partial_lse, _ = materialize_scratch_view(
             scratch_storage,
@@ -592,6 +621,8 @@ def _materialize(
         window_size=caps.window_size,
         num_splits=layout.num_splits,
         chunks_per_split=layout.chunks_per_split,
+        single_split_chunks=layout.single_split_chunks,
+        partial_dtype=caps.partial_dtype,
         query_tile=query_tile,
         use_cuda_graph=caps.use_cuda_graph,
         partial_output=partial_output,
@@ -625,6 +656,15 @@ class Plan:
     @property
     def chunks_per_split(self) -> int:
         return int(self.layout.chunks_per_split)
+
+    @property
+    def single_split_chunks(self) -> int:
+        """Largest scanned-chunk count that split 0 scans alone."""
+        return int(self.layout.single_split_chunks)
+
+    @property
+    def partial_dtype(self) -> torch.dtype:
+        return self.caps.partial_dtype
 
     def bind(
         self,

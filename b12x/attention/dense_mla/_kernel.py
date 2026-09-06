@@ -53,6 +53,21 @@ def _to_cute(
     return converted
 
 
+def _partial_dtype_name(scratch) -> str:
+    return "fp32" if scratch.partial_dtype == torch.float32 else "bf16"
+
+
+def _partial_cute_dtype(scratch):
+    """Element type of the split-partial operand handed to the kernels.
+
+    A one-split plan has no partial buffer; the forward kernel then receives
+    the bf16 output tensor as a never-written placeholder.
+    """
+    if scratch.partial_output is None:
+        return cutlass.BFloat16
+    return cutlass.Float32 if scratch.partial_dtype == torch.float32 else cutlass.BFloat16
+
+
 def _byte_base_pointer(tensor: torch.Tensor) -> torch.Tensor:
     """Return a one-element byte view at the tensor's physical base.
 
@@ -83,6 +98,8 @@ def _signature(binding: Binding) -> tuple[object, ...]:
         scratch.query_tile,
         scratch.num_splits,
         scratch.chunks_per_split,
+        scratch.single_split_chunks,
+        str(scratch.partial_dtype),
         scratch.physical_record_width,
         scratch.head_dim,
         scratch.v_head_dim,
@@ -126,6 +143,7 @@ def _forward_launch(binding: Binding) -> _ForwardLaunch:
         num_heads=scratch.num_q_heads,
         num_splits=scratch.num_splits,
         chunks_per_split=scratch.chunks_per_split,
+        single_split_chunks=scratch.single_split_chunks,
         query_tile=scratch.query_tile,
         fp8=fp8,
         qk_dim=scratch.head_dim,
@@ -186,7 +204,7 @@ def _forward_launch(binding: Binding) -> _ForwardLaunch:
             dynamic_layout=True,
         ),
         _to_cute(final_lse, cutlass.Float32, align=4),
-        _to_cute(partial_output, cutlass.BFloat16, align=16),
+        _to_cute(partial_output, _partial_cute_dtype(scratch), align=16),
         _to_cute(partial_lse, cutlass.Float32, align=4),
         _to_cute(kv_scale, cutlass.Float32, align=4),
         _to_cute(q_scale, cutlass.Float32, align=4),
@@ -203,7 +221,7 @@ def _forward_launch(binding: Binding) -> _ForwardLaunch:
     )
     spec = KernelCompileSpec.from_fields(
         "attention.dense_mla.forward",
-        4,
+        5,
         key_field("dtype", "fp8" if fp8 else "bf16"),
         key_field("heads", scratch.num_q_heads),
         key_field("page_size", scratch.page_size),
@@ -212,6 +230,8 @@ def _forward_launch(binding: Binding) -> _ForwardLaunch:
         key_field("query_tile", scratch.query_tile),
         key_field("num_splits", scratch.num_splits),
         key_field("chunks_per_split", scratch.chunks_per_split),
+        key_field("single_split_chunks", scratch.single_split_chunks),
+        key_field("partial_dtype", _partial_dtype_name(scratch)),
         key_field("physical_record_width", scratch.physical_record_width),
         key_field("head_dim", scratch.head_dim),
         key_field("v_head_dim", scratch.v_head_dim),
@@ -254,12 +274,16 @@ def _merge_launch(binding: Binding) -> _MergeLaunch | None:
         return None
     assert scratch.partial_output is not None
     assert scratch.partial_lse is not None
-    entry = DenseMlaMergeKernel(scratch.num_splits, scratch.v_head_dim)
+    entry = DenseMlaMergeKernel(
+        scratch.num_splits,
+        scratch.v_head_dim,
+        partial_fp32=scratch.partial_dtype == torch.float32,
+    )
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     args = (
         _to_cute(
             scratch.partial_output,
-            cutlass.BFloat16,
+            _partial_cute_dtype(scratch),
             align=16,
         ),
         _to_cute(scratch.partial_lse, cutlass.Float32, align=4),
@@ -275,10 +299,11 @@ def _merge_launch(binding: Binding) -> _MergeLaunch | None:
     )
     spec = KernelCompileSpec.from_fields(
         "attention.dense_mla.merge",
-        4,
+        5,
         key_field("num_splits", scratch.num_splits),
         key_field("heads", scratch.num_q_heads),
         key_field("v_head_dim", scratch.v_head_dim),
+        key_field("partial_dtype", _partial_dtype_name(scratch)),
         tensor_key(
             "partial_output",
             scratch.partial_output,
