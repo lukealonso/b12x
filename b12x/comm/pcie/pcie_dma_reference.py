@@ -6,8 +6,8 @@ rank ``c + 1`` adds its values to them, rank ``c + 2`` adds its values to that
 sum, and so on, so every element of chunk ``c`` is summed in the rank order
 ``c, c + 1, ..., c - 1`` with one add per reduce-scatter hop. Each add reads
 both operands as fp32 and stores the sum, which rounds it to bf16
-(``cvt.rn.bf16x2.f32``) unless the hop it feeds carries fp32. The all-gather
-phase copies finished chunks, so all ranks end with the same bits.
+(``cvt.rn.bf16x2.f32``). The all-gather phase copies finished chunks, so all
+ranks end with the same bits.
 
 Two properties of that schedule are configurable and are defined here so the
 CUDA implementation and its CPU proofs cannot drift apart:
@@ -19,9 +19,13 @@ CUDA implementation and its CPU proofs cannot drift apart:
   assigns fixed-size granules round-robin, which makes it depend only on the
   element's position inside a ``world * granule`` row period.
 * **Hop precision** — how many trailing reduce-scatter hops carry the running
-  sum as fp32 instead of bf16 (``ring_schedule``, ``scratch_step_widths``).
+  sum as fp32 instead of bf16 (``ring_schedule``, ``chain_sum``,
+  ``rounding_count``).
 
-``ring_schedule`` is the step table the ring executes.
+``ring_schedule`` is the step table the ring executes; ``execute_schedule``
+runs that same table over CPU tensors, and ``ring_all_reduce_reference``
+computes the intended result directly from the chain definition. Agreement of
+the two is what makes the schedule table a proof rather than a restatement.
 
 CPU only, torch only; no CUDA dependency.
 """
@@ -35,10 +39,15 @@ import torch
 
 __all__ = [
     "RingStep",
+    "chain_order",
+    "chain_sum",
     "chunk_of_flat_elements",
+    "execute_schedule",
     "granule_elems_for",
     "piece_offset_elems",
+    "ring_all_reduce_reference",
     "ring_schedule",
+    "rounding_count",
     "scratch_step_widths",
 ]
 
@@ -128,11 +137,68 @@ def chunk_of_flat_elements(
 # --------------------------------------------------------------------------
 
 
+def chain_order(chunk: int, world: int) -> list[int]:
+    """Rank order in which chunk ``chunk`` is summed."""
+    return [(chunk + i) % world for i in range(world)]
+
+
 def _check_hops(world: int, fp32_hops: int) -> None:
     if not 0 <= fp32_hops <= world - 2:
         raise ValueError(
             f"fp32 hops must lie in [0, world - 2] = [0, {world - 2}], got {fp32_hops}"
         )
+
+
+def rounding_count(world: int, fp32_hops: int = 0) -> int:
+    """bf16 roundings applied to one element (``world - 1`` adds, the last
+    ``fp32_hops`` of the non-final ones kept in fp32)."""
+    _check_hops(world, fp32_hops)
+    return world - 1 - fp32_hops
+
+
+def chain_sum(
+    terms: list[torch.Tensor], order: list[int], fp32_hops: int = 0
+) -> torch.Tensor:
+    """``(((x[o0] + x[o1]) + x[o2]) + ...)`` with the ring's roundings.
+
+    Add ``i`` (``1 <= i < len(order)``) is an fp32 sum; its result is rounded
+    to the input dtype unless the add feeds an fp32 hop, i.e. unless
+    ``len(order) - 1 - fp32_hops <= i < len(order) - 1``. The final add is
+    always rounded (the output dtype is the input dtype). Returns the rounded
+    result in the input dtype.
+    """
+    world = len(order)
+    _check_hops(world, fp32_hops)
+    dtype = terms[0].dtype
+    acc = terms[order[0]].float()
+    for i in range(1, world):
+        acc = acc + terms[order[i]].float()
+        keep_fp32 = world - 1 - fp32_hops <= i < world - 1
+        if not keep_fp32:
+            acc = acc.to(dtype).float()
+    return acc.to(dtype)
+
+
+def ring_all_reduce_reference(
+    inputs: list[torch.Tensor],
+    world: int,
+    *,
+    granule_elems: int = 0,
+    fp32_hops: int = 0,
+) -> torch.Tensor:
+    """Bit-level reference of the ring all-reduce of ``inputs`` (one tensor per
+    rank, equal shapes) for the given mapping and fp32 hop count."""
+    if len(inputs) != world:
+        raise ValueError(f"expected {world} inputs, got {len(inputs)}")
+    flat = [x.reshape(-1) for x in inputs]
+    numel = flat[0].numel()
+    chunks = chunk_of_flat_elements(numel, world, granule_elems)
+    out = torch.empty_like(flat[0])
+    for chunk in range(world):
+        sel = chunks == chunk
+        terms = [x[sel] for x in flat]
+        out[sel] = chain_sum(terms, chain_order(chunk, world), fp32_hops)
+    return out.view_as(inputs[0])
 
 
 # --------------------------------------------------------------------------
@@ -257,3 +323,129 @@ def scratch_step_widths(world: int, fp32_hops: int = 0) -> tuple[int, ...]:
     return tuple(
         2 if step.payload_fp32 else 1 for step in ring_schedule(world, fp32_hops)
     )
+
+
+# --------------------------------------------------------------------------
+# CPU execution of the step table
+# --------------------------------------------------------------------------
+
+
+def _check_add_mode(step: RingStep, received: torch.dtype) -> None:
+    """Fail if the step's declared add does not match the dtypes it meets:
+    the local operand is always bf16, the received operand carries the payload
+    dtype and the result is bf16 only when it lands in the output tensor."""
+    if step.op == "add":
+        expected = ""
+        if received != torch.bfloat16 or step.sum_to != "out":
+            raise ValueError(f"step {step.step}: served add on a widened payload")
+    else:
+        b = "f32" if received == torch.float32 else "bf16"
+        expected = f"bf16_{b}_{'bf16' if step.sum_to == 'out' else 'f32'}"
+    if step.add_mode != expected:
+        raise ValueError(
+            f"step {step.step}: add mode {step.add_mode!r} does not match the "
+            f"payload dtypes ({expected!r})"
+        )
+
+
+def execute_schedule(
+    inputs: list[torch.Tensor],
+    *,
+    world: int,
+    pieces: int = 1,
+    granule_elems: int = 0,
+    fp32_hops: int = 0,
+) -> list[torch.Tensor]:
+    """Run ``ring_schedule(world, fp32_hops)`` over CPU tensors and return the
+    output of every rank.
+
+    The buffers of the CUDA implementation are modelled one for one: an output
+    tensor per rank, a receive area per (rank, step, piece) whose dtype follows
+    ``payload_fp32``, and a rank-local fp32 stage per piece. Every step first
+    performs all ranks' copies (a send reads only values produced by earlier
+    steps) and then all ranks' adds or placement copies, which is the order the
+    flag handshake enforces on the device.
+    """
+    if len(inputs) != world:
+        raise ValueError(f"expected {world} inputs, got {len(inputs)}")
+    dtype = inputs[0].dtype
+    flat = [x.reshape(-1) for x in inputs]
+    numel = flat[0].numel()
+    shard_elems = numel // world
+    if shard_elems * world != numel:
+        raise ValueError(f"{numel} elements do not split into {world} shards")
+    if granule_elems:
+        if shard_elems % granule_elems:
+            raise ValueError("granule does not tile the shard")
+        pieces = shard_elems // granule_elems
+    piece_elems = shard_elems // pieces
+    if piece_elems * pieces != shard_elems:
+        raise ValueError(f"{pieces} pieces do not tile the shard")
+    schedule = ring_schedule(world, fp32_hops)
+
+    out = [torch.zeros(numel, dtype=dtype) for _ in range(world)]
+    scratch = [
+        [
+            [
+                torch.zeros(
+                    piece_elems,
+                    dtype=torch.float32 if step.payload_fp32 else dtype,
+                )
+                for _ in range(pieces)
+            ]
+            for step in schedule
+        ]
+        for _ in range(world)
+    ]
+    stage = [
+        [torch.zeros(piece_elems, dtype=torch.float32) for _ in range(pieces)]
+        for _ in range(world)
+    ]
+
+    def piece_slice(chunk: int, piece: int) -> slice:
+        start = piece_offset_elems(
+            chunk,
+            piece,
+            world=world,
+            shard_elems=shard_elems,
+            piece_elems=piece_elems,
+            granule=bool(granule_elems),
+        )
+        return slice(start, start + piece_elems)
+
+    for step in schedule:
+        payloads = []
+        for rank in range(world):
+            send_chunk = (rank + step.send_offset) % world
+            row = []
+            for piece in range(pieces):
+                if step.send_from == "input":
+                    row.append(flat[rank][piece_slice(send_chunk, piece)].clone())
+                elif step.send_from == "out":
+                    row.append(out[rank][piece_slice(send_chunk, piece)].clone())
+                elif step.send_from == "stage":
+                    row.append(stage[rank][piece].clone())
+                else:
+                    row.append(scratch[rank][step.send_step][piece].clone())
+            payloads.append(row)
+        for rank in range(world):
+            nxt = (rank + 1) % world
+            for piece in range(pieces):
+                scratch[nxt][step.step][piece].copy_(payloads[rank][piece])
+        for rank in range(world):
+            recv_chunk = (rank + step.recv_offset) % world
+            for piece in range(pieces):
+                received = scratch[rank][step.step][piece]
+                if not step.reduce:
+                    out[rank][piece_slice(recv_chunk, piece)] = received.to(dtype)
+                    continue
+                _check_add_mode(step, received.dtype)
+                local = flat[rank][piece_slice(recv_chunk, piece)].float()
+                total = local + received.float()
+                if step.sum_to == "out":
+                    out[rank][piece_slice(recv_chunk, piece)] = total.to(dtype)
+                elif step.sum_to == "stage":
+                    stage[rank][piece].copy_(total)
+                else:
+                    scratch[rank][step.step][piece].copy_(total)
+    return [x.view_as(inputs[0]) for x in out]
