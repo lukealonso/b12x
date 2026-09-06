@@ -1,0 +1,249 @@
+{
+ "device": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+ "sms": 188,
+ "cases": {
+  "h16-t1024-n1": {
+   "heads": 16,
+   "lengths": [
+    1024
+   ],
+   "flashkda": {
+    "cold_us": 68.01600009202957,
+    "warm_us": 63.040003180503845,
+    "cold_min_us": 67.56800040602684,
+    "replays_per_sample": 2,
+    "gather_scatter_us": 22.972799837589264,
+    "captured": true,
+    "workspace_bytes": 14376960
+   },
+   "triton": {
+    "cold_us": 109.24000106751919,
+    "warm_us": 102.00800187885761,
+    "cold_min_us": 108.19200053811073,
+    "replays_per_sample": 2,
+    "captured": true
+   },
+   "chain_tiles": 64
+  },
+  "h16-t4096-n1": {
+   "heads": 16,
+   "lengths": [
+    4096
+   ],
+   "flashkda": {
+    "cold_us": 219.13599967956543,
+    "warm_us": 214.62400257587433,
+    "cold_min_us": 219.13599967956543,
+    "replays_per_sample": 1,
+    "gather_scatter_us": 23.885333444923162,
+    "captured": true,
+    "workspace_bytes": 56844288
+   },
+   "triton": {
+    "cold_us": 392.7040100097656,
+    "warm_us": 396.89600467681885,
+    "cold_min_us": 391.1679983139038,
+    "replays_per_sample": 1,
+    "captured": true
+   },
+   "chain_tiles": 256
+  },
+  "h16-t4096-n4": {
+   "heads": 16,
+   "lengths": [
+    1024,
+    1024,
+    1024,
+    1024
+   ],
+   "flashkda": {
+    "cold_us": 98.4400026500225,
+    "warm_us": 104.58399914205074,
+    "cold_min_us": 98.25600311160088,
+    "replays_per_sample": 2,
+    "gather_scatter_us": 22.741333271066345,
+    "captured": true,
+    "workspace_bytes": 57507840
+   },
+   "triton": {
+    "cold_us": 328.19199562072754,
+    "warm_us": 329.8240005970001,
+    "cold_min_us": 325.6320059299469,
+    "replays_per_sample": 1,
+    "captured": true
+   },
+   "chain_tiles": 64
+  },
+  "h16-t8192-n1": {
+   "heads": 16,
+   "lengths": [
+    8192
+   ],
+   "flashkda": {
+    "cold_us": 440.3199851512909,
+    "warm_us": 451.1680006980896,
+    "cold_min_us": 438.27199935913086,
+    "replays_per_sample": 1,
+    "gather_scatter_us": 23.40266682828466,
+    "captured": true,
+    "workspace_bytes": 113467392
+   },
+   "triton": {
+    "cold_us": 894.976019859314,
+    "warm_us": 900.1920223236084,
+    "cold_min_us": 890.8799886703491,
+    "replays_per_sample": 1,
+    "captured": true
+   },
+   "chain_tiles": 512
+  },
+  "h16-t512x8": {
+   "heads": 16,
+   "lengths": [
+    512,
+    512,
+    512,
+    512,
+    512,
+    512,
+    512,
+    512
+   ],
+   "flashkda": {
+    "cold_us": 100.3040000796318,
+    "warm_us": 104.00000214576721,
+    "cold_min_us": 98.32000359892845,
+    "replays_per_sample": 2,
+    "gather_scatter_us": 24.76479969918728,
+    "captured": true,
+    "workspace_bytes": 58392576
+   },
+   "triton": {
+    "cold_us": 337.40800619125366,
+    "warm_us": 341.6000008583069,
+    "cold_min_us": 335.87199449539185,
+    "replays_per_sample": 1,
+    "captured": true
+   },
+   "chain_tiles": 32
+  },
+  "h16-t32768-n1": {
+   "heads": 16,
+   "lengths": [
+    32768
+   ],
+   "flashkda": {
+    "cold_us": 1828.1919956207275,
+    "warm_us": 1841.7279720306396,
+    "cold_min_us": 1821.6960430145264,
+    "replays_per_sample": 1,
+    "gather_scatter_us": 23.02666660398245,
+    "captured": true,
+    "workspace_bytes": 453206016
+   },
+   "triton": {
+    "cold_us": 3811.8720054626465,
+    "warm_us": 3865.1840686798096,
+    "cold_min_us": 3805.1838874816895,
+    "replays_per_sample": 1,
+    "captured": true
+   },
+   "chain_tiles": 2048
+  },
+  "h64-t1024-n1": {
+   "heads": 64,
+   "lengths": [
+    1024
+   ],
+   "flashkda": {
+    "cold_us": 100.65599903464317,
+    "warm_us": 106.04800283908844,
+    "cold_min_us": 100.3040000796318,
+    "replays_per_sample": 2,
+    "gather_scatter_us": 23.087999938676752,
+    "captured": true,
+    "workspace_bytes": 57507840
+   },
+   "triton": {
+    "cold_us": 237.56800591945648,
+    "warm_us": 239.19999599456787,
+    "cold_min_us": 235.52000522613525,
+    "replays_per_sample": 1,
+    "captured": true
+   },
+   "chain_tiles": 64
+  },
+  "h64-t4096-n1": {
+   "heads": 64,
+   "lengths": [
+    4096
+   ],
+   "flashkda": {
+    "cold_us": 469.02400255203247,
+    "warm_us": 486.9759976863861,
+    "cold_min_us": 464.92800116539,
+    "replays_per_sample": 1,
+    "gather_scatter_us": 23.749333495895065,
+    "captured": true,
+    "workspace_bytes": 227377152
+   },
+   "triton": {
+    "cold_us": 1407.4879884719849,
+    "warm_us": 1415.2640104293823,
+    "cold_min_us": 1402.8799533843994,
+    "replays_per_sample": 1,
+    "captured": true
+   },
+   "chain_tiles": 256
+  },
+  "h64-t4096-n4": {
+   "heads": 64,
+   "lengths": [
+    1024,
+    1024,
+    1024,
+    1024
+   ],
+   "flashkda": {
+    "cold_us": 484.78399217128754,
+    "warm_us": 495.2000081539154,
+    "cold_min_us": 482.30400681495667,
+    "replays_per_sample": 1,
+    "gather_scatter_us": 25.895999744534492,
+    "captured": true,
+    "workspace_bytes": 230031360
+   },
+   "triton": {
+    "cold_us": 1449.0079879760742,
+    "warm_us": 1453.1520009040833,
+    "cold_min_us": 1442.7839517593384,
+    "replays_per_sample": 1,
+    "captured": true
+   },
+   "chain_tiles": 64
+  },
+  "h64-t32768-n1": {
+   "heads": 64,
+   "lengths": [
+    32768
+   ],
+   "flashkda": {
+    "cold_us": 3928.096055984497,
+    "warm_us": 4196.847915649414,
+    "cold_min_us": 3915.7440662384033,
+    "replays_per_sample": 1,
+    "gather_scatter_us": 23.49066672225793,
+    "captured": true,
+    "workspace_bytes": 1812824064
+   },
+   "triton": {
+    "cold_us": 12574.719905853271,
+    "warm_us": 12595.776081085205,
+    "cold_min_us": 12472.960472106934,
+    "replays_per_sample": 1,
+    "captured": true
+   },
+   "chain_tiles": 2048
+  }
+ }
+}

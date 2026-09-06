@@ -2,16 +2,18 @@
 
 from __future__ import annotations
 
+import gc
 from collections.abc import Mapping, Sequence
+from contextlib import AbstractContextManager
 
 from b12x.policy.components import (
     COMPRESSED_SPARSE_MLA_ATTENTION,
     GDN_ATTENTION,
     GQA_ATTENTION,
     MLA_ATTENTION,
+    QSA_ATTENTION,
 )
 from b12x.policy.generation.attention_corpus import (
-    COMMON_PREFILL_TOKEN_CAPACITIES,
     COMMON_SEQUENCE_CAPACITIES,
     GDN_GEOMETRIES,
     GDN_STATE_INDEX_COLUMNS,
@@ -27,14 +29,12 @@ from b12x.policy.generation.attention_corpus import (
 from b12x.policy.generation.contracts import (
     GenerationContext,
 )
-from b12x.policy.generation.measured import (
-    GpuProbeMeasurement,
-    MeasuredPolicyGenerator,
-)
 from b12x.policy.generation.sweep import (
     DiscreteSweepGenerator,
     SweepBenchmarkFactory,
+    SweepCandidate,
     SweepCase,
+    SweepMeasurement,
 )
 
 from .gpu_workers import (
@@ -174,123 +174,185 @@ class GqaAttentionGenerator(_AttentionGenerator):
         )
 
 
-class _QsaProbe:
-    _CASES = (
-        ("tp1", 1, 2_048, "bf16", "throughput"),
-        ("tp1", 4, 8_192, "fp8_e4m3", "throughput"),
-        ("tp2", 1, 8_192, "fp8_e4m3", "throughput"),
-        ("tp2", 4, 2_048, "bf16", "throughput"),
-        ("tp4", 1, 2_048, "fp8_e4m3", "throughput"),
-        ("tp4", 4, 8_192, "bf16", "throughput"),
-        *(
-            (profile, rows, 8_192, kv_dtype, "prefill")
-            for profile in ("tp1", "tp2", "tp4")
-            for rows in COMMON_PREFILL_TOKEN_CAPACITIES
-            for kv_dtype in ("bf16", "fp8_e4m3")
-        ),
+class _QsaSession(AbstractContextManager["_QsaSession"]):
+    _CANDIDATES = tuple(
+        SweepCandidate.create(
+            {
+                "backend": "cutedsl",
+                "sparse_gqa_direct_kv_warps": kv_warps,
+            }
+        )
+        for kv_warps in (2, 1, 4)
     )
 
-    @property
-    def case_count(self) -> int:
-        return len(self._CASES)
+    def __init__(self, context: GenerationContext) -> None:
+        self._context = context
 
-    @property
-    def case_ids(self) -> tuple[str, ...]:
-        from benchmarks.benchmark_qsa import BenchmarkCase, PROFILES
+    def __enter__(self) -> "_QsaSession":
+        return self
 
-        return tuple(
-            (
-                f"{BenchmarkCase(PROFILES[profile], rows, sequence, kind=kind).name}"
-                f"-{kv_dtype}"
-            )
-            for profile, rows, sequence, kv_dtype, kind in self._CASES
-        )
+    def __exit__(self, *_exc: object) -> None:
+        import torch
 
-    @property
-    def description(self) -> str:
-        return "production QSA graph qualification across TP and KV dtypes"
+        gc.collect()
+        torch.cuda.synchronize(self._context.device_ordinal)
+        torch.cuda.empty_cache()
+        return None
 
-    def __call__(
+    def candidates(self, case: SweepCase) -> tuple[SweepCandidate, ...]:
+        del case
+        return self._CANDIDATES
+
+    def measure(
         self,
-        context: GenerationContext,
-    ) -> tuple[GpuProbeMeasurement, ...]:
+        case: SweepCase,
+        candidates: tuple[SweepCandidate, ...],
+    ) -> tuple[SweepMeasurement, ...]:
         import argparse
-        from collections.abc import Mapping
 
         import torch
 
         from benchmarks.benchmark_qsa import BenchmarkCase, PROFILES, _run_case
+        from b12x.attention.qsa._policy import QsaConfig
         from b12x.policy import PolicyContext, PolicyMode
 
         from .gpu_workers import _l2_flush_fn
 
-        device = torch.device("cuda", context.device_ordinal)
-        settings = context.settings
+        metadata = case.metadata
+        tp_size = int(metadata["tensor_parallel_size"])
+        profile_name = f"tp{tp_size}"
+        kv_dtype = str(metadata["kv_dtype"])
+        benchmark_dtype = "fp8_e4m3" if kv_dtype == "float8_e4m3fn" else "bf16"
+        benchmark_case = BenchmarkCase(
+            PROFILES[profile_name],
+            int(metadata["rows"]),
+            int(metadata["context"]),
+            kind=str(metadata["kind"]),
+            main_page_size=int(metadata["main_page_size"]),
+            planned_max_batch=int(case.query["max_batch"]),
+            planned_max_q_rows=int(case.query["max_q_rows"]),
+            planned_max_speculative_tokens=int(case.query["max_speculative_tokens"]),
+        )
+        device = torch.device("cuda", self._context.device_ordinal)
+        settings = self._context.settings
         flush = _l2_flush_fn(device, enabled=settings.cold_l2)
-        policy = PolicyContext.for_device(device, mode=PolicyMode.HEURISTIC_ONLY)
+        base_policy = PolicyContext.for_device(
+            device,
+            mode=PolicyMode.HEURISTIC_ONLY,
+        )
+        args = argparse.Namespace(
+            seed=settings.seed,
+            main_cache_layout="interleaved",
+            kv_cache_dtype=benchmark_dtype,
+            warmup=settings.warmup,
+            eager_replays=1,
+            graph_replays=max(1, settings.groups * settings.repetitions),
+        )
+        case_index = int(case.case_id[-8:], 16)
         measurements = []
-        for index, (profile, rows, sequence, kv_dtype, kind) in enumerate(self._CASES):
-            case = BenchmarkCase(PROFILES[profile], rows, sequence, kind=kind)
-            label = f"{case.name}-{kv_dtype}"
-            args = argparse.Namespace(
-                seed=settings.seed,
-                main_cache_layout="interleaved",
-                kv_cache_dtype=kv_dtype,
-                warmup=settings.warmup,
-                eager_replays=1,
-                graph_replays=max(1, settings.groups * settings.repetitions),
-            )
-            result = _run_case(
-                case,
-                args=args,
-                device=device,
-                l2_flush=flush,
-                case_index=index,
-                policy=policy,
-            )
-            timing = result["timing"]
-            if not isinstance(timing, Mapping):
-                raise TypeError("QSA benchmark timing must be an object")
-            graph_timing = timing["cuda_graph"]
-            if not isinstance(graph_timing, Mapping):
-                raise TypeError("QSA graph timing must be an object")
-            summary = graph_timing["replay_summary"]
-            if not isinstance(summary, Mapping):
-                raise TypeError("QSA replay summary must be an object")
-            correctness = result["correctness"]
-            if not isinstance(correctness, Mapping):
-                raise TypeError("QSA correctness must be an object")
-            measurements.append(
-                GpuProbeMeasurement(
-                    label=label,
-                    latency_us=float(summary["median_us"]),
-                    correct=bool(
-                        correctness["graph_finite"]
-                        and correctness["graph_nonzero_elements"]
-                        and correctness["eager_graph_exact"]
-                    ),
-                    metrics={
-                        "kind": kind,
-                        "kv_dtype": kv_dtype,
-                        "rows": rows,
-                        "tp_size": PROFILES[profile].tensor_parallel_size,
-                    },
+        for candidate in candidates:
+            try:
+                config = QsaConfig.from_profile(candidate.config)
+                policy = base_policy.with_override(QSA_ATTENTION, config)
+                result = _run_case(
+                    benchmark_case,
+                    args=args,
+                    device=device,
+                    l2_flush=flush,
+                    case_index=case_index,
+                    policy=policy,
                 )
-            )
+                timing = result["timing"]
+                graph_contract = result["graph_contract"]
+                correctness = result["correctness"]
+                if not all(
+                    isinstance(item, Mapping)
+                    for item in (timing, graph_contract, correctness)
+                ):
+                    raise TypeError("QSA benchmark result sections must be objects")
+                graph_timing = timing["cuda_graph"]
+                if not isinstance(graph_timing, Mapping):
+                    raise TypeError("QSA CUDA graph timing must be an object")
+                summary = graph_timing["replay_summary"]
+                if not isinstance(summary, Mapping):
+                    raise TypeError("QSA graph replay summary must be an object")
+                correct = bool(
+                    correctness["graph_finite"]
+                    and correctness["graph_nonzero_elements"]
+                    and correctness["eager_graph_exact"]
+                    and correctness["graph_persistent_state_exact"]
+                    and correctness["graph_main_kv_read_only"]
+                    and graph_contract["stable_bound_addresses"]
+                    and graph_contract["replay_allocation_delta_bytes"] == 0
+                )
+                measurements.append(
+                    SweepMeasurement(
+                        candidate=candidate,
+                        latency_us=float(summary["median_us"]),
+                        correct=correct,
+                        metrics={
+                            "graph_replay_samples_us": list(
+                                graph_timing["replay_samples_us"]
+                            ),
+                            "page_size": benchmark_case.main_page_size,
+                            "rows": benchmark_case.rows,
+                            "context": benchmark_case.context,
+                            "kv_dtype": kv_dtype,
+                            "tensor_parallel_size": tp_size,
+                        },
+                    )
+                )
+            except Exception as error:
+                measurements.append(
+                    SweepMeasurement(
+                        candidate=candidate,
+                        latency_us=None,
+                        correct=False,
+                        error=f"{type(error).__name__}: {error}",
+                    )
+                )
+            finally:
+                gc.collect()
+                torch.cuda.empty_cache()
         return tuple(measurements)
 
 
-class QsaAttentionGenerator(MeasuredPolicyGenerator):
-    """Measure the only production QSA backend over its serving envelope."""
+class _QsaBenchmarkFactory:
+    def __call__(self, group_id, cases, context):
+        del group_id, cases
+        return _QsaSession(context)
 
-    def __init__(self) -> None:
+
+def _qsa_candidate_tie_rank(candidate: SweepCandidate) -> int:
+    return {2: 0, 1: 1, 4: 2}[int(candidate.config["sparse_gqa_direct_kv_warps"])]
+
+
+class QsaAttentionGenerator(DiscreteSweepGenerator):
+    """Race selected-position QSA launch geometry on public graph transactions."""
+
+    def __init__(
+        self,
+        *,
+        benchmark_factory: SweepBenchmarkFactory | None = None,
+        cases: Sequence[SweepCase] | None = None,
+    ) -> None:
         from b12x.attention.qsa._policy import QSA_POLICY, QsaQuery
 
         super().__init__(
-            policy=QSA_POLICY,
-            queries=tuple(QsaQuery(**case.query.to_dict()) for case in qsa_cases()),
-            encode_config=lambda config: {"backend": config.backend},
-            probe=_QsaProbe(),
+            component_id=QSA_POLICY.component_id,
+            query_schema_version=QSA_POLICY.query_schema_version,
+            config_schema_version=QSA_POLICY.config_schema_version,
+            query_fields=tuple(QsaQuery.__dataclass_fields__),
+            range_fields=frozenset(),
+            cases=qsa_cases() if cases is None else cases,
+            benchmark_factory=benchmark_factory or _QsaBenchmarkFactory(),
+            coverage={
+                "profile_cases": len(qsa_cases() if cases is None else cases),
+                "candidate_kv_warps": [2, 1, 4],
+                "unmeasured_queries": "heuristic",
+            },
+            candidate_contract_version=2,
+            candidate_tie_breaker=_qsa_candidate_tie_rank,
         )
 
 

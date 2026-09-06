@@ -11,6 +11,7 @@ import triton.language as tl
 
 from b12x._lib.dense_gemm import (
     _WO_SPARK_MAX_SMS,
+    _select_default_dense_gemm_plan,
     dense_gemm,
     dense_gemm_fused_quant_a,
     dense_gemm_fused_quant_a_grouped,
@@ -20,7 +21,7 @@ from b12x._lib.scratch import (
     scratch_buffer_spec,
     scratch_tensor,
 )
-from b12x._lib.utils import cuda_stream_to_int
+from b12x._lib.utils import cuda_stream_to_int, get_num_sm
 from b12x.gemm.wo_projection._policy import (
     WO_PROJECTION_POLICY,
     WoProjectionQuery,
@@ -2577,6 +2578,16 @@ def wo_b_dense_gemm_fused_quant_mxfp8(
     else:
         source = tmp_trg
         inner_span = rank
+    rhs_values_tiled = (
+        wo_b_hgr.values_tiled
+        if expected_m is not None and 1 <= expected_m <= 8
+        else None
+    )
+    mma_tiler_mn = None
+    if rhs_values_tiled is not None:
+        mma_tiler_mn = _wo_b_fused_tiled_plan(
+            tokens, hidden, width, source.device, expected_m
+        )
     return dense_gemm_fused_quant_a(
         source,
         wo_b_hgr.values.reshape(hidden, width, 1),
@@ -2584,15 +2595,43 @@ def wo_b_dense_gemm_fused_quant_mxfp8(
         out=out,
         expected_m=expected_m,
         sfb_k_replicated=sfb_k_replicated,
-        rhs_values_tiled=(
-            wo_b_hgr.values_tiled
-            if expected_m is not None and 1 <= expected_m <= 8
-            else None
-        ),
+        rhs_values_tiled=rhs_values_tiled,
+        mma_tiler_mn=mma_tiler_mn,
         a_inner_span=inner_span,
         _atomic_output_precleared=_atomic_output_precleared,
         stream=stream,
     )
+
+
+_WO_B_FUSED_TILED_PLANS = ((16, 64), (16, 128))
+
+
+def _wo_b_fused_tiled_plan(
+    m: int,
+    n: int,
+    k: int,
+    device: torch.device,
+    expected_m: int,
+) -> tuple[int, int]:
+    """Pin the tile-major fused-quant WO-B launch to a production 16xN plan.
+
+    ``dense_gemm_fused_quant_a`` only accepts the tile-major RHS with the
+    16xN/BK128 plans, but the default dense planner prefers (32, 64) for
+    small M on <=48-SM parts, so it must not be left to choose here. Keep the
+    planner's tile when it is one of the supported plans; otherwise fall
+    back to the 16x128 plan the planner itself selects for M=7..8.
+    """
+
+    override = os.getenv("B12X_WO_B_FUSED_TILE", "").strip().lower()
+    if override in ("16x64", "16x128"):
+        rows, cols = override.split("x")
+        return (int(rows), int(cols))
+    plan = _select_default_dense_gemm_plan(
+        m, n, k, get_num_sm(device), is_mxfp8=True, expected_m=expected_m
+    )
+    if plan.mma_tiler_mn in _WO_B_FUSED_TILED_PLANS:
+        return plan.mma_tiler_mn
+    return (16, 128)
 
 
 def wo_projection_mxfp8(

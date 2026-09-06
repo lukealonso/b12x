@@ -36,6 +36,7 @@ from .pcie_oneshot import (
 from .pcie_oneshot import (
     parse_pcie_oneshot_max_size as parse_oneshot_max_size,
 )
+from .pcie_twoshot_bf16 import PCIeTwoShotBF16
 from .pcie_twoshot import (
     PCIeTwoShotSP as TwoShotReduceScatter,
 )
@@ -60,6 +61,7 @@ __all__ = [
     "OneshotAllReduce",
     "OneshotAllReducePool",
     "DmaAllReduce",
+    "PCIeTwoShotBF16",
     "TwoShotReduceScatter",
     "DcpAllToAll",
     "DcpAllToAllPool",

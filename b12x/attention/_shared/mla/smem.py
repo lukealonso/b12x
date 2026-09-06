@@ -58,7 +58,7 @@ from dataclasses import dataclass
 import cutlass
 import cutlass.cute as cute
 
-from .traits import ScaleFormat, UnifiedMLATraits
+from .traits import ModelType, ScaleFormat, UnifiedMLATraits
 
 
 # SM120 dynamic-smem opt-in carveout cap: (100-1)*1024 (see cutlass
@@ -290,7 +290,14 @@ def make_smem_layout(traits: UnifiedMLATraits) -> SmemLayout:
     w_fp8_off = off
     w_fp8_stride = bi + _W_FP8_PAD
     w_fp8_buf_bytes = hpb * w_fp8_stride
-    w_fp8_bufs = _W_FP8_BUF_COUNT
+    # GLM_NEXT has no RoPE stage and sits well under the carveout, so it can
+    # afford separate HIGH and LOW W buffers per V-group parity: the two-pass
+    # PV then stages both passes behind one barrier per V group.
+    w_fp8_bufs = (
+        2 * _W_FP8_BUF_COUNT
+        if traits.model_type == ModelType.GLM_NEXT
+        else _W_FP8_BUF_COUNT
+    )
     off = w_fp8_off + w_fp8_buf_bytes * w_fp8_bufs
 
     # --- staged raw-token-index validity buffer (incl -1 sentinel), int32. ---

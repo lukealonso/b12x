@@ -11,6 +11,7 @@ from ._contract import (
     cache_requirements,
     is_supported,
     plan,
+    prewarm,
     run,
 )
 from ._policy import QsaConfig, QsaQuery
@@ -25,6 +26,7 @@ __all__ = [
     "cache_requirements",
     "plan",
     "bind",
+    "prewarm",
     "run",
     "is_supported",
 ]

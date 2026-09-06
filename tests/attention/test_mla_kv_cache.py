@@ -440,6 +440,7 @@ def test_writer_records_feed_production_head_multisplit_decode() -> None:
     sm_scale = _HEAD_DIM**-0.5
 
     caps = B12XSparseMLAScratchCaps(
+        softmax_scale=1.0,
         device=device,
         dtype=torch.bfloat16,
         kv_dtype=torch.uint8,

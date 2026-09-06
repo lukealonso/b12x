@@ -599,16 +599,24 @@ def bind(
     )
 
 
-def run(binding: Binding) -> torch.Tensor:
-    """Execute the fused-expressed hash, local gather, and dequantization op."""
+def run(binding: Binding, *, token_count: int | None = None) -> torch.Tensor:
+    """Hash and gather up to token_count rows from the planned storage.
+
+    The device num_tokens must fit this host launch bound. Rows after the
+    bound are untouched. The bound changes grids, not kernel specializations.
+    """
     if binding.plan.caps.device.type != "cuda":
         raise ValueError(
             "PLE embedding GPU run requires CUDA; use the explicit reference oracle"
         )
     from ._kernels import run_pipeline
 
-    run_pipeline(binding)
-    return binding.out
+    if token_count is None:
+        token_count = binding.plan.caps.max_tokens
+    if not 0 <= token_count <= binding.plan.caps.max_tokens:
+        raise ValueError("token_count must fit the planned token capacity")
+    run_pipeline(binding, token_count=token_count)
+    return binding.out[:token_count]
 
 
 __all__ = [

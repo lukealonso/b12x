@@ -66,6 +66,7 @@ from b12x._lib.intrinsics import (
     fp4_decode_2,
     get_ptr_as_int64,
     ld_global_nc_v2_u32,
+    ld_global_nc_v4_u32,
     ld_shared_v2_u32,
     ld_shared_v4_u32,
     ld_shared_f32,
@@ -84,7 +85,9 @@ from b12x._lib.intrinsics import (
     st_shared_f32,
     st_shared_u32,
     st_shared_u8,
+    st_shared_v4_u32,
     st_global_v4_u32,
+    store_bf16x2,
 )
 
 
@@ -545,6 +548,136 @@ def s0_load_q_bf16_to_smem(
         )
         i += Int32(num_threads)
     cute.arch.barrier(**bar_kw)
+
+
+@cute.jit
+def s0_quantize_q_vec(
+    q_token: cute.Tensor,  # (NUM_HEADS, D_QK) bf16 view for this token; dim stride 1
+    q_fp8_base_addr: Int32,  # u32 smem addr of q_fp8 (rows of q_nope_stride bytes)
+    q_sc_view: cute.Tensor,  # smem fp32 view (HPB*NUM_SCALES,) -- pow2 scales
+    q_rope_base_addr: Int32,  # u32 smem addr of q_rope (rows of q_rope_stride bf16)
+    head_base: Int32,  # first head index of this CTA
+    valid_hpb: Int32,  # number of valid heads (<= hpb_local)
+    tid: Int32,  # flat thread id in [0, num_threads)
+    *,
+    d_nope: cutlass.Constexpr,  # 448 (DSV4) / 512 (GLM)
+    d_rope: cutlass.Constexpr,  # 64, or 0 for GLM_NEXT
+    quant_tile: cutlass.Constexpr,  # 64 (DSV4) / 128 (GLM)
+    num_scales: cutlass.Constexpr,  # d_nope // quant_tile
+    q_nope_stride: cutlass.Constexpr,  # q_fp8 row stride in bytes
+    q_rope_stride: cutlass.Constexpr,  # q_rope row stride in bf16 elements
+    num_threads: cutlass.Constexpr,  # 128 or 256 math threads
+    barrier_id: cutlass.Constexpr,
+    hpb_local: cutlass.Constexpr = 8,  # heads staged by this CTA (8 or 16)
+):
+    """S0 with 16-byte global loads for the 8- and 16-head decode paths.
+
+    Numerically identical to :func:`s0_quantize_q_to_smem`: the per-(head,
+    tile) absmax, the pow2-ceil UE8M0 scale, and the clamped ``cvt.rn.satfinite``
+    E4M3 quantization are the same operations on the same values. The
+    difference is the schedule: every Q vector this thread needs is loaded
+    before any value is consumed, the tile absmax is an 8-lane shuffle
+    reduction instead of a shared-memory atomic, and the E4M3 bytes are stored
+    eight at a time.
+
+    Work split: an 8-lane subgroup owns one (head, tile) slot per iteration;
+    lane ``lane8`` owns elements ``[tile*quant_tile + v*64 + lane8*8, +8)`` for
+    each 64-wide vector row ``v`` of the tile. The Q-RoPE row copy is one
+    16-byte load and store per (head, 8-element group) on threads < 8 * 8.
+    Requires ``q_token`` rows to be 16-byte aligned with unit dim stride.
+    """
+    vecs_per_lane = quant_tile // 64
+    slots = hpb_local * num_scales
+    subgroups = num_threads // 8
+    iters = (slots + subgroups - 1) // subgroups
+    lane8 = tid & Int32(7)
+    sub = tid >> Int32(3)
+
+    # ── Phase A: issue every global load this thread will consume. ──
+    q_words = []
+    for it in cutlass.range_constexpr(iters):
+        slot = sub + Int32(it * subgroups)
+        h = slot // Int32(num_scales)
+        blk = slot - h * Int32(num_scales)
+        for v in cutlass.range_constexpr(vecs_per_lane):
+            d = blk * Int32(quant_tile) + Int32(v * 64) + lane8 * Int32(8)
+            w0 = Uint32(0)
+            w1 = Uint32(0)
+            w2 = Uint32(0)
+            w3 = Uint32(0)
+            if slot < Int32(slots) and h < valid_hpb:
+                q_off = cute.crd2idx((head_base + h, d), q_token.layout)
+                w0, w1, w2, w3 = ld_global_nc_v4_u32(get_ptr_as_int64(q_token, q_off))
+            q_words.append((w0, w1, w2, w3))
+
+    rope_groups = d_rope // 8
+    rope_threads = hpb_local * rope_groups
+    r0 = Uint32(0)
+    r1 = Uint32(0)
+    r2 = Uint32(0)
+    r3 = Uint32(0)
+    if cutlass.const_expr(d_rope > 0):
+        if tid < Int32(rope_threads):
+            rh = tid // Int32(rope_groups)
+            rg = tid - rh * Int32(rope_groups)
+            if rh < valid_hpb:
+                q_off = cute.crd2idx(
+                    (head_base + rh, Int32(d_nope) + rg * Int32(8)), q_token.layout
+                )
+                r0, r1, r2, r3 = ld_global_nc_v4_u32(get_ptr_as_int64(q_token, q_off))
+
+    # ── Phase B: Q-RoPE row copy (bf16 pass-through; zero-filled invalid heads). ──
+    if cutlass.const_expr(d_rope > 0):
+        if tid < Int32(rope_threads):
+            rh = tid // Int32(rope_groups)
+            rg = tid - rh * Int32(rope_groups)
+            st_shared_v4_u32(
+                q_rope_base_addr + (rh * Int32(q_rope_stride) + rg * Int32(8)) * Int32(2),
+                r0,
+                r1,
+                r2,
+                r3,
+            )
+
+    # ── Phase C: per-slot absmax -> pow2 scale -> E4M3 quantize -> smem. ──
+    for it in cutlass.range_constexpr(iters):
+        slot = sub + Int32(it * subgroups)
+        h = slot // Int32(num_scales)
+        blk = slot - h * Int32(num_scales)
+        vals = []
+        amax = Float32(0.0)
+        for v in cutlass.range_constexpr(vecs_per_lane):
+            w0, w1, w2, w3 = q_words[it * vecs_per_lane + v]
+            for w in (w0, w1, w2, w3):
+                lo = _u32_to_f32(w << Uint32(16))
+                hi = _u32_to_f32(w & Uint32(0xFFFF0000))
+                vals.append(lo)
+                vals.append(hi)
+                amax = fmax_f32(amax, fabs_f32(lo))
+                amax = fmax_f32(amax, fabs_f32(hi))
+        for offset in (1, 2, 4):
+            amax = fmax_f32(amax, cute.arch.shuffle_sync_bfly(amax, offset=offset))
+        raw = fmax_f32(amax, Float32(1e-4)) * Float32(1.0 / _FP8_MAX)
+        rounded, _ue8m0 = pow2_ceil_ue8m0(raw)
+        if slot < Int32(slots) and lane8 == Int32(0):
+            q_sc_view[slot] = rounded
+        inv_scale = Float32(1.0) / rounded
+        for v in cutlass.range_constexpr(vecs_per_lane):
+            packed = []
+            for pair in cutlass.range_constexpr(4):
+                x0 = vals[v * 8 + pair * 2] * inv_scale
+                x1 = vals[v * 8 + pair * 2 + 1] * inv_scale
+                x0 = fmax_f32(Float32(_FP8_MIN), fmin_f32(Float32(_FP8_MAX), x0))
+                x1 = fmax_f32(Float32(_FP8_MIN), fmin_f32(Float32(_FP8_MAX), x1))
+                packed.append(_cvt_f32x2_to_e4m3x2(x0, x1))
+            b0 = packed[0] | (packed[1] << Uint32(16))
+            b1 = packed[2] | (packed[3] << Uint32(16))
+            if slot < Int32(slots):
+                d = blk * Int32(quant_tile) + Int32(v * 64) + lane8 * Int32(8)
+                out_addr = q_fp8_base_addr + h * Int32(q_nope_stride) + d
+                st_shared_u32(out_addr, b0)
+                st_shared_u32(out_addr + Int32(4), b1)
+    cute.arch.barrier(barrier_id=barrier_id, number_of_threads=num_threads)
 
 
 # =============================================================================
@@ -1025,6 +1158,7 @@ def s2_qk_rope_bf16(
     q_rope_stride: cutlass.Constexpr,
     valid_hpb: cutlass.Constexpr = 16,
     fp8_rope: cutlass.Constexpr = False,
+    kv_rope_stride_bytes: cutlass.Constexpr = 0,  # K-rope row stride; 0 -> D_ROPE * 2
 ):
     """S2: accumulate Q_rope . K_rope into qk[0..3] via D_ROPE/16=4 bf16 MMAs.
 
@@ -1062,7 +1196,8 @@ def s2_qk_rope_bf16(
                 d_rope=d_rope,
             )
         else:
-            row_byte = entry * Int32(d_rope * 2) + ko * Int32(2)
+            row_stride = kv_rope_stride_bytes if kv_rope_stride_bytes else d_rope * 2
+            row_byte = entry * Int32(row_stride) + ko * Int32(2)
             b0 = _ld_u32(kv_rope_base_addr, row_byte + tid * Int32(2) * Int32(2))
             b1 = _ld_u32(
                 kv_rope_base_addr, row_byte + (tid * Int32(2) + Int32(8)) * Int32(2)
@@ -1492,26 +1627,43 @@ def s4_online_softmax(
         )
     cute.arch.barrier(**bar_kw)
 
-    # one thread per head folds the 8 warps' (max,sum) into a block reduction.
-    if tid_flat < Int32(valid_hpb):
-        h = tid_flat
-        bmax = Float32(-1e30)
-        for w in cutlass.range_constexpr(n_warps):
-            wm = ld_shared_f32(reduce_max_addr + (Int32(w) * Int32(hpb) + h) * Int32(4))
-            bmax = fmax_f32(bmax, wm)
-        bsum = Float32(0.0)
-        for w in cutlass.range_constexpr(n_warps):
-            wm = ld_shared_f32(reduce_max_addr + (Int32(w) * Int32(hpb) + h) * Int32(4))
-            ws = ld_shared_f32(reduce_sum_addr + (Int32(w) * Int32(hpb) + h) * Int32(4))
-            bsum = bsum + ws * _exp2_approx_ftz_f32(wm - bmax)
-        st_shared_f32(reduce_max_addr + h * Int32(4), bmax)
-        st_shared_f32(reduce_sum_addr + h * Int32(4), bsum)
-    cute.arch.barrier(**bar_kw)
-
-    block_local_max0 = ld_shared_f32(reduce_max_addr + gid * Int32(4))
-    block_local_max1 = ld_shared_f32(reduce_max_addr + (gid + Int32(8)) * Int32(4))
-    block_local_sum0 = ld_shared_f32(reduce_sum_addr + gid * Int32(4))
-    block_local_sum1 = ld_shared_f32(reduce_sum_addr + (gid + Int32(8)) * Int32(4))
+    # Every lane folds the per-warp (max, sum) pairs of its two rows itself,
+    # in the same sequential order the one-thread-per-head fold used, so the
+    # result is identical without a second barrier and shared round trip. The
+    # per-warp slots are next written by the following chunk's S4, which the
+    # PV stage barriers separate from these reads.
+    h1 = gid + Int32(8)
+    wmax0 = []
+    wmax1 = []
+    wsum0 = []
+    wsum1 = []
+    for w in cutlass.range_constexpr(n_warps):
+        wmax0.append(
+            ld_shared_f32(reduce_max_addr + (Int32(w) * Int32(hpb) + gid) * Int32(4))
+        )
+        wsum0.append(
+            ld_shared_f32(reduce_sum_addr + (Int32(w) * Int32(hpb) + gid) * Int32(4))
+        )
+        wmax1.append(
+            ld_shared_f32(reduce_max_addr + (Int32(w) * Int32(hpb) + h1) * Int32(4))
+        )
+        wsum1.append(
+            ld_shared_f32(reduce_sum_addr + (Int32(w) * Int32(hpb) + h1) * Int32(4))
+        )
+    block_local_max0 = Float32(-1e30)
+    block_local_max1 = Float32(-1e30)
+    for w in cutlass.range_constexpr(n_warps):
+        block_local_max0 = fmax_f32(block_local_max0, wmax0[w])
+        block_local_max1 = fmax_f32(block_local_max1, wmax1[w])
+    block_local_sum0 = Float32(0.0)
+    block_local_sum1 = Float32(0.0)
+    for w in cutlass.range_constexpr(n_warps):
+        block_local_sum0 = block_local_sum0 + wsum0[w] * _exp2_approx_ftz_f32(
+            wmax0[w] - block_local_max0
+        )
+        block_local_sum1 = block_local_sum1 + wsum1[w] * _exp2_approx_ftz_f32(
+            wmax1[w] - block_local_max1
+        )
 
     # --- online softmax update (cross-chunk). ---
     new_gmax0 = fmax_f32(global_max[0], block_local_max0)
@@ -1628,25 +1780,39 @@ def s4_online_softmax_glm_h8_swap_ab(
         )
     cute.arch.barrier(**bar_kw)
 
-    if tid_flat < Int32(8):
-        h = tid_flat
-        bmax = Float32(-1e30)
-        for w in cutlass.range_constexpr(n_warps):
-            wm = ld_shared_f32(reduce_max_addr + (Int32(w) * Int32(hpb) + h) * Int32(4))
-            bmax = fmax_f32(bmax, wm)
-        bsum = Float32(0.0)
-        for w in cutlass.range_constexpr(n_warps):
-            wm = ld_shared_f32(reduce_max_addr + (Int32(w) * Int32(hpb) + h) * Int32(4))
-            ws = ld_shared_f32(reduce_sum_addr + (Int32(w) * Int32(hpb) + h) * Int32(4))
-            bsum = bsum + ws * _exp2_approx_ftz_f32(wm - bmax)
-        st_shared_f32(reduce_max_addr + h * Int32(4), bmax)
-        st_shared_f32(reduce_sum_addr + h * Int32(4), bsum)
-    cute.arch.barrier(**bar_kw)
-
-    block_max0 = ld_shared_f32(reduce_max_addr + head0 * Int32(4))
-    block_max1 = ld_shared_f32(reduce_max_addr + head1 * Int32(4))
-    block_sum0 = ld_shared_f32(reduce_sum_addr + head0 * Int32(4))
-    block_sum1 = ld_shared_f32(reduce_sum_addr + head1 * Int32(4))
+    # Every lane folds the per-warp (max, sum) pairs of its two heads itself.
+    # This is the same sequential fold the one-thread-per-head variant
+    # performed, so the result is identical, without a second barrier and
+    # shared-memory round trip. The per-warp slots are next written by the
+    # following chunk's S4, which is separated from these reads by the PV
+    # stage barriers.
+    wmax0 = []
+    wmax1 = []
+    wsum0 = []
+    wsum1 = []
+    for w in cutlass.range_constexpr(n_warps):
+        wmax0.append(
+            ld_shared_f32(reduce_max_addr + (Int32(w) * Int32(hpb) + head0) * Int32(4))
+        )
+        wmax1.append(
+            ld_shared_f32(reduce_max_addr + (Int32(w) * Int32(hpb) + head1) * Int32(4))
+        )
+        wsum0.append(
+            ld_shared_f32(reduce_sum_addr + (Int32(w) * Int32(hpb) + head0) * Int32(4))
+        )
+        wsum1.append(
+            ld_shared_f32(reduce_sum_addr + (Int32(w) * Int32(hpb) + head1) * Int32(4))
+        )
+    block_max0 = Float32(-1e30)
+    block_max1 = Float32(-1e30)
+    for w in cutlass.range_constexpr(n_warps):
+        block_max0 = fmax_f32(block_max0, wmax0[w])
+        block_max1 = fmax_f32(block_max1, wmax1[w])
+    block_sum0 = Float32(0.0)
+    block_sum1 = Float32(0.0)
+    for w in cutlass.range_constexpr(n_warps):
+        block_sum0 = block_sum0 + wsum0[w] * _exp2_approx_ftz_f32(wmax0[w] - block_max0)
+        block_sum1 = block_sum1 + wsum1[w] * _exp2_approx_ftz_f32(wmax1[w] - block_max1)
 
     new_gmax0 = fmax_f32(global_max[0], block_max0)
     new_gmax1 = fmax_f32(global_max[1], block_max1)
@@ -1767,6 +1933,7 @@ def s6_xv_nope(
     sm_p_full_addr: Int32 = None,  # NVFP4 BF16 PV only
     sm_p_stride: cutlass.Constexpr = 0,  # NVFP4: bf16 elems per sm_p row (0 -> BI)
     latent_scale_per_token: cutlass.Constexpr = False,  # NVFP4_E4M3 only
+    w_fp8_bufs: cutlass.Constexpr = 2,  # W staging buffers (GLM two-pass: 2 or 4)
 ):
     """S6: accumulate W . V_nope into acc_nope[vc*NT+nt][0..3] via PLAIN fp8 MMAs
     (14 DSV4 / 16 GLM = N_V_CHUNKS * NT_PER_WARP_XV * (BI/32)).
@@ -1830,6 +1997,9 @@ def s6_xv_nope(
     warp_first_cand = warp_id * Int32(8)
     cand_e0 = warp_first_cand + tid * Int32(2)
     cand_e1 = cand_e0 + Int32(1)
+    # W (A operand) columns follow the permuted K axis of _d2_load_b_fp8_perm.
+    wcol_e0 = _w_perm_col(cand_e0)
+    wcol_e1 = _w_perm_col(cand_e1)
     hi = cutlass.const_expr(valid_hpb > 8)
 
     glm_scale_base = Int32(n_v_chunks) * Int32(v_chunk)  # == D_NOPE (GLM)
@@ -1896,10 +2066,10 @@ def s6_xv_nope(
             f00 = _quant_e4m3_byte(w_pre[0] * vsc0 * si0)
             f01 = _quant_e4m3_byte(w_pre[1] * vsc1 * si0)
             st_shared_u8(
-                w_fp8_addr + gid * Int32(w_fp8_stride) + cand_e0, f00.to(cutlass.Uint8)
+                w_fp8_addr + gid * Int32(w_fp8_stride) + wcol_e0, f00.to(cutlass.Uint8)
             )
             st_shared_u8(
-                w_fp8_addr + gid * Int32(w_fp8_stride) + cand_e1, f01.to(cutlass.Uint8)
+                w_fp8_addr + gid * Int32(w_fp8_stride) + wcol_e1, f01.to(cutlass.Uint8)
             )
             if cutlass.const_expr(hi):
                 si1 = (
@@ -1909,11 +2079,11 @@ def s6_xv_nope(
                 f10 = _quant_e4m3_byte(w_pre[2] * vsc0 * si1)
                 f11 = _quant_e4m3_byte(w_pre[3] * vsc1 * si1)
                 st_shared_u8(
-                    w_fp8_addr + (gid + Int32(8)) * Int32(w_fp8_stride) + cand_e0,
+                    w_fp8_addr + (gid + Int32(8)) * Int32(w_fp8_stride) + wcol_e0,
                     f10.to(cutlass.Uint8),
                 )
                 st_shared_u8(
-                    w_fp8_addr + (gid + Int32(8)) * Int32(w_fp8_stride) + cand_e1,
+                    w_fp8_addr + (gid + Int32(8)) * Int32(w_fp8_stride) + wcol_e1,
                     f11.to(cutlass.Uint8),
                 )
             cute.arch.barrier(**bar_kw)
@@ -1937,7 +2107,7 @@ def s6_xv_nope(
                     ko = Int32(kstep) * Int32(32)
                     a_addr = w_fp8_addr + a_row * Int32(w_fp8_stride) + ko + a_col
                     a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(a_addr)
-                    b0, b1 = _d2_load_b_fp8(
+                    b0, b1 = _d2_load_b_fp8_perm(
                         kv_fp8_base_addr, ko, dim, lane, kv_smem_stride=kv_smem_stride
                     )
                     xv0, xv1, xv2, xv3 = mma_m16n8k32_f32_e4m3(
@@ -1973,13 +2143,21 @@ def s6_xv_nope(
             resid00 = fmax_f32(Float32(_FP8_MIN), fmin_f32(Float32(_FP8_MAX), resid00))
             resid01 = fmax_f32(Float32(_FP8_MIN), fmin_f32(Float32(_FP8_MAX), resid01))
             flo2 = _cvt_f32x2_to_e4m3x2(resid00, resid01)
-            _st_shared_u16(
-                w_fp8_addr + gid * Int32(w_fp8_stride) + cand_e0,
-                fhi2,
+            st_shared_u8(
+                w_fp8_addr + gid * Int32(w_fp8_stride) + wcol_e0,
+                (fhi2 & Uint32(0xFF)).to(cutlass.Uint8),
             )
-            _st_shared_u16(
-                w_fp8_addr + (gid + Int32(8)) * Int32(w_fp8_stride) + cand_e0,
-                flo2,
+            st_shared_u8(
+                w_fp8_addr + gid * Int32(w_fp8_stride) + wcol_e1,
+                ((fhi2 >> Uint32(8)) & Uint32(0xFF)).to(cutlass.Uint8),
+            )
+            st_shared_u8(
+                w_fp8_addr + (gid + Int32(8)) * Int32(w_fp8_stride) + wcol_e0,
+                (flo2 & Uint32(0xFF)).to(cutlass.Uint8),
+            )
+            st_shared_u8(
+                w_fp8_addr + (gid + Int32(8)) * Int32(w_fp8_stride) + wcol_e1,
+                ((flo2 >> Uint32(8)) & Uint32(0xFF)).to(cutlass.Uint8),
             )
             cute.arch.barrier(**bar_kw)
 
@@ -1997,7 +2175,7 @@ def s6_xv_nope(
                     ko = Int32(kstep) * Int32(32)
                     a_addr = w_fp8_addr + a_row * Int32(w_fp8_stride) + ko + a_col
                     a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(a_addr)
-                    b0, b1 = _d2_load_b_fp8(
+                    b0, b1 = _d2_load_b_fp8_perm(
                         kv_fp8_base_addr,
                         ko,
                         dim,
@@ -2012,11 +2190,22 @@ def s6_xv_nope(
                 acc_nope[at][1] = acc_nope[at][1] + (xv1 + xv3) * sc0
         return acc_nope
 
-    # GLM (ARBITRARY_FP32, P10f): 2-pass W (HIGH + LOW e4m3 residual) -> ~7 mantissa
-    # bits, run the PLAIN MMA twice per (vc, nt) into the SAME fp32 xv. This is a
-    # SEPARATE const_expr branch, so DSV4 (above) is untouched.
+    # GLM (ARBITRARY_FP32): two-pass W (HIGH + LOW e4m3 residual, ~7 mantissa
+    # bits). Both passes are staged before one barrier -- HIGH and LOW in
+    # separate W buffers -- and each V fragment is synthesized once and fed to
+    # the HIGH and LOW MMAs. With four W buffers (GLM_NEXT layout) the buffer
+    # pair alternates with the V-group parity and no read-before-overwrite
+    # barrier is needed; with two buffers a barrier precedes each group's
+    # stores.
+    w_buf_bytes = Int32(hpb * w_fp8_stride)
     for vc in cutlass.range_constexpr(n_v_chunks):
-        w_fp8_addr = w_fp8_base_addr + Int32(vc & 1) * Int32(hpb * w_fp8_stride)
+        if cutlass.const_expr(w_fp8_bufs >= 4):
+            hi_addr = w_fp8_base_addr + Int32((vc & 1) * 2) * w_buf_bytes
+        else:
+            hi_addr = w_fp8_base_addr
+            if cutlass.const_expr(vc > 0):
+                cute.arch.barrier(**bar_kw)
+        lo_addr = hi_addr + w_buf_bytes
         si0 = Float32(1.0) / w_head_sc_view[Int32(vc) * Int32(hpb) + gid]
         sc0 = w_head_sc_view[Int32(vc) * Int32(hpb) + gid]
         if cutlass.const_expr(hi):
@@ -2029,78 +2218,75 @@ def s6_xv_nope(
         # normalized W (= w_pre * V_scale / w_head_sc), the e4m3 quant target.
         wn00 = w_pre[0] * vsc0 * si0
         wn01 = w_pre[1] * vsc1 * si0
+        st_shared_u8(
+            hi_addr + gid * Int32(w_fp8_stride) + wcol_e0,
+            _quant_e4m3_byte(wn00).to(cutlass.Uint8),
+        )
+        st_shared_u8(
+            hi_addr + gid * Int32(w_fp8_stride) + wcol_e1,
+            _quant_e4m3_byte(wn01).to(cutlass.Uint8),
+        )
+        st_shared_u8(
+            lo_addr + gid * Int32(w_fp8_stride) + wcol_e0,
+            _quant_e4m3_residual_byte(wn00).to(cutlass.Uint8),
+        )
+        st_shared_u8(
+            lo_addr + gid * Int32(w_fp8_stride) + wcol_e1,
+            _quant_e4m3_residual_byte(wn01).to(cutlass.Uint8),
+        )
         if cutlass.const_expr(hi):
             wn10 = w_pre[2] * vsc0 * si1
             wn11 = w_pre[3] * vsc1 * si1
-        # per-nt fp32 accumulators, carried across the W hi/lo passes.
-        xv = [
-            [Float32(0.0), Float32(0.0), Float32(0.0), Float32(0.0)]
-            for _ in range(nt_per_warp_xv)
-        ]
-        for wpass in cutlass.range_constexpr(2):
-            if cutlass.const_expr(wpass > 0):
-                # serialize: the prev pass's MMA reads of w_fp8 must finish before
-                # we overwrite it with the residual bytes (same double-buffer slot).
-                cute.arch.barrier(**bar_kw)
-                # LOW residual = e4m3(Wn - dequant(hi_byte)); halves W's quant error.
-                f00 = _quant_e4m3_residual_byte(wn00)
-                f01 = _quant_e4m3_residual_byte(wn01)
-                if cutlass.const_expr(hi):
-                    f10 = _quant_e4m3_residual_byte(wn10)
-                    f11 = _quant_e4m3_residual_byte(wn11)
-            else:
-                f00 = _quant_e4m3_byte(wn00)
-                f01 = _quant_e4m3_byte(wn01)
-                if cutlass.const_expr(hi):
-                    f10 = _quant_e4m3_byte(wn10)
-                    f11 = _quant_e4m3_byte(wn11)
             st_shared_u8(
-                w_fp8_addr + gid * Int32(w_fp8_stride) + cand_e0, f00.to(cutlass.Uint8)
+                hi_addr + (gid + Int32(8)) * Int32(w_fp8_stride) + wcol_e0,
+                _quant_e4m3_byte(wn10).to(cutlass.Uint8),
             )
             st_shared_u8(
-                w_fp8_addr + gid * Int32(w_fp8_stride) + cand_e1, f01.to(cutlass.Uint8)
+                hi_addr + (gid + Int32(8)) * Int32(w_fp8_stride) + wcol_e1,
+                _quant_e4m3_byte(wn11).to(cutlass.Uint8),
             )
-            if cutlass.const_expr(hi):
-                st_shared_u8(
-                    w_fp8_addr + (gid + Int32(8)) * Int32(w_fp8_stride) + cand_e0,
-                    f10.to(cutlass.Uint8),
-                )
-                st_shared_u8(
-                    w_fp8_addr + (gid + Int32(8)) * Int32(w_fp8_stride) + cand_e1,
-                    f11.to(cutlass.Uint8),
-                )
-            cute.arch.barrier(**bar_kw)
+            st_shared_u8(
+                lo_addr + (gid + Int32(8)) * Int32(w_fp8_stride) + wcol_e0,
+                _quant_e4m3_residual_byte(wn10).to(cutlass.Uint8),
+            )
+            st_shared_u8(
+                lo_addr + (gid + Int32(8)) * Int32(w_fp8_stride) + wcol_e1,
+                _quant_e4m3_residual_byte(wn11).to(cutlass.Uint8),
+            )
+        cute.arch.barrier(**bar_kw)
 
-            for nt in cutlass.range_constexpr(nt_per_warp_xv):
-                # dim = vc*V_CHUNK + (nt*N_WARPS + warp_id)*8 (covers the full V_CHUNK).
-                dim = Int32(vc) * Int32(v_chunk) + (
-                    Int32(nt) * Int32(n_warps) + warp_id
-                ) * Int32(8)
-                xv0 = xv[nt][0]
-                xv1 = xv[nt][1]
-                xv2 = xv[nt][2]
-                xv3 = xv[nt][3]
-                for kstep in cutlass.range_constexpr(bi // 32):
-                    ko = Int32(kstep) * Int32(32)
-                    a_addr = w_fp8_addr + a_row * Int32(w_fp8_stride) + ko + a_col
-                    a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(a_addr)
-                    b0, b1 = _d2_load_b_fp8(
-                        kv_fp8_base_addr, ko, dim, lane, kv_smem_stride=kv_smem_stride
-                    )
-                    xv0, xv1, xv2, xv3 = mma_m16n8k32_f32_e4m3(
-                        xv0, xv1, xv2, xv3, a0, a1, a2, a3, b0, b1
-                    )
-                xv[nt][0] = xv0
-                xv[nt][1] = xv1
-                xv[nt][2] = xv2
-                xv[nt][3] = xv3
         for nt in cutlass.range_constexpr(nt_per_warp_xv):
+            # dim = vc*V_CHUNK + (nt*N_WARPS + warp_id)*8 (covers the full V_CHUNK).
+            dim = Int32(vc) * Int32(v_chunk) + (
+                Int32(nt) * Int32(n_warps) + warp_id
+            ) * Int32(8)
+            xv0 = Float32(0.0)
+            xv1 = Float32(0.0)
+            xv2 = Float32(0.0)
+            xv3 = Float32(0.0)
+            for kstep in cutlass.range_constexpr(bi // 32):
+                ko = Int32(kstep) * Int32(32)
+                b0, b1 = _d2_load_b_fp8_perm(
+                    kv_fp8_base_addr, ko, dim, lane, kv_smem_stride=kv_smem_stride
+                )
+                a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(
+                    hi_addr + a_row * Int32(w_fp8_stride) + ko + a_col
+                )
+                xv0, xv1, xv2, xv3 = mma_m16n8k32_f32_e4m3(
+                    xv0, xv1, xv2, xv3, a0, a1, a2, a3, b0, b1
+                )
+                a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(
+                    lo_addr + a_row * Int32(w_fp8_stride) + ko + a_col
+                )
+                xv0, xv1, xv2, xv3 = mma_m16n8k32_f32_e4m3(
+                    xv0, xv1, xv2, xv3, a0, a1, a2, a3, b0, b1
+                )
             at = vc * nt_per_warp_xv + nt
-            acc_nope[at][0] = acc_nope[at][0] + xv[nt][0] * sc0
-            acc_nope[at][1] = acc_nope[at][1] + xv[nt][1] * sc0
+            acc_nope[at][0] = acc_nope[at][0] + xv0 * sc0
+            acc_nope[at][1] = acc_nope[at][1] + xv1 * sc0
             if cutlass.const_expr(hi):
-                acc_nope[at][2] = acc_nope[at][2] + xv[nt][2] * sc1
-                acc_nope[at][3] = acc_nope[at][3] + xv[nt][3] * sc1
+                acc_nope[at][2] = acc_nope[at][2] + xv2 * sc1
+                acc_nope[at][3] = acc_nope[at][3] + xv3 * sc1
     return acc_nope
 
 
@@ -2291,6 +2477,9 @@ def s6_xv_nope_glm_h8_swap_ab(
 
     a_row = (lane & Int32(7)) + ((lane >> Int32(3)) & Int32(1)) * Int32(8)
     a_col = (lane >> Int32(4)) * Int32(16)
+    # W columns follow the permuted K axis of _d2_load_b_fp8_perm.
+    wcol0 = _w_perm_col(cand0)
+    wcol1 = _w_perm_col(cand1)
     for vc in cutlass.range_constexpr(n_v_chunks):
         w_fp8_addr = w_fp8_base_addr + Int32(vc & 1) * Int32(hpb * w_fp8_stride)
         si0 = w_head_sc_view[Int32(vc) * Int32(hpb) + head0 + Int32(8)]
@@ -2313,35 +2502,35 @@ def s6_xv_nope_glm_h8_swap_ab(
         r11 = _quant_e4m3_residual_byte(wn11)
 
         st_shared_u8(
-            w_fp8_addr + head0 * Int32(w_fp8_stride) + cand0,
+            w_fp8_addr + head0 * Int32(w_fp8_stride) + wcol0,
             f00.to(cutlass.Uint8),
         )
         st_shared_u8(
-            w_fp8_addr + head1 * Int32(w_fp8_stride) + cand0,
+            w_fp8_addr + head1 * Int32(w_fp8_stride) + wcol0,
             f01.to(cutlass.Uint8),
         )
         st_shared_u8(
-            w_fp8_addr + head0 * Int32(w_fp8_stride) + cand1,
+            w_fp8_addr + head0 * Int32(w_fp8_stride) + wcol1,
             f10.to(cutlass.Uint8),
         )
         st_shared_u8(
-            w_fp8_addr + head1 * Int32(w_fp8_stride) + cand1,
+            w_fp8_addr + head1 * Int32(w_fp8_stride) + wcol1,
             f11.to(cutlass.Uint8),
         )
         st_shared_u8(
-            w_fp8_addr + (head0 + Int32(8)) * Int32(w_fp8_stride) + cand0,
+            w_fp8_addr + (head0 + Int32(8)) * Int32(w_fp8_stride) + wcol0,
             r00.to(cutlass.Uint8),
         )
         st_shared_u8(
-            w_fp8_addr + (head1 + Int32(8)) * Int32(w_fp8_stride) + cand0,
+            w_fp8_addr + (head1 + Int32(8)) * Int32(w_fp8_stride) + wcol0,
             r01.to(cutlass.Uint8),
         )
         st_shared_u8(
-            w_fp8_addr + (head0 + Int32(8)) * Int32(w_fp8_stride) + cand1,
+            w_fp8_addr + (head0 + Int32(8)) * Int32(w_fp8_stride) + wcol1,
             r10.to(cutlass.Uint8),
         )
         st_shared_u8(
-            w_fp8_addr + (head1 + Int32(8)) * Int32(w_fp8_stride) + cand1,
+            w_fp8_addr + (head1 + Int32(8)) * Int32(w_fp8_stride) + wcol1,
             r11.to(cutlass.Uint8),
         )
         cute.arch.barrier(**bar_kw)
@@ -2362,7 +2551,7 @@ def s6_xv_nope_glm_h8_swap_ab(
                 ko = Int32(kstep) * Int32(32)
                 a_addr = w_fp8_addr + a_row * Int32(w_fp8_stride) + ko + a_col
                 a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(a_addr)
-                b0, b1 = _d2_load_b_fp8(
+                b0, b1 = _d2_load_b_fp8_perm(
                     kv_fp8_base_addr,
                     ko,
                     dim,
@@ -2519,6 +2708,9 @@ def s6_xv_nope_dsv4_h8_swap_ab(
         )
     a_row = (lane & Int32(7)) + ((lane >> Int32(3)) & Int32(1)) * Int32(8)
     a_col = (lane >> Int32(4)) * Int32(16)
+    # W columns follow the permuted K axis of _d2_load_b_fp8_perm.
+    wcol0 = _w_perm_col(cand0)
+    wcol1 = _w_perm_col(cand1)
     for vc in cutlass.range_constexpr(n_v_chunks):
         w_fp8_addr = w_fp8_base_addr + Int32(vc & 1) * Int32(hpb * w_fp8_stride)
         si0 = w_head_sc_view[Int32(vc) * Int32(hpb) + head0 + Int32(8)]
@@ -2539,19 +2731,19 @@ def s6_xv_nope_dsv4_h8_swap_ab(
         f10 = _quant_e4m3_byte(w_pre[2] * vsc1 * si0)
         f11 = _quant_e4m3_byte(w_pre[3] * vsc1 * si1)
         st_shared_u8(
-            w_fp8_addr + head0 * Int32(w_fp8_stride) + cand0,
+            w_fp8_addr + head0 * Int32(w_fp8_stride) + wcol0,
             f00.to(cutlass.Uint8),
         )
         st_shared_u8(
-            w_fp8_addr + head1 * Int32(w_fp8_stride) + cand0,
+            w_fp8_addr + head1 * Int32(w_fp8_stride) + wcol0,
             f01.to(cutlass.Uint8),
         )
         st_shared_u8(
-            w_fp8_addr + head0 * Int32(w_fp8_stride) + cand1,
+            w_fp8_addr + head0 * Int32(w_fp8_stride) + wcol1,
             f10.to(cutlass.Uint8),
         )
         st_shared_u8(
-            w_fp8_addr + head1 * Int32(w_fp8_stride) + cand1,
+            w_fp8_addr + head1 * Int32(w_fp8_stride) + wcol1,
             f11.to(cutlass.Uint8),
         )
         cute.arch.barrier(**bar_kw)
@@ -2569,7 +2761,7 @@ def s6_xv_nope_dsv4_h8_swap_ab(
                 ko = Int32(kstep) * Int32(32)
                 a_addr = w_fp8_addr + a_row * Int32(w_fp8_stride) + ko + a_col
                 a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(a_addr)
-                b0, b1 = _d2_load_b_fp8(
+                b0, b1 = _d2_load_b_fp8_perm(
                     kv_fp8_base_addr,
                     ko,
                     dim,
@@ -2848,6 +3040,20 @@ def s7_epilogue(
                         + ((gid + Int32(8)) * Int32(d_v) + d0 + Int32(1)) * Int32(2),
                         acc_nope[at][3] * inv_g1,
                     )
+            elif cutlass.const_expr(_ot == cutlass.BFloat16):
+                store_bf16x2(
+                    get_ptr_as_int64(out_o, cute.crd2idx((gid, d0), out_o.layout)),
+                    acc_nope[at][0] * inv_g0,
+                    acc_nope[at][1] * inv_g0,
+                )
+                if cutlass.const_expr(valid_hpb > 8):
+                    store_bf16x2(
+                        get_ptr_as_int64(
+                            out_o, cute.crd2idx((gid + Int32(8), d0), out_o.layout)
+                        ),
+                        acc_nope[at][2] * inv_g1,
+                        acc_nope[at][3] * inv_g1,
+                    )
             else:
                 out_o[gid, d0] = (acc_nope[at][0] * inv_g0).to(_ot)
                 out_o[gid, d0 + Int32(1)] = (acc_nope[at][1] * inv_g0).to(_ot)
@@ -2884,6 +3090,20 @@ def s7_epilogue(
                     st_shared_bf16_from_f32(
                         staging_base_addr
                         + ((gid + Int32(8)) * Int32(d_v) + rd0 + Int32(1)) * Int32(2),
+                        acc_rope[r + 3] * inv_g1,
+                    )
+            elif cutlass.const_expr(_ot == cutlass.BFloat16):
+                store_bf16x2(
+                    get_ptr_as_int64(out_o, cute.crd2idx((gid, rd0), out_o.layout)),
+                    acc_rope[r + 0] * inv_g0,
+                    acc_rope[r + 1] * inv_g0,
+                )
+                if cutlass.const_expr(valid_hpb > 8):
+                    store_bf16x2(
+                        get_ptr_as_int64(
+                            out_o, cute.crd2idx((gid + Int32(8), rd0), out_o.layout)
+                        ),
+                        acc_rope[r + 2] * inv_g1,
                         acc_rope[r + 3] * inv_g1,
                     )
             else:
@@ -2978,6 +3198,93 @@ def _quant_e4m3_residual_byte(v: Float32) -> Uint32:
     resid = vc - fp8_e4m3_to_f32(hi_byte)
     resid = fmax_f32(Float32(_FP8_MIN), fmin_f32(Float32(_FP8_MAX), resid))
     return cvt_f32_to_e4m3(resid) & Uint32(0xFF)
+
+
+@cute.jit
+def _d2_load_b_fp8_perm(
+    kv_fp8_base_addr: Int32,
+    entry_base: Int32,
+    dim: Int32,
+    lane: Int32,
+    *,
+    kv_smem_stride: cutlass.Constexpr,
+):
+    """B-operand synthesizer with a candidate-permuted K axis.
+
+    Same instruction mix as :func:`_d2_load_b_fp8` (8 LDS.32 + 6 prmt), but MMA
+    K index ``4*tid + j`` maps to candidate ``4*j + tid`` within each 16-wide
+    K block (and ``16 +`` the same for K in [16, 32)). At any one load, the
+    four lanes with equal ``j`` then read four consecutive candidate rows, so
+    the row-stride bank rotation places them in distinct banks; the identity
+    mapping read rows 0/4/8/12 and paid a 2-way conflict on every load. The W
+    (A operand) columns must be staged with the matching permutation, see
+    ``_w_perm_col``.
+    """
+    gid = lane >> Int32(2)
+    tid = lane & Int32(3)
+    d = dim + gid
+    d_base = d & ~Int32(3)
+    d_sel = d & Int32(3)
+    sel = ((Int32(4) + d_sel) << Int32(4)) | d_sel
+
+    r0 = ld_shared_u32(
+        kv_fp8_base_addr + (entry_base + tid) * Int32(kv_smem_stride) + d_base
+    )
+    r1 = ld_shared_u32(
+        kv_fp8_base_addr
+        + (entry_base + Int32(4) + tid) * Int32(kv_smem_stride)
+        + d_base
+    )
+    r2 = ld_shared_u32(
+        kv_fp8_base_addr
+        + (entry_base + Int32(8) + tid) * Int32(kv_smem_stride)
+        + d_base
+    )
+    r3 = ld_shared_u32(
+        kv_fp8_base_addr
+        + (entry_base + Int32(12) + tid) * Int32(kv_smem_stride)
+        + d_base
+    )
+    t01 = byte_perm(r0, r1, sel)
+    t23 = byte_perm(r2, r3, sel)
+    b0 = byte_perm(t01, t23, Int32(0x5410))
+
+    r0 = ld_shared_u32(
+        kv_fp8_base_addr
+        + (entry_base + Int32(16) + tid) * Int32(kv_smem_stride)
+        + d_base
+    )
+    r1 = ld_shared_u32(
+        kv_fp8_base_addr
+        + (entry_base + Int32(20) + tid) * Int32(kv_smem_stride)
+        + d_base
+    )
+    r2 = ld_shared_u32(
+        kv_fp8_base_addr
+        + (entry_base + Int32(24) + tid) * Int32(kv_smem_stride)
+        + d_base
+    )
+    r3 = ld_shared_u32(
+        kv_fp8_base_addr
+        + (entry_base + Int32(28) + tid) * Int32(kv_smem_stride)
+        + d_base
+    )
+    t01 = byte_perm(r0, r1, sel)
+    t23 = byte_perm(r2, r3, sel)
+    b1 = byte_perm(t01, t23, Int32(0x5410))
+    return b0, b1
+
+
+@cute.jit
+def _w_perm_col(cand: Int32) -> Int32:
+    """W column (MMA K index) holding ``cand`` under the permuted K axis.
+
+    Inverse of the ``_d2_load_b_fp8_perm`` mapping: candidate ``c`` within a
+    16-block sits at K ``4*(c & 3) + (c >> 2)``.
+    """
+    blk = cand & ~Int32(15)
+    c = cand & Int32(15)
+    return blk + (c & Int32(3)) * Int32(4) + (c >> Int32(2))
 
 
 @cute.jit

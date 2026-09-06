@@ -26,19 +26,35 @@ def test_common_models_expand_across_tp1_through_tp16() -> None:
         for alias in geometry.aliases
     }
 
+    recipes_by_family = {
+        family: tuple(
+            recipe
+            for recipe in MOE_RECIPES
+            if recipe.family_id == family
+        )
+        for family in {recipe.family_id for recipe in MOE_RECIPES}
+    }
     for model in COMMON_MOE_MODELS:
-        for recipe_id in model.recipe_ids:
-            for tp_size in COMMON_TP_SIZES:
-                assert (model.model_id, recipe_id, tp_size) in covered
+        for family in model.recipe_families:
+            recipes = (
+                recipe
+                for recipe in recipes_by_family[family]
+                if model.activation in recipe.compatible_activations
+            )
+            for recipe in recipes:
+                for tp_size in COMMON_TP_SIZES:
+                    assert (model.model_id, recipe.recipe_id, tp_size) in covered
 
 
 def test_unaligned_three_wide_shard_is_padded_instead_of_rejected() -> None:
     recipe = MoeRecipe(
         recipe_id="nvfp4-test",
+        family_id="test",
         quant_mode="nvfp4",
         source_format="modelopt_nvfp4",
         intermediate_alignment=16,
         minimum_intermediate_size=16,
+        compatible_activations=("silu",),
     )
     model = MoeModelGeometry(
         model_id="small-test",
@@ -47,7 +63,7 @@ def test_unaligned_three_wide_shard_is_padded_instead_of_rejected() -> None:
         num_experts=16,
         native_top_k=2,
         activation="silu",
-        recipe_ids=(recipe.recipe_id,),
+        recipe_families=(recipe.family_id,),
         source="test",
         tp_sizes=(16,),
     )
@@ -63,13 +79,53 @@ def test_unaligned_three_wide_shard_is_padded_instead_of_rejected() -> None:
     assert alias.padding_per_tp_group == 209
 
 
+def test_recipe_families_expand_only_activation_compatible_recipes() -> None:
+    recipes = (
+        MoeRecipe(
+            recipe_id="silu-recipe",
+            family_id="shared-family",
+            quant_mode="nvfp4",
+            source_format="modelopt_nvfp4",
+            intermediate_alignment=16,
+            minimum_intermediate_size=16,
+            compatible_activations=("silu",),
+        ),
+        MoeRecipe(
+            recipe_id="relu-recipe",
+            family_id="shared-family",
+            quant_mode="w4a16",
+            source_format="modelopt_nvfp4",
+            intermediate_alignment=64,
+            minimum_intermediate_size=64,
+            compatible_activations=("relu2",),
+        ),
+    )
+    model = MoeModelGeometry(
+        model_id="silu-model",
+        hidden_size=256,
+        intermediate_size=96,
+        num_experts=16,
+        native_top_k=2,
+        activation="silu",
+        recipe_families=("shared-family",),
+        source="test",
+        tp_sizes=(1,),
+    )
+
+    geometries = expand_physical_geometries(models=(model,), recipes=recipes)
+
+    assert [geometry.recipe.recipe_id for geometry in geometries] == ["silu-recipe"]
+
+
 def test_three_wide_trellis_shard_uses_the_kernel_minimum() -> None:
     recipe = MoeRecipe(
         recipe_id="trellis-test",
+        family_id="test",
         quant_mode="w4a16",
         source_format="btx",
         intermediate_alignment=256,
         minimum_intermediate_size=256,
+        compatible_activations=("silu",),
         trellis_variant="k3-sqg-uniform-coupled",
     )
     model = MoeModelGeometry(
@@ -79,7 +135,7 @@ def test_three_wide_trellis_shard_uses_the_kernel_minimum() -> None:
         num_experts=16,
         native_top_k=2,
         activation="silu",
-        recipe_ids=(recipe.recipe_id,),
+        recipe_families=(recipe.family_id,),
         source="test",
         tp_sizes=(16,),
     )
@@ -97,10 +153,12 @@ def test_three_wide_trellis_shard_uses_the_kernel_minimum() -> None:
 def test_three_wide_modelopt_w4a16_shard_uses_the_main_kernel_minimum() -> None:
     recipe = MoeRecipe(
         recipe_id="modelopt-w4a16-test",
+        family_id="test",
         quant_mode="w4a16",
         source_format="modelopt_nvfp4",
         intermediate_alignment=64,
         minimum_intermediate_size=64,
+        compatible_activations=("silu",),
     )
     model = MoeModelGeometry(
         model_id="small-w4a16-test",
@@ -109,7 +167,7 @@ def test_three_wide_modelopt_w4a16_shard_uses_the_main_kernel_minimum() -> None:
         num_experts=16,
         native_top_k=2,
         activation="silu",
-        recipe_ids=(recipe.recipe_id,),
+        recipe_families=(recipe.family_id,),
         source="test",
         tp_sizes=(16,),
     )
@@ -144,10 +202,12 @@ def test_nondivisible_tp_shards_share_one_padded_physical_geometry() -> None:
 def test_sweep_deduplicates_model_aliases_before_crossing_runtime_axes() -> None:
     recipe = MoeRecipe(
         recipe_id="same",
+        family_id="test",
         quant_mode="nvfp4",
         source_format="modelopt_nvfp4",
         intermediate_alignment=16,
         minimum_intermediate_size=16,
+        compatible_activations=("silu",),
     )
     shared = {
         "hidden_size": 256,
@@ -155,7 +215,7 @@ def test_sweep_deduplicates_model_aliases_before_crossing_runtime_axes() -> None
         "num_experts": 16,
         "native_top_k": 2,
         "activation": "silu",
-        "recipe_ids": (recipe.recipe_id,),
+        "recipe_families": (recipe.family_id,),
         "source": "test",
         "tp_sizes": (1,),
     }
@@ -183,8 +243,8 @@ def test_default_sweep_has_stable_complete_cross_product() -> None:
     geometries = expand_physical_geometries()
     cases = expand_sweep_cases(geometries=geometries)
 
-    assert len(geometries) == 253
-    assert len(cases) == 138_652
+    assert len(geometries) == 421
+    assert len(cases) == 230_724
     assert {case.num_tokens for case in cases} == set(COMMON_PLAN_TOKEN_COUNTS)
     assert {case.route_pattern for case in cases} == set(COMMON_ROUTE_PATTERNS)
     assert len({case.case_id for case in cases}) == len(cases)
@@ -213,9 +273,19 @@ def test_glm_benchmark_recipes_expand_across_all_profiled_tp_sizes() -> None:
     }
 
     for tp_size in COMMON_TP_SIZES:
+        assert ("glm-5.3", "nvfp4", tp_size) in covered
+        assert ("glm-5.3", "w4a16", tp_size) in covered
         assert ("glm-5.2", "w4a8_nvfp4", tp_size) in covered
         assert ("glm-5.3-flash", "nvfp4", tp_size) in covered
         assert ("glm-5.3-flash", "w4a16", tp_size) in covered
+
+
+def test_modelopt_w4a8_corpus_excludes_non_route_complete_relu2_pairs() -> None:
+    assert not any(
+        geometry.recipe.recipe_id == "modelopt-w4a8-nvfp4"
+        and geometry.activation == "relu2"
+        for geometry in expand_physical_geometries()
+    )
 
 
 def test_moe_benchmark_preset_catalog_is_fully_mapped_to_the_corpus() -> None:
@@ -225,6 +295,7 @@ def test_moe_benchmark_preset_catalog_is_fully_mapped_to_the_corpus() -> None:
         "dsv4f-nvfp4",
         "glm51",
         "glm52",
+        "glm53-flash",
         "glm53-flash-shape",
         "laguna-s21-shape",
         "minimax-m27",
@@ -243,9 +314,11 @@ def test_moe_benchmark_preset_catalog_is_fully_mapped_to_the_corpus() -> None:
     recipes = {recipe.recipe_id: recipe for recipe in MOE_RECIPES}
     for preset in MOE_BENCHMARK_PRESETS:
         assert preset.model_id in models
-        assert preset.recipe_id in models[preset.model_id].recipe_ids
+        recipe = recipes[preset.recipe_id]
+        assert recipe.family_id in models[preset.model_id].recipe_families
+        assert models[preset.model_id].activation in recipe.compatible_activations
         benchmark = MODEL_PROFILES[preset.preset_id]
         assert preset.tp_size == benchmark.tp_size
-        assert recipes[preset.recipe_id].quant_mode == (
+        assert recipe.quant_mode == (
             benchmark.default_quant_mode or "nvfp4"
         )

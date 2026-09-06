@@ -35,7 +35,10 @@ class CheckpointStore:
         path = self._path(component_id, key)
         if not path.is_file():
             return None
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return None
         if not isinstance(payload, dict):
             raise TypeError(f"checkpoint {path} must contain an object")
         return payload

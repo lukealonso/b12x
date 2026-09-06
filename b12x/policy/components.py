@@ -9,11 +9,13 @@ MOE_DECODE = "moe.decode"
 QSA_ATTENTION = "attention.qsa"
 SPARSE_MLA_ATTENTION = "attention.sparse_mla"
 VARLEN_ATTENTION = "attention.varlen"
+BLOCKSCALED_PRECISION = "gemm.blockscaled_precision"
 BLOCK_FP8_LINEAR = "gemm.block_fp8_linear"
 BF16_VOCAB_PROJECTION = "gemm.bf16_vocab_projection"
 WO_PROJECTION = "gemm.wo_projection"
 EP_MOE = "moe.ep_moe"
 HYPERCONNECTION = "norm.hyperconnection"
+KDA_PREFILL = "sequence.kda_prefill"
 MHC = "norm.mhc"
 NVFP4_QUANTIZATION = "quantization.nvfp4"
 MTP_FEEDBACK = "sequence.mtp_feedback"
@@ -22,6 +24,7 @@ PLE_EMBEDDING = "sequence.ple_embedding"
 PLE_HASH = "sequence.ple_hash"
 
 __all__ = [
+    "BLOCKSCALED_PRECISION",
     "BLOCK_FP8_LINEAR",
     "BF16_VOCAB_PROJECTION",
     "COMPRESSED_SPARSE_MLA_ATTENTION",
@@ -30,6 +33,7 @@ __all__ = [
     "GDN_ATTENTION",
     "GQA_ATTENTION",
     "HYPERCONNECTION",
+    "KDA_PREFILL",
     "MLA_ATTENTION",
     "MHC",
     "MOE_DECODE",

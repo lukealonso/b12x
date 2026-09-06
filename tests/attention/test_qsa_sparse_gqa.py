@@ -269,9 +269,7 @@ def test_cute_candidate_accepts_all_qwen_rows_for_interleaved_blh_cache_views(
                 ),
                 torch.float32,
             ),
-            partial_lse=_CandidateTensor(
-                (rows, splits, q_heads), torch.float32
-            ),
+            partial_lse=_CandidateTensor((rows, splits, q_heads), torch.float32),
             block_n=cute_config.BLOCK_N,
             splits=splits,
         )
@@ -279,7 +277,7 @@ def test_cute_candidate_accepts_all_qwen_rows_for_interleaved_blh_cache_views(
     )
 
 
-def test_qwen_split_policy_does_not_route_large_rows_to_triton() -> None:
+def test_qwen_split_policy_uses_unsplit_large_rows() -> None:
     caps = SimpleNamespace(
         q_heads=12,
         kv_heads=1,
@@ -291,6 +289,8 @@ def test_qwen_split_policy_does_not_route_large_rows_to_triton() -> None:
     assert _target_splits(caps, 1) == (16, 64)
     assert _target_splits(caps, 4) == (16, 32)
     assert _target_splits(caps, 32) == (16, 16)
+    assert _target_splits(caps, 64) == (16, 16)
+    assert _target_splits(caps, 65) == (16, 1)
 
     with pytest.raises(NotImplementedError, match="requires the CuTe Qwen"):
         _target_splits(
@@ -383,6 +383,66 @@ def test_non_qwen_geometry_has_no_sparse_gqa_fallback(
         )
 
 
+def test_large_prefill_rejects_layouts_not_supported_by_selected_abi() -> None:
+    device = require_sm120()
+    rows, q_heads, kv_heads, head_dim = 65, 6, 1, 256
+    query = torch.empty(
+        (q_heads, rows, head_dim), dtype=torch.bfloat16, device=device
+    ).transpose(0, 1)
+    key_cache = torch.empty(
+        (1, 16, kv_heads, head_dim), dtype=torch.bfloat16, device=device
+    )
+    value_cache = torch.empty_like(key_cache)
+    block_table = torch.zeros((1, 1), dtype=torch.int32, device=device)
+    request_ids = torch.zeros((rows,), dtype=torch.int64, device=device)
+    selected_positions = torch.full((rows, 2051), -1, dtype=torch.int32, device=device)
+    query_positions = torch.zeros((rows,), dtype=torch.int64, device=device)
+    output = torch.empty(
+        (q_heads, rows, head_dim), dtype=torch.bfloat16, device=device
+    ).transpose(0, 1)
+    launch_kwargs = {
+        "key_cache": key_cache,
+        "value_cache": value_cache,
+        "block_table": block_table,
+        "request_ids": request_ids,
+        "selected_positions": selected_positions,
+        "query_positions": query_positions,
+        "partial_output": None,
+        "partial_lse": None,
+        "softmax_scale": 1.0 / math.sqrt(head_dim),
+        "block_n": 16,
+        "splits": 1,
+    }
+
+    with pytest.raises(ValueError, match="query must be contiguous"):
+        launch_sparse_paged_gqa(
+            query=query,
+            output=query.contiguous(),
+            **launch_kwargs,
+        )
+
+    with pytest.raises(ValueError, match="output must be contiguous"):
+        launch_sparse_paged_gqa(
+            query=query.contiguous(),
+            output=output,
+            **launch_kwargs,
+        )
+
+    overlapping_cache = torch.empty(
+        16 + head_dim,
+        dtype=torch.bfloat16,
+        device=device,
+    ).as_strided((1, 16, kv_heads, head_dim), (16, 1, head_dim, 1))
+    launch_kwargs["key_cache"] = overlapping_cache
+    launch_kwargs["value_cache"] = overlapping_cache
+    with pytest.raises(ValueError, match="must have non-overlapping rows"):
+        launch_sparse_paged_gqa(
+            query=query.contiguous(),
+            output=query.contiguous(),
+            **launch_kwargs,
+        )
+
+
 @pytest.mark.parametrize(
     (
         "rows",
@@ -395,10 +455,10 @@ def test_non_qwen_geometry_has_no_sparse_gqa_fallback(
         "splits",
         "layout",
     ),
-        [
-            (1, 24, 2, 256, 16, 2051, 16, 64, "contiguous"),
-            (1, 8, 2, 256, 16, 2051, 16, 64, "contiguous"),
-            (1, 6, 1, 256, 16, 2051, 16, 64, "interleaved_page"),
+    [
+        (1, 24, 2, 256, 16, 2051, 16, 64, "contiguous"),
+        (1, 8, 2, 256, 16, 2051, 16, 64, "contiguous"),
+        (1, 6, 1, 256, 16, 2051, 16, 64, "interleaved_page"),
         (5, 12, 1, 256, 16, 2051, 16, 64, "interleaved_page"),
     ],
 )
@@ -511,6 +571,176 @@ def test_sparse_gqa_matches_gathered_dense_reference(
         softmax_scale,
     )
     torch.testing.assert_close(actual, expected, rtol=0.0, atol=2e-2)
+
+
+@pytest.mark.parametrize("page_size", [16, 3008])
+@pytest.mark.parametrize(
+    "kv_dtype",
+    [torch.bfloat16, torch.float8_e4m3fn],
+    ids=["bf16", "fp8_e4m3"],
+)
+def test_large_prefill_sparse_gqa_addresses_paged_cache(
+    page_size: int,
+    kv_dtype: torch.dtype,
+) -> None:
+    device = require_sm120()
+    rows, q_heads, kv_heads, head_dim = 65, 24, 2, 256
+    pages, batches = 4, 2
+    storage = torch.randn(
+        (pages, 2, page_size, kv_heads, head_dim),
+        dtype=torch.bfloat16,
+        device=device,
+    ).to(kv_dtype)
+    key_cache, value_cache = storage.unbind(1)
+    block_table = torch.tensor([[2, 0], [1, 3]], dtype=torch.int32, device=device)
+    request_ids = torch.arange(rows, dtype=torch.int64, device=device) % batches
+    request_ids[-1] = -1
+    query_positions = torch.zeros(rows, dtype=torch.int64, device=device)
+    selected_positions = torch.full((rows, 2051), -1, dtype=torch.int32, device=device)
+    selected_positions[:, 0] = 0
+    query = torch.randn((rows, q_heads, head_dim), dtype=torch.bfloat16, device=device)
+    output = torch.full_like(query, float("nan"))
+    k_descale = None
+    v_descale = None
+    value_scale = 1.0
+    if kv_dtype == torch.float8_e4m3fn:
+        k_descale = torch.tensor([0.125], dtype=torch.float32, device=device)
+        v_descale = torch.tensor([0.125], dtype=torch.float32, device=device)
+        value_scale = float(v_descale)
+
+    actual = launch_sparse_paged_gqa(
+        query=query,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        block_table=block_table,
+        request_ids=request_ids,
+        selected_positions=selected_positions,
+        query_positions=query_positions,
+        output=output,
+        partial_output=None,
+        partial_lse=None,
+        softmax_scale=1.0 / math.sqrt(head_dim),
+        block_n=16,
+        splits=1,
+    )
+
+    expected = torch.zeros_like(query)
+    heads_per_kv = q_heads // kv_heads
+    for row in range(rows - 1):
+        request = int(request_ids[row])
+        physical_page = int(block_table[request, 0])
+        expected[row].copy_(
+            (value_cache[physical_page, 0].float() * value_scale)
+            .repeat_interleave(heads_per_kv, dim=0)
+            .to(torch.bfloat16)
+        )
+    torch.testing.assert_close(actual, expected, rtol=0.0, atol=2e-3)
+
+
+@pytest.mark.parametrize(
+    "kv_dtype",
+    [torch.bfloat16, torch.float8_e4m3fn],
+    ids=["bf16", "fp8_e4m3"],
+)
+@pytest.mark.parametrize("direct_kv_warps", [1, 2, 4])
+def test_large_prefill_selected_paged_gqa_matches_split_for_full_selection(
+    kv_dtype: torch.dtype,
+    direct_kv_warps: int,
+) -> None:
+    from b12x.attention.qsa._sparse_gqa_cute import (
+        launch_selected_paged_gqa_direct,
+        launch_sparse_gqa_merge,
+        launch_sparse_gqa_split,
+    )
+
+    device = require_sm120()
+    rows, q_heads, kv_heads, head_dim = 65, 24, 2, 256
+    page_size, pages, selection_width = 3008, 4, 2051
+    generator = torch.Generator(device="cpu").manual_seed(93865)
+    source = torch.randn(
+        (pages, 2, page_size, kv_heads, head_dim),
+        generator=generator,
+        dtype=torch.bfloat16,
+        device="cpu",
+    ).to(device)
+    k_descale = None
+    v_descale = None
+    if kv_dtype == torch.float8_e4m3fn:
+        k_descale = torch.tensor([0.125], dtype=torch.float32, device=device)
+        v_descale = torch.tensor([0.125], dtype=torch.float32, device=device)
+        storage = torch.empty_like(source, dtype=kv_dtype)
+        storage[:, 0].copy_((source[:, 0].float() / k_descale).to(kv_dtype))
+        storage[:, 1].copy_((source[:, 1].float() / v_descale).to(kv_dtype))
+    else:
+        storage = source
+    key_cache, value_cache = storage.unbind(1)
+    block_table = torch.arange(pages, dtype=torch.int32, device=device).view(1, -1)
+    request_ids = torch.zeros(rows, dtype=torch.int64, device=device)
+    query_positions = torch.full(
+        (rows,), pages * page_size - 1, dtype=torch.int64, device=device
+    )
+    selected = torch.randperm(
+        pages * page_size, generator=generator, dtype=torch.int64
+    )[:selection_width]
+    selected_positions = (
+        selected.to(device=device, dtype=torch.int32)
+        .view(1, -1)
+        .expand(rows, -1)
+        .contiguous()
+    )
+    query = torch.randn(
+        (rows, q_heads, head_dim),
+        generator=generator,
+        dtype=torch.bfloat16,
+        device="cpu",
+    ).to(device)
+    direct_output = torch.empty_like(query)
+    cute_output = torch.empty_like(query)
+    split_output = torch.empty(
+        (rows, 16, q_heads, head_dim), dtype=torch.float32, device=device
+    )
+    split_lse = torch.empty((rows, 16, q_heads), dtype=torch.float32, device=device)
+    scale = 1.0 / math.sqrt(head_dim)
+
+    launch_selected_paged_gqa_direct(
+        query=query,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        block_table=block_table,
+        request_ids=request_ids,
+        selected_positions=selected_positions,
+        query_positions=query_positions,
+        output=direct_output,
+        softmax_scale=scale,
+        kv_warps=direct_kv_warps,
+    )
+    launch_sparse_gqa_split(
+        query=query,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        block_table=block_table,
+        request_ids=request_ids,
+        selected_positions=selected_positions,
+        query_positions=query_positions,
+        partial_output=split_output,
+        partial_lse=split_lse,
+        softmax_scale=scale,
+        splits=16,
+    )
+    launch_sparse_gqa_merge(
+        partial_output=split_output,
+        partial_lse=split_lse,
+        output=cute_output,
+        rows=rows,
+        splits=16,
+    )
+    torch.testing.assert_close(direct_output, cute_output, rtol=0.0, atol=3e-2)
 
 
 def test_sparse_gqa_matches_reference_for_1504_token_pages() -> None:
@@ -814,25 +1044,99 @@ def test_sparse_gqa_split_path_is_cuda_graph_replay_safe() -> None:
     torch.testing.assert_close(captured_output, expected, rtol=0.0, atol=2e-2)
 
 
-def test_sparse_gqa_reuses_binaries_across_runtime_rows_and_page_sizes(
+@pytest.mark.parametrize("request_id_dtype", [torch.int32, torch.int64])
+def test_selected_paged_gqa_direct_path_is_cuda_graph_replay_safe(
+    request_id_dtype: torch.dtype,
+) -> None:
+    device = require_sm120()
+    rows, q_heads, kv_heads, head_dim = 65, 24, 2, 256
+    page_size = 16
+    query = torch.randn((rows, q_heads, head_dim), dtype=torch.bfloat16, device=device)
+    key_cache = torch.randn(
+        (1, page_size, kv_heads, head_dim),
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    value_cache = torch.randn_like(key_cache)
+    block_table = torch.zeros((1, 1), dtype=torch.int32, device=device)
+    request_ids = torch.zeros((rows,), dtype=request_id_dtype, device=device)
+    query_positions = torch.zeros((rows,), dtype=torch.int64, device=device)
+    selected_positions = torch.full((rows, 2051), -1, dtype=torch.int32, device=device)
+    selected_positions[:, 0] = 0
+    output = torch.empty_like(query)
+    scale = 1.0 / math.sqrt(head_dim)
+
+    launch_sparse_paged_gqa(
+        query=query,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        block_table=block_table,
+        request_ids=request_ids,
+        selected_positions=selected_positions,
+        query_positions=query_positions,
+        output=output,
+        partial_output=None,
+        partial_lse=None,
+        softmax_scale=scale,
+        block_n=16,
+        splits=1,
+        direct_kv_warps=4,
+    )
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured_output = launch_sparse_paged_gqa(
+            query=query,
+            key_cache=key_cache,
+            value_cache=value_cache,
+            block_table=block_table,
+            request_ids=request_ids,
+            selected_positions=selected_positions,
+            query_positions=query_positions,
+            output=output,
+            partial_output=None,
+            partial_lse=None,
+            softmax_scale=scale,
+            block_n=16,
+            splits=1,
+            direct_kv_warps=4,
+        )
+
+    value_cache.copy_(torch.randn_like(value_cache))
+    allocated_before = torch.cuda.memory_allocated(device)
+    graph.replay()
+    torch.cuda.synchronize(device)
+    allocated_after = torch.cuda.memory_allocated(device)
+    expected = (
+        value_cache[0, 0]
+        .repeat_interleave(q_heads // kv_heads, dim=0)
+        .unsqueeze(0)
+        .expand(rows, -1, -1)
+    )
+    assert allocated_after == allocated_before
+    assert captured_output.data_ptr() == output.data_ptr()
+    torch.testing.assert_close(captured_output, expected, rtol=0.0, atol=0.0)
+
+
+def test_sparse_gqa_reuses_direct_binary_across_runtime_rows(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from b12x._lib.runtime_control import (
         freeze_kernel_resolution,
         unfreeze_kernel_resolution,
     )
-    from b12x.attention.qsa import _sparse_gqa_cute as cute_impl
+    from b12x.attention.paged import _selected_forward as selected_impl
 
     device = require_sm120()
     q_heads, kv_heads, head_dim = 6, 1, 256
     compile_targets: list[str] = []
-    original_compile = cute_impl.b12x_compile
+    original_compile = selected_impl.b12x_compile
 
     def traced_compile(target: object, *args: object, **kwargs: object) -> object:
         compile_targets.append(type(target).__name__)
         return original_compile(target, *args, **kwargs)
 
-    def launch(rows: int, page_size: int, splits: int) -> torch.Tensor:
+    def launch(rows: int) -> torch.Tensor:
+        page_size = 16
         query = torch.randn(
             (rows, q_heads, head_dim), dtype=torch.bfloat16, device=device
         )
@@ -847,12 +1151,6 @@ def test_sparse_gqa_reuses_binaries_across_runtime_rows_and_page_sizes(
         )
         query_positions = torch.zeros((rows,), dtype=torch.int64, device=device)
         output = torch.empty_like(query)
-        partial_output = torch.empty(
-            (rows, splits, q_heads, head_dim), dtype=torch.float32, device=device
-        )
-        partial_lse = torch.empty(
-            (rows, splits, q_heads), dtype=torch.float32, device=device
-        )
         return launch_sparse_paged_gqa(
             query=query,
             key_cache=key_cache,
@@ -862,27 +1160,86 @@ def test_sparse_gqa_reuses_binaries_across_runtime_rows_and_page_sizes(
             selected_positions=selected_positions,
             query_positions=query_positions,
             output=output,
-            partial_output=partial_output,
-            partial_lse=partial_lse,
+            partial_output=None,
+            partial_lse=None,
             softmax_scale=1.0 / math.sqrt(head_dim),
             block_n=16,
-            splits=splits,
+            splits=1,
+            direct_kv_warps=4,
         )
 
-    cute_impl.clear_caches()
-    monkeypatch.setattr(cute_impl, "b12x_compile", traced_compile)
+    selected_impl.clear_caches()
+    monkeypatch.setattr(selected_impl, "b12x_compile", traced_compile)
     try:
-        assert torch.count_nonzero(launch(1, 16, 64)).item() == 0
+        assert torch.count_nonzero(launch(65)).item() == 0
         compiled_after_first_launch = tuple(compile_targets)
-        assert compiled_after_first_launch.count("_SparseGqaSplitKernel") == 1
-        assert compiled_after_first_launch.count("_SparseGqaMergeKernel") == 1
+        assert (
+            compiled_after_first_launch.count("_SelectedPositionPagedForwardKernel")
+            == 1
+        )
 
         freeze_kernel_resolution("QSA runtime-row cache reuse test")
-        assert torch.count_nonzero(launch(17, 3008, 8)).item() == 0
-        assert tuple(compile_targets) == compiled_after_first_launch
+        for rows in (128, 1_024):
+            assert torch.count_nonzero(launch(rows)).item() == 0
+            assert tuple(compile_targets) == compiled_after_first_launch
     finally:
         unfreeze_kernel_resolution()
-        cute_impl.clear_caches()
+        selected_impl.clear_caches()
+
+
+def test_large_prefill_direct_path_does_not_touch_split_scratch() -> None:
+    device = require_sm120()
+    rows, q_heads, kv_heads, head_dim = 65, 6, 1, 256
+    query = torch.randn((rows, q_heads, head_dim), dtype=torch.bfloat16, device=device)
+    key_cache = torch.randn(
+        (1, 16, kv_heads, head_dim), dtype=torch.bfloat16, device=device
+    )
+    value_cache = torch.randn_like(key_cache)
+    block_table = torch.zeros((1, 1), dtype=torch.int32, device=device)
+    request_ids = torch.zeros((rows,), dtype=torch.int64, device=device)
+    query_positions = torch.zeros((rows,), dtype=torch.int64, device=device)
+    selected_positions = torch.full((rows, 2051), -1, dtype=torch.int32, device=device)
+    selected_positions[:, 0] = 0
+    output = torch.empty_like(query)
+    partial_output = torch.full(
+        (rows, 64, q_heads, head_dim),
+        float("nan"),
+        dtype=torch.float32,
+        device=device,
+    )
+    partial_lse = torch.full(
+        (rows, 64, q_heads),
+        float("nan"),
+        dtype=torch.float32,
+        device=device,
+    )
+    partial_output_before = partial_output.clone()
+    partial_lse_before = partial_lse.clone()
+
+    launch_sparse_paged_gqa(
+        query=query,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        block_table=block_table,
+        request_ids=request_ids,
+        selected_positions=selected_positions,
+        query_positions=query_positions,
+        output=output,
+        partial_output=partial_output,
+        partial_lse=partial_lse,
+        softmax_scale=1.0 / math.sqrt(head_dim),
+        block_n=16,
+        splits=1,
+        direct_kv_warps=2,
+    )
+    torch.cuda.synchronize(device)
+
+    torch.testing.assert_close(
+        partial_output, partial_output_before, rtol=0.0, atol=0.0, equal_nan=True
+    )
+    torch.testing.assert_close(
+        partial_lse, partial_lse_before, rtol=0.0, atol=0.0, equal_nan=True
+    )
 
 
 @pytest.mark.parametrize(
@@ -894,7 +1251,7 @@ def test_sparse_gqa_uses_int64_for_high_physical_page_offsets(
     kv_dtype: torch.dtype,
 ) -> None:
     device = require_sm120()
-    rows, q_heads, kv_heads, head_dim = 1, 24, 2, 256
+    rows, q_heads, kv_heads, head_dim = 65, 24, 2, 256
     page_size = 16
     page_stride_elements = page_size * kv_heads * head_dim
     tail_page = math.ceil((1 << 31) / page_stride_elements)
@@ -933,8 +1290,8 @@ def test_sparse_gqa_uses_int64_for_high_physical_page_offsets(
     k_descale = None
     v_descale = None
     if kv_dtype == torch.float8_e4m3fn:
-        k_descale = torch.tensor([0.01], dtype=torch.float32, device=device)
-        v_descale = torch.tensor([0.01], dtype=torch.float32, device=device)
+        k_descale = torch.tensor([0.015625], dtype=torch.float32, device=device)
+        v_descale = torch.tensor([0.015625], dtype=torch.float32, device=device)
         live_value = (source_value.float() / v_descale).to(kv_dtype)
         expected_value = (live_value.float() * v_descale).to(torch.bfloat16)
     else:
@@ -946,15 +1303,8 @@ def test_sparse_gqa_uses_int64_for_high_physical_page_offsets(
     request_ids = torch.zeros((rows,), dtype=torch.int64, device=device)
     query_positions = torch.zeros((rows,), dtype=torch.int64, device=device)
     selected_positions = torch.full((rows, 2051), -1, dtype=torch.int32, device=device)
-    selected_positions[0, 0] = 0
+    selected_positions[:, 0] = 0
     output = torch.empty_like(query)
-    splits = 64
-    partial_output = torch.empty(
-        (rows, splits, q_heads, head_dim), dtype=torch.float32, device=device
-    )
-    partial_lse = torch.empty(
-        (rows, splits, q_heads), dtype=torch.float32, device=device
-    )
     actual = launch_sparse_paged_gqa(
         query=query,
         key_cache=cache,
@@ -966,13 +1316,18 @@ def test_sparse_gqa_uses_int64_for_high_physical_page_offsets(
         selected_positions=selected_positions,
         query_positions=query_positions,
         output=output,
-        partial_output=partial_output,
-        partial_lse=partial_lse,
+        partial_output=None,
+        partial_lse=None,
         softmax_scale=1.0 / math.sqrt(head_dim),
         block_n=16,
-        splits=splits,
+        splits=1,
+        direct_kv_warps=4,
     )
-    expected = torch.stack(
-        [expected_value[head // (q_heads // kv_heads)] for head in range(q_heads)]
-    ).unsqueeze(0)
+    expected = (
+        torch.stack(
+            [expected_value[head // (q_heads // kv_heads)] for head in range(q_heads)]
+        )
+        .unsqueeze(0)
+        .expand(rows, -1, -1)
+    )
     torch.testing.assert_close(actual, expected, rtol=0.0, atol=0.0)

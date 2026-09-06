@@ -49,6 +49,19 @@ _DEVICE = DeviceIdentity(
 )
 
 
+def test_checkpoint_store_treats_truncated_checkpoint_as_cache_miss(
+    tmp_path: Path,
+) -> None:
+    checkpoints = CheckpointStore(tmp_path / "checkpoints")
+    path = checkpoints.save("test.component", "case", {"complete": True})
+    path.write_text("", encoding="utf-8")
+
+    assert checkpoints.load("test.component", "case") is None
+
+    checkpoints.save("test.component", "case", {"complete": True})
+    assert checkpoints.load("test.component", "case") == {"complete": True}
+
+
 def test_default_measurement_protocol_is_two_warmups_and_five_by_five() -> None:
     settings = GenerationSettings()
     args = _parser().parse_args([])

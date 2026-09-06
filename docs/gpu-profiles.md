@@ -49,6 +49,14 @@ runtime-policy and generator registrations. Package loading rejects an embedded
 profile that omits a registered component. The component schema is validated
 before a matching config is returned; invalid matching data fails closed.
 
+One-shot `gemm.blockscaled` participates through the separate catalog inventory
+`ONESHOT_COMPONENTS`. Its `gemm.blockscaled_precision` policy resolves static
+weight geometry during prewarm; live M selects a precision route from
+that cached config. Graph replay retains the captured route. This does not
+introduce a public GEMM planning API. See
+[dense GEMM activation precision](dense-gemm-precision.md) for shared weight
+storage, workspace, and qualification contracts.
+
 ## Precedence and overrides
 
 Resolution order is:
@@ -101,6 +109,8 @@ provenance. It performs policy lookup only and does not allocate model weights:
     --tp 4 --device gb10
 ./scripts/inspect_model_policy.py glm-5.2 \
     --tp 8 --device gb10
+./scripts/inspect_model_policy.py glm-5.3 \
+    --tp 8 --device nvidia.rtx.pro.6000.blackwell
 ./scripts/inspect_model_policy.py glm-5.3-flash \
     --tp 4 --device gb10
 ./scripts/inspect_model_policy.py qwen3.8-27b \
@@ -201,6 +211,12 @@ shapes, GQA context/page/KV-dtype combinations, and dense and sparse MLA shapes.
 Unaligned low-width MoE shards are padded to their recipe's physical minimum
 instead of being discarded.
 
+MoE model entries declare compatible checkpoint-format families rather than a
+single benchmark recipe. Generation crosses each geometry with every recipe in
+that family that supports the model activation, so ModelOpt NVFP4, W4A16, and
+W4A8 variants share geometry coverage without pretending unsupported
+activation/recipe pairs are runnable.
+
 Attention serving capacities are dense from one through sixteen sequences and
 then use 32, 64, 128, and 256 as larger anchors. Components with a prefill path
 also capture 1,024, 2,048, 4,096, and 8,192 query-token capacities. GDN
@@ -209,11 +225,25 @@ whether an integrator calls the corresponding multi-token transaction
 speculative verification.
 
 MoE measures every token count from 1 through 8 and additional anchors through
-128. Reduction fills the bounded 1--128 serving domain from the nearest valid
+128. Fixed-precision reduction fills the bounded 1--128 serving domain from the nearest valid
 measured anchor. It never extends micro beyond eight tokens or Triton route
 packing beyond 256 routed rows, and it does not extrapolate outside the recorded
 domain. Profile coverage reports measured and synthesized runtime query counts
 separately.
+
+The `modelopt-nvfp4-auto` recipe races A4 and A16 over shared native NVFP4
+storage for SiLU. It selects precision at execution capacity, covers only
+exact measured capacities, and falls back to native A16 direct decode at
+capacities 1–8 on SM120 and SM121 when supported, or A4 otherwise. It independently
+qualifies every capacity without coarse precision pruning. A16 wins confirmed
+median parity as well as speedups; each candidate uses its own precision oracle.
+See [MoE storage and precision planning](moe-execution-model.md#sharing-nvfp4-storage-across-activation-precisions).
+
+`benchmarks/benchmark_moe_precision_policy.py` runs this registered provider for
+one reviewed geometry and a bounded set of capacities. Its default input is
+the generator's synthetic corpus; `--input-snapshot` instead races the exact
+checkpoint operands exported by `benchmark_nvfp4_decode_precisions.py`.
+The manifest distinguishes those inputs and preserves tensor identities.
 
 Corpus definitions live in generator code and are not repeated or referenced in
 JSON. The full local artifact retains the device, settings, aggregate winners,

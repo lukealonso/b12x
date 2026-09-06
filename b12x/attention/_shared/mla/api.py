@@ -18,7 +18,7 @@ except ImportError:  # Keep the pure-PyTorch fallback usable outside vLLM images
 
 from .merge import clear_sparse_mla_merge_kernel_cache
 from .reference import sparse_mla_reference
-from .traits import ModelType, kv_fp8_rope_enabled
+from .traits import ModelType, kv_fp8_rope_enabled, resolve_unplanned_traits
 
 _MLA_STRATEGY_ENV = "B12X_MLA_PREFILL_STRATEGY"
 _MLA_FORCE_SINGLE_PASS_ENV = "B12X_MLA_FORCE_SINGLE_PASS"
@@ -28,6 +28,7 @@ _MLA_SM120_BACKEND = "sm120"
 _MLA_UNIFIED_GLM_Q_HEAD_DIM = 576
 _MLA_UNIFIED_GLM_NEXT_Q_HEAD_DIM = 512
 _MLA_UNIFIED_GLM_NEXT_RECORD_BYTES = 528
+_MLA_UNIFIED_GLM_NEXT_NVFP4_RECORD_BYTES = 304
 _MLA_SINGLE_PASS_TARGET_Q_ROWS = 2048
 _MLA_SINGLE_PASS_TARGET_TOPK = 2048
 _LN2 = math.log(2.0)
@@ -379,6 +380,7 @@ def _resolve_sparse_mla_binding(
     torch.Tensor,
     torch.Tensor,
     object,
+    torch.Tensor | None,
 ]:
     if binding is None:
         raise TypeError("sparse MLA forward requires binding")
@@ -404,13 +406,14 @@ def _resolve_sparse_mla_binding(
         binding.cache_seqlens_int32,
         binding.nsa_cache_seqlens_int32,
         binding.scratch,
+        binding.kv_cache,
     )
 
 
 def sparse_mla_decode_forward(
     *,
     q_all: torch.Tensor | None = None,
-    kv_cache: torch.Tensor,
+    kv_cache: torch.Tensor | None = None,
     page_table_1: torch.Tensor | None = None,
     cache_seqlens_int32: torch.Tensor | None = None,
     nsa_cache_seqlens_int32: torch.Tensor | None = None,
@@ -427,18 +430,31 @@ def sparse_mla_decode_forward(
     scale_format: int | None = None,
     model_type: int | None = None,
     fp8_rope: bool | None = None,
-    latent_scale_per_token: bool = False,
+    latent_scale_per_token: bool | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-    q_all, page_table_1, cache_seqlens_int32, nsa_cache_seqlens_int32, workspace = (
-        _resolve_sparse_mla_binding(
-            binding=binding,
-            q_all=q_all,
-            selected_indices=page_table_1,
-            cache_seqlens_int32=cache_seqlens_int32,
-            nsa_cache_seqlens_int32=nsa_cache_seqlens_int32,
-            selected_name="page_table_1",
-        )
+    (
+        q_all,
+        page_table_1,
+        cache_seqlens_int32,
+        nsa_cache_seqlens_int32,
+        workspace,
+        bound_kv_cache,
+    ) = _resolve_sparse_mla_binding(
+        binding=binding,
+        q_all=q_all,
+        selected_indices=page_table_1,
+        cache_seqlens_int32=cache_seqlens_int32,
+        nsa_cache_seqlens_int32=nsa_cache_seqlens_int32,
+        selected_name="page_table_1",
     )
+    if bound_kv_cache is not None:
+        if kv_cache is not None and kv_cache is not bound_kv_cache:
+            raise ValueError(
+                "sparse MLA binding owns kv_cache; do not also pass kv_cache"
+            )
+        kv_cache = bound_kv_cache
+    if kv_cache is None:
+        raise TypeError("sparse MLA forward requires kv_cache in its binding")
     if v_head_dim is None:
         v_head_dim = workspace.v_head_dim
     return _run_sparse_mla(
@@ -461,13 +477,16 @@ def sparse_mla_decode_forward(
         model_type=model_type,
         fp8_rope=fp8_rope,
         latent_scale_per_token=latent_scale_per_token,
+        planned_cache_traits=(
+            binding.cache_traits if bound_kv_cache is not None else None
+        ),
     )
 
 
 def sparse_mla_extend_forward(
     *,
     q_all: torch.Tensor | None = None,
-    kv_cache: torch.Tensor,
+    kv_cache: torch.Tensor | None = None,
     selected_token_offsets: torch.Tensor | None = None,
     cache_seqlens_int32: torch.Tensor | None = None,
     nsa_cache_seqlens_int32: torch.Tensor | None = None,
@@ -481,7 +500,7 @@ def sparse_mla_extend_forward(
     scale_format: int | None = None,
     model_type: int | None = None,
     fp8_rope: bool | None = None,
-    latent_scale_per_token: bool = False,
+    latent_scale_per_token: bool | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     (
         q_all,
@@ -489,6 +508,7 @@ def sparse_mla_extend_forward(
         cache_seqlens_int32,
         nsa_cache_seqlens_int32,
         workspace,
+        bound_kv_cache,
     ) = _resolve_sparse_mla_binding(
         binding=binding,
         q_all=q_all,
@@ -497,6 +517,14 @@ def sparse_mla_extend_forward(
         nsa_cache_seqlens_int32=nsa_cache_seqlens_int32,
         selected_name="selected_token_offsets",
     )
+    if bound_kv_cache is not None:
+        if kv_cache is not None and kv_cache is not bound_kv_cache:
+            raise ValueError(
+                "sparse MLA binding owns kv_cache; do not also pass kv_cache"
+            )
+        kv_cache = bound_kv_cache
+    if kv_cache is None:
+        raise TypeError("sparse MLA forward requires kv_cache in its binding")
     if v_head_dim is None:
         v_head_dim = workspace.v_head_dim
     return _run_sparse_mla(
@@ -516,6 +544,9 @@ def sparse_mla_extend_forward(
         model_type=model_type,
         fp8_rope=fp8_rope,
         latent_scale_per_token=latent_scale_per_token,
+        planned_cache_traits=(
+            binding.cache_traits if bound_kv_cache is not None else None
+        ),
     )
 
 
@@ -539,7 +570,8 @@ def _run_sparse_mla(
     scale_format: int | None = None,
     model_type: int | None = None,
     fp8_rope: bool | None = None,
-    latent_scale_per_token: bool = False,
+    latent_scale_per_token: bool | None = None,
+    planned_cache_traits: object | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     if q_all.ndim != 3:
         raise ValueError(f"q_all must be rank-3, got {tuple(q_all.shape)}")
@@ -627,101 +659,73 @@ def _run_sparse_mla(
             f"v_head_dim {v_head_dim} does not match workspace v_head_dim {workspace.v_head_dim}"
         )
     _sm120_route = _use_sm120_sparse_mla(backend=backend, device=q_all.device)
-    # NVFP4 (scale_format=2) selection: explicit kwarg wins; otherwise the
-    # scratch/workspace planned kv_cache_dtype supplies it. None -> inferred
-    # from q_head_dim inside the kernel launchers (fp8 GLM default).
-    scale_format_for_call = (
-        scale_format
-        if scale_format is not None
-        else getattr(workspace, "scale_format", None)
-    )
-    planned_model_type = getattr(workspace, "model_type", None)
-    if planned_model_type is not None:
-        planned_model_type = int(planned_model_type)
-    if (
-        model_type is not None
-        and planned_model_type is not None
-        and int(model_type) != planned_model_type
-    ):
-        raise ValueError(
-            "sparse MLA run model_type does not match its plan: "
-            f"run={int(model_type)}, plan={planned_model_type}"
+    # A binding-owned cache was validated against these immutable traits at
+    # bind time. The planned serving path consumes them without repeating ABI
+    # checks for every launch.
+    cache_traits = planned_cache_traits
+    if cache_traits is not None:
+        model_type_for_call = int(cache_traits.model_type)
+        scale_format_for_call = int(cache_traits.scale_format)
+        fp8_rope_for_call = bool(cache_traits.fp8_rope)
+        latent_scale_per_token_for_call = bool(cache_traits.latent_scale_per_token)
+    else:
+        # The compatibility path accepts a cache supplied at run time. It must
+        # resolve and validate the cache recipe because bind did not own it.
+        cache_traits = getattr(workspace, "cache_traits", None)
+        if cache_traits is None and _sm120_route:
+            cache_traits = resolve_unplanned_traits(
+                int(q_all.shape[-1]),
+                kv_cache.dtype,
+                int(kv_cache.shape[-1]),
+                model_type=model_type,
+                scale_format=scale_format,
+                fp8_rope=fp8_rope,
+                latent_scale_per_token=bool(latent_scale_per_token),
+            )
+        if cache_traits is not None:
+            model_type_for_call = int(cache_traits.model_type)
+            scale_format_for_call = int(cache_traits.scale_format)
+            fp8_rope_for_call = bool(cache_traits.fp8_rope)
+            latent_scale_per_token_for_call = bool(cache_traits.latent_scale_per_token)
+            expected_record_bytes = int(cache_traits.kv_gmem_stride)
+            for name, supplied, planned in (
+                ("model_type", model_type, model_type_for_call),
+                ("scale_format", scale_format, scale_format_for_call),
+                ("fp8_rope", fp8_rope, fp8_rope_for_call),
+                (
+                    "latent_scale_per_token",
+                    latent_scale_per_token,
+                    latent_scale_per_token_for_call,
+                ),
+            ):
+                if supplied is not None and int(supplied) != int(planned):
+                    if name == "fp8_rope" and model_type_for_call == ModelType.GLM_NEXT:
+                        raise ValueError(
+                            "GLM_NEXT sparse MLA has no RoPE cache payload"
+                        )
+                    raise ValueError(
+                        f"sparse MLA run {name} does not match its plan: "
+                        f"run={supplied!r}, plan={planned!r}"
+                    )
+            if int(kv_cache.shape[-1]) != expected_record_bytes:
+                raise ValueError(
+                    "sparse MLA kv_cache record width does not match its plan: "
+                    f"got {int(kv_cache.shape[-1])}, expected {expected_record_bytes}"
+                )
+            if model_type_for_call not in (ModelType.GLM_NSA, ModelType.GLM_NEXT):
+                raise ValueError(
+                    "attention.sparse_mla supports ModelType.GLM_NSA or "
+                    f"ModelType.GLM_NEXT; got model_type={model_type_for_call}"
+                )
+        else:
+            model_type_for_call = None
+            scale_format_for_call = None if scale_format is None else int(scale_format)
+            fp8_rope_for_call = None
+            latent_scale_per_token_for_call = False
+    if scale_format_for_call == 2 and not _sm120_route:
+        raise NotImplementedError(
+            "NVFP4 sparse MLA requires the active SM120 kernel path"
         )
-    model_type_for_call = (
-        int(model_type)
-        if model_type is not None
-        else planned_model_type
-    )
-    if model_type_for_call is not None:
-        model_type_for_call = int(model_type_for_call)
-    if model_type_for_call == ModelType.GLM_NEXT:
-        if int(q_all.shape[-1]) != _MLA_UNIFIED_GLM_NEXT_Q_HEAD_DIM:
-            raise ValueError(
-                "GLM_NEXT sparse MLA requires q_head_dim=512, got "
-                f"{int(q_all.shape[-1])}"
-            )
-        if int(kv_cache.shape[-1]) != _MLA_UNIFIED_GLM_NEXT_RECORD_BYTES:
-            raise ValueError(
-                "GLM_NEXT sparse MLA cache record must be 528 bytes, got "
-                f"{int(kv_cache.shape[-1])}"
-            )
-        if scale_format_for_call not in (None, 1):
-            raise ValueError(
-                "GLM_NEXT sparse MLA requires scale_format=1 "
-                f"(ARBITRARY_FP32), got {scale_format_for_call}"
-            )
-        if fp8_rope not in (None, False):
-            raise ValueError("GLM_NEXT sparse MLA has no RoPE cache payload")
-        scale_format_for_call = 1
-        fp8_rope_for_call = False
-    elif model_type_for_call not in (None, ModelType.GLM_NSA):
-        raise ValueError(
-            "attention.sparse_mla supports ModelType.GLM_NSA or "
-            f"ModelType.GLM_NEXT; got model_type={model_type_for_call}"
-        )
-    if (
-        model_type_for_call != ModelType.GLM_NEXT
-        and int(scale_format_for_call or -1) == 2
-        and fp8_rope is None
-    ):
-        # Normal vLLM calls arrive through b12x.integration.mla, whose stable
-        # public signature does not carry this new option. The allocated record
-        # is therefore the authoritative process-lifetime ABI at this boundary;
-        # derive the specialization from it instead of rereading a mutable env.
-        record_bytes = int(kv_cache.shape[-1])
-        if record_bytes not in (368, 432):
-            raise ValueError(
-                "NVFP4 sparse MLA cache record must be 368 or 432 bytes, got "
-                f"{record_bytes}"
-            )
-        fp8_rope_for_call = record_bytes == 368
-    elif model_type_for_call != ModelType.GLM_NEXT:
-        fp8_rope_for_call = _resolve_kv_fp8_rope(fp8_rope)
-    if int(scale_format_for_call or -1) == 2:
-        expected_record_bytes = 368 if fp8_rope_for_call else 432
-        if int(kv_cache.shape[-1]) != expected_record_bytes:
-            raise ValueError(
-                "NVFP4 sparse MLA cache record disagrees with KV_FP8_ROPE: "
-                f"got {int(kv_cache.shape[-1])} bytes, expected "
-                f"{expected_record_bytes}"
-            )
-        if not _sm120_route:
-            raise NotImplementedError(
-                "NVFP4 sparse MLA requires the active SM120 kernel path"
-            )
-    # FAIL-CLOSED: the per-token fp32 latent scale lives at bytes [292, 296) of
-    # the NVFP4 fp8-rope 368-byte record ONLY.
-    if latent_scale_per_token:
-        if int(scale_format_for_call or -1) != 2:
-            raise ValueError(
-                "sparse MLA latent_scale_per_token requires the NVFP4 cache "
-                f"(scale_format=2); got scale_format={scale_format_for_call!r}"
-            )
-        if int(kv_cache.shape[-1]) != 368:
-            raise ValueError(
-                "sparse MLA latent_scale_per_token requires the fp8-rope "
-                f"368-byte NVFP4 record; got {int(kv_cache.shape[-1])} bytes"
-            )
     if attn_sink is not None:
         attn_sink = attn_sink.detach()
         if not _sm120_route:
@@ -801,7 +805,8 @@ def _run_sparse_mla(
                 scale_format=scale_format_for_call,
                 model_type=model_type_for_call,
                 fp8_rope=fp8_rope_for_call,
-                latent_scale_per_token=latent_scale_per_token,
+                latent_scale_per_token=latent_scale_per_token_for_call,
+                cache_traits=cache_traits,
             )
         from .kernel import run_unified_decode
 
@@ -821,7 +826,8 @@ def _run_sparse_mla(
             scale_format_override=scale_format_for_call,
             model_type_override=model_type_for_call,
             fp8_rope_override=fp8_rope_for_call,
-            latent_scale_per_token=latent_scale_per_token,
+            latent_scale_per_token=latent_scale_per_token_for_call,
+            traits_override=cache_traits,
         )
     if _is_cuda_graph_capture_active(q_all.device):
         raise RuntimeError(
@@ -869,6 +875,7 @@ def _run_sm120_prefill(
     model_type: int | None = None,
     fp8_rope: bool | None = None,
     latent_scale_per_token: bool = False,
+    cache_traits: object | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Route a prefill-like call to the active SM120 single-pass prefill."""
     from .kernel import run_unified_prefill
@@ -897,11 +904,13 @@ def _run_sm120_prefill(
         model_type=model_type,
         fp8_rope=fp8_rope,
         latent_scale_per_token=latent_scale_per_token,
+        traits_override=cache_traits,
     )
     if not return_lse:
         return output
-    lse = lse_base2 if lse_scale == "base2" else (lse_base2 * _LN2)
-    return output, lse
+    if lse_scale == "natural":
+        lse_base2.mul_(_LN2)
+    return output, lse_base2
 
 
 def _final_lse_from_split_workspace(

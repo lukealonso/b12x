@@ -41,7 +41,8 @@ _BLOCK_FP8_TILES = (
 _VOCAB_PROJECTION_GEOMETRIES = (
     ("qwen3.8-flash-next-180b", 2_560, (248_320,)),
     ("qwen3.8-27b", 5_120, (248_320,)),
-    ("glm-5.3-flash", 4_096, (163_840, 163_968)),
+    ("glm-5.3", 6_144, (154_880,)),
+    ("glm-5.3-flash", 4_096, (154_880,)),
     ("glm-5.2", 6_144, (163_840, 163_968)),
 )
 _VOCAB_PROJECTION_TP_SIZES = (1, 2, 4, 8, 16)
