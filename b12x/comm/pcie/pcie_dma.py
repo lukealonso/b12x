@@ -26,10 +26,11 @@ from torch.distributed import ProcessGroup
 
 from ._cuda_ipc import CudaRTLibrary
 from .pcie_dma_reference import (
+    final_handshake_slot,
     granule_elems_for,
-    piece_offset_elems,
-    ring_schedule,
+    lossless_access_plan,
     scratch_step_widths,
+    validate_access_plan,
 )
 from .pcie_oneshot import PCIeOneshotAllReduce, _normalize_device
 
@@ -182,6 +183,20 @@ def _ring_fp32_hops() -> int:
     0 (default): served bf16 hops.
     """
     return max(0, int(os.getenv("B12X_PCIE_RING_FP32_HOPS", "0")))
+
+
+def _ring_check_bounds() -> bool:
+    """Check every buffer range of the lossless ring against the slab
+    capacities before the call issues a kernel.
+
+    A range that leaves its buffer faults on the device, where the report is
+    an asynchronous ``unspecified launch failure`` on some later
+    synchronization with no indication of which step, piece or rank produced
+    it. The check is a few hundred integer comparisons per call on the host,
+    which is why it is opt-in rather than always on; enable it when a ring
+    configuration is being brought up or bisected.
+    """
+    return os.getenv("B12X_PCIE_RING_CHECK_BOUNDS", "0") == "1"
 
 
 def _graph_replay_mode() -> bool:
@@ -935,9 +950,11 @@ class PCIeDmaAllReduce:
         """Lossless ring all-reduce with a selectable chunk-to-element mapping
         and fp32 running sums on the trailing reduce-scatter hops.
 
-        The step table comes from ``ring_schedule`` and the element mapping
-        from ``piece_offset_elems``, which the CPU proofs execute as well, so
-        what the tests reason about is what this loop issues. The kernel
+        The step table comes from ``ring_schedule`` and every buffer range
+        from ``lossless_access_plan``, which the CPU proofs execute and check
+        as well, so what the tests reason about is what this loop issues; with
+        ``B12X_PCIE_RING_CHECK_BOUNDS=1`` the plan is additionally checked
+        against the slab capacities before a single kernel is issued. The kernel
         sequence per (step, piece) is the one ``_all_reduce_aligned`` issues
         on its lossless path: one CE copy on the copy stream, one flag on the
         flag stream, one wait plus one add (reduce-scatter) or placement copy
@@ -993,111 +1010,95 @@ class PCIeDmaAllReduce:
                 )
         else:
             pieces = self._pick_pieces(shard_elems, shard_bytes)
-        piece_elems = shard_elems // pieces
-        piece_bytes = piece_elems * elem
-        schedule = ring_schedule(world, fp32_hops)
-        # Receive-area stride of every step: an fp32 running sum needs two
-        # bytes per bf16 element, matching ``_scratch_layout``.
-        area_stride = tuple(
-            2 * piece_bytes if step.payload_fp32 else piece_bytes for step in schedule
-        )
 
         main = torch.cuda.current_stream(self.device)
         copy_stream = self._copy_stream
         flag_stream = self._flag_stream
         add_done = self._piece_events
         copied = self._copied_events
-        base = out.data_ptr()
-        in_base = inp.data_ptr()
         stage_base = self._fp32_stage.data_ptr() if fp32_hops else 0
+        # Every range the loop addresses, in issue order, as offsets into one
+        # of four bases. The plan is the object the CPU proofs check, so the
+        # loop cannot drift from what they reason about.
+        plan = lossless_access_plan(
+            world=world,
+            rank=rank,
+            shard_elems=shard_elems,
+            pieces=pieces,
+            granule=bool(granule_elems),
+            fp32_hops=fp32_hops,
+            elem_size=elem,
+            scratch_offsets=self._scratch_offsets,
+        )
+        if _ring_check_bounds():
+            validate_access_plan(
+                plan,
+                tensor_bytes=inp.numel() * elem,
+                scratch_offsets=self._scratch_offsets,
+                scratch_widths=scratch_step_widths(world, fp32_hops),
+                shard_capacity=self.shard_capacity,
+                stage_bytes=2 * self.shard_capacity if fp32_hops else 0,
+                flag_slots=FLAG_SLOTS,
+            )
+        bases = {
+            ("input", "self"): inp.data_ptr(),
+            ("out", "self"): out.data_ptr(),
+            ("stage", "self"): stage_base,
+            ("scratch", "self"): self._scratch_base[rank],
+            ("scratch", "next"): self._scratch_base[nxt],
+        }
         self._input_ready.record(main)
         copy_stream.wait_event(self._input_ready)
         flag_stream.wait_event(self._input_ready)
 
-        def piece_offset(chunk: int, piece: int) -> int:
-            return (
-                piece_offset_elems(
-                    chunk,
-                    piece,
-                    world=world,
-                    shard_elems=shard_elems,
-                    piece_elems=piece_elems,
-                    granule=bool(granule_elems),
+        def address(access) -> int:
+            return bases[(access.region, access.owner)] + access.offset
+
+        for op in plan:
+            p = op.piece
+            slot = op.slot
+            with torch.cuda.stream(copy_stream):
+                if op.step > 0:
+                    copy_stream.wait_event(add_done[p])
+                kernels.dma_copy(
+                    address(op.copy_dst), address(op.copy_src), op.copy_src.nbytes
                 )
-                * elem
+                copied[slot].record(copy_stream)
+            with torch.cuda.stream(flag_stream):
+                flag_stream.wait_event(copied[slot])
+                kernels.dma_set_flag(
+                    self._flag_ptr(nxt, slot),
+                    self._counter_ptr(self._send_counters, slot),
+                )
+            kernels.dma_wait_flag(
+                self._flag_ptr(rank, slot),
+                self._counter_ptr(self._wait_counters, slot),
             )
-
-        def piece_ptr(chunk: int, piece: int) -> int:
-            return base + piece_offset(chunk, piece)
-
-        def in_piece_ptr(chunk: int, piece: int) -> int:
-            return in_base + piece_offset(chunk, piece)
-
-        def scratch_piece(owner: int, step: int, piece: int) -> int:
-            return self._scratch_ptr(owner, step) + piece * area_stride[step]
-
-        def stage_ptr(piece: int) -> int:
-            return stage_base + piece * 2 * piece_bytes
-
-        def buffer_ptr(name: str, step: int, chunk: int, piece: int) -> int:
-            if name == "input":
-                return in_piece_ptr(chunk, piece)
-            if name == "out":
-                return piece_ptr(chunk, piece)
-            if name == "stage":
-                return stage_ptr(piece)
-            return scratch_piece(rank, step, piece)
-
-        for step in schedule:
-            k = step.step
-            send_chunk = (rank + step.send_offset) % world
-            recv_chunk = (rank + step.recv_offset) % world
-            send_bytes = 2 * piece_bytes if step.payload_fp32 else piece_bytes
-            for p in range(pieces):
-                send_src = buffer_ptr(step.send_from, step.send_step, send_chunk, p)
-                slot = k * pieces + p
-                with torch.cuda.stream(copy_stream):
-                    if k > 0:
-                        copy_stream.wait_event(add_done[p])
-                    kernels.dma_copy(scratch_piece(nxt, k, p), send_src, send_bytes)
-                    copied[slot].record(copy_stream)
-                with torch.cuda.stream(flag_stream):
-                    flag_stream.wait_event(copied[slot])
-                    kernels.dma_set_flag(
-                        self._flag_ptr(nxt, slot),
-                        self._counter_ptr(self._send_counters, slot),
-                    )
-                kernels.dma_wait_flag(
-                    self._flag_ptr(rank, slot),
-                    self._counter_ptr(self._wait_counters, slot),
+            if op.op == "add":
+                kernels.dma_add(
+                    address(op.main_dst),
+                    address(op.main_local),
+                    address(op.main_recv),
+                    op.elems,
+                    dtype_code,
                 )
-                if step.op == "add":
-                    kernels.dma_add(
-                        piece_ptr(recv_chunk, p),
-                        in_piece_ptr(recv_chunk, p),
-                        scratch_piece(rank, k, p),
-                        piece_elems,
-                        dtype_code,
-                    )
-                elif step.op == "add_mixed":
-                    kernels.dma_add_mixed(
-                        buffer_ptr(step.sum_to, k, recv_chunk, p),
-                        in_piece_ptr(recv_chunk, p),
-                        scratch_piece(rank, k, p),
-                        piece_elems,
-                        step.add_mode,
-                    )
-                else:
-                    kernels.dma_copy(
-                        piece_ptr(recv_chunk, p),
-                        scratch_piece(rank, k, p),
-                        piece_bytes,
-                    )
-                add_done[p].record(main)
+            elif op.op == "add_mixed":
+                kernels.dma_add_mixed(
+                    address(op.main_dst),
+                    address(op.main_local),
+                    address(op.main_recv),
+                    op.elems,
+                    op.add_mode,
+                )
+            else:
+                kernels.dma_copy(
+                    address(op.main_dst), address(op.main_recv), op.main_dst.nbytes
+                )
+            add_done[p].record(main)
 
         main.wait_stream(copy_stream)
         main.wait_stream(flag_stream)
-        done = len(schedule) * pieces
+        done = final_handshake_slot(world, pieces, fp32_hops)
         kernels.dma_set_flag(
             self._flag_ptr(prv, done), self._counter_ptr(self._send_counters, done)
         )
