@@ -35,6 +35,38 @@ LOW_SM = 48
 WIDE_N = 4096  # n > 1536 -> the MXFP8 wide-N regime that the hint tunes
 
 
+@pytest.mark.parametrize("expected_m", (1, 8, 16, 129, 2048, 8192))
+@pytest.mark.parametrize("sm_count", (LOW_SM, HIGH_SM))
+@pytest.mark.parametrize("c_dtype", (cutlass.BFloat16, cutlass.Float16))
+def test_expected_m_bounds_the_complete_scheduling_specialization(
+    expected_m: int, sm_count: int, c_dtype,
+) -> None:
+    n = k = 4096
+    plan = _select_default_dense_gemm_plan(
+        expected_m, n, k, sm_count, is_mxfp8=True, expected_m=expected_m
+    )
+    tile_k = _select_mxfp8_tile_k(expected_m, n, k, expected_m, sm_count)
+    policies = {
+        _dense_gemm_policy_for(
+            m=live_m,
+            n=n,
+            k=k,
+            l=1,
+            ab_dtype=cutlass.Float8E4M3FN,
+            c_dtype=c_dtype,
+            mma_tiler_mn=plan.mma_tiler_mn,
+            cluster_shape_mn=(1, 1),
+            sm_count=sm_count,
+            tile_k=tile_k,
+            expected_m=expected_m,
+            generalize_mxfp8_split_k=True,
+        )
+        for live_m in (1, 2, 8, 9, 15, 16, 128, 129, expected_m)
+        if live_m <= expected_m
+    }
+    assert len(policies) == 1
+
+
 @pytest.mark.parametrize("m", (1, 2, 4, 6, 8, 16, 32, 64, 128))
 @pytest.mark.parametrize(
     "n,k,expected_tile_k",

@@ -7,6 +7,9 @@ graph capture safe); ``run`` quantizes the BF16/FP16 input to MXFP8 inline
 and launches the GEMM.  ``prewarm`` compiles the kernels for a capacity ahead
 of serving.
 
+Bindings default ``expected_m`` to ``Caps.max_tokens``. An explicit row bound
+takes precedence, including when separate captured regimes share scratch.
+
 Example:
     from b12x.gemm import block_fp8_linear as bfl
 
