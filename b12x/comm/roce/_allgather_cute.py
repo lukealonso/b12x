@@ -11,6 +11,11 @@ replaced by a strided copy that writes the concatenated output directly:
 
 The local shard is copied from the input; peer shards are read in place from
 the NIC-written slots with system-scope loads.
+
+Launch grid and message size are runtime scalars.  The host picks a
+power-of-two grid from the shard size and hands the kernel that grid's own
+staging and tail counters, so small gathers do not pay for the full grid and
+gathers may interleave with reductions of any size inside one CUDA graph.
 """
 
 from __future__ import annotations
@@ -169,11 +174,13 @@ class _RoceAllGatherLaunch:
                     words[3],
                 )
                 stage_index += stride
-            fence_sc_sys()
             cute.arch.sync_threads()
 
-            # 2. the last block to finish staging rings the proxy doorbell
+            # 2. the last block to finish staging rings the proxy doorbell.  One
+            # system fence per block after the barrier (cumulative over the
+            # staging stores the barrier ordered) replaces one per thread.
             if Int32(tidx) == Int32(0):
+                fence_sc_sys()
                 prior = atomic_add_relaxed_gpu_u32(stage_counter_ptr, Uint32(1))
                 if (prior + Uint32(1)) % Uint32(gdim) == Uint32(0):
                     st_relaxed_sys_u32(ctrl_base + Int64(4), Uint32(nbytes))
@@ -325,7 +332,7 @@ def get_launcher(
         1,
         1,
         current_cuda_stream(),
-        compile_spec=KernelCompileSpec.from_key("comm.roce.allgather", 3, cache_key),
+        compile_spec=KernelCompileSpec.from_key("comm.roce.allgather", 4, cache_key),
     )
 
     def run(

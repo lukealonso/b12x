@@ -4,7 +4,7 @@ import multiprocessing
 import os
 from concurrent.futures import ProcessPoolExecutor
 from contextlib import AbstractContextManager
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from types import SimpleNamespace
 
 import pytest
@@ -74,8 +74,11 @@ _DEVICE = DeviceIdentity(
 )
 
 
-def test_embedded_moe_profiles_cover_every_corpus_query_with_valid_configs(
+def test_embedded_moe_profiles_and_heuristics_cover_corpus_queries(
 ) -> None:
+    from b12x.policy import PolicyContext, PolicySource
+    from b12x.moe.fused_moe._policy import MOE_DECODE_POLICY, MoeDecodeQuery
+
     cases = tuple(
         case for case in expand_sweep_cases()
         if case.geometry.recipe.quant_mode != "nvfp4_auto"
@@ -106,8 +109,18 @@ def test_embedded_moe_profiles_cover_every_corpus_query_with_valid_configs(
     for profile in EMBEDDED_REGISTRY.list_profiles():
         component = profile.component("moe.decode")
         assert component is not None, profile.profile_id
+        context = PolicyContext.for_identity(profile.targets[0])
         for query in queries.values():
             hit = component.lookup(query)
+            if query["quant_mode"] == "w4a16" and query["source_format"] == "modelopt_nvfp4":
+                # Native-layout measurements cannot qualify uniform MMA-packed A16.
+                assert hit is None, (profile.profile_id, query)
+                resolution = context.resolve(
+                    MOE_DECODE_POLICY, MoeDecodeQuery(**query),
+                )
+                assert resolution.source is PolicySource.HEURISTIC
+                assert _config_covers_query(query, asdict(resolution.config))
+                continue
             assert hit is not None, (profile.profile_id, query)
             assert _config_covers_query(query, hit.config), (
                 profile.profile_id,
@@ -339,10 +352,10 @@ def test_w4a16_tuner_models_native_and_packed_route_kernels() -> None:
         and case.route_pattern == "balanced"
     )
 
-    assert _w4a16_weight_layout(glm_decode.geometry) == "modelopt"
+    assert _w4a16_weight_layout(glm_decode.geometry) == "packed"
     assert (
         _w4a16_direct_path(glm_decode.geometry, glm_decode)
-        == "w4a16.small_m_direct"
+        == "w4a16.tc_decode"
     )
     assert _w4a16_weight_layout(e8m0_decode.geometry) == "packed"
     assert (
@@ -356,7 +369,7 @@ def test_w4a16_tuner_models_native_and_packed_route_kernels() -> None:
     )
     assert (
         _w4a16_direct_path(relu2_direct.geometry, relu2_direct)
-        == "w4a16.small_m_direct"
+        == "w4a16.direct_topk"
     )
     assert _w4a16_direct_path(relu2_packed_only.geometry, relu2_packed_only) is None
 
@@ -406,7 +419,7 @@ def test_concrete_candidate_path_reads_the_exact_execution_variant() -> None:
     case = next(
         case
         for case in expand_sweep_cases()
-        if case.geometry.recipe.recipe_id == "modelopt-w4a16"
+        if case.geometry.recipe.recipe_id == "modelopt-nvfp4-auto"
         and case.geometry.activation == "silu"
         and case.top_k == 8
         and case.num_tokens == 8
@@ -2073,7 +2086,7 @@ def test_embedded_auto_precision_retains_overrides_and_exact_capacity_coverage(p
 
 
 @pytest.mark.parametrize("capability", [(12, 0), (12, 1)])
-@pytest.mark.parametrize("capacity", [1, 2, 4, 6, 8, 9, 16])
+@pytest.mark.parametrize("capacity", [*range(1, 10), 16])
 def test_auto_precision_heuristic_promotes_supported_decode(capability, capacity):
     from dataclasses import replace
     from b12x.policy import PolicyContext, PolicyMode, PolicySource

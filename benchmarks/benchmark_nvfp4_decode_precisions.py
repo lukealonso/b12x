@@ -27,6 +27,7 @@ import torch
 
 import b12x
 from b12x.moe import fused_moe
+from b12x.policy import MOE_DECODE, get_auto_policy
 from b12x.moe._shared.kernels.reference import moe_reference_nvfp4
 from benchmarks.benchmark_moe import (
     MODEL_PROFILES,
@@ -190,7 +191,7 @@ def main() -> None:
         intermediate_size=spec.I_tp,
     )
     arms = {}
-    for name, mode in (("a4", fused_moe.ActivationMode.A4), ("a16", fused_moe.ActivationMode.A16)):
+    for name, mode in (("a4", fused_moe.ActivationMode.A4), ("a16", fused_moe.ActivationMode.AUTO)):
         weight_plan = fused_moe.plan_weights(
             source=source, geometry=geometry,
             activation=fused_moe.ActivationSpec(
@@ -203,6 +204,10 @@ def main() -> None:
         experts = fused_moe.prepare_weights(plan=weight_plan, weights=bundle)
         plan = fused_moe.plan_execution(
             experts=experts,
+            policy=(get_auto_policy(device).with_override(MOE_DECODE, fused_moe.MoeDecodeConfig(
+                backend="w4a16", route_planner="internal", max_active_clusters=None,
+                w4a16_route_mode="direct",
+            )) if name == "a16" else None),
             capacity=fused_moe.ExecutionCapacity(
                 max_tokens=args.capacity, top_k=spec.top_k,
                 warmup_token_counts=tuple(args.batch_sizes),
@@ -222,6 +227,8 @@ def main() -> None:
     ):
         assert getattr(native, micro_attr).data_ptr() == original.data_ptr()
         assert getattr(arms["a4"]["experts"]._impl, a4_attr).data_ptr() == original.data_ptr()
+    assert native.w13_scale.data_ptr() == bundle.w13_block_scales.data_ptr()
+    assert native.w2_scale.data_ptr() == bundle.w2_block_scales.data_ptr()
     assert _weight_hashes(bundle) == report["native_weight_sha256"]
     report["shared_payload_and_decode_block_scales"] = True
     cache_modes = ("cold", "warm") if args.cache == "both" else (args.cache,)

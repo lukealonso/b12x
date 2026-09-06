@@ -27,6 +27,7 @@ import torch
 
 import b12x
 from b12x.moe import fused_moe
+from b12x.policy import MOE_DECODE, get_auto_policy
 from benchmarks.benchmark_moe import (
     MODEL_PROFILES,
     bench_events,
@@ -176,7 +177,7 @@ def main() -> None:
     arms = {}
     for name, mode, packing in (
         ("a4", fused_moe.ActivationMode.A4, None),
-        ("native", fused_moe.ActivationMode.A16, fused_moe.WeightPacking.SOURCE_NATIVE),
+        ("native", fused_moe.ActivationMode.AUTO, fused_moe.WeightPacking.SOURCE_NATIVE),
         ("packed", fused_moe.ActivationMode.A16, fused_moe.WeightPacking.MMA_PACKED),
     ):
         plan = fused_moe.plan_weights(
@@ -205,10 +206,16 @@ def main() -> None:
         assert getattr(native, micro_attr).data_ptr() == original.data_ptr()
         assert getattr(arms["a4"]["experts"]._impl, a4_attr).data_ptr() == original.data_ptr()
     report["a4_native_share_decode_block_scales"] = True
+    assert native.w13_scale.data_ptr() == bundle.w13_block_scales.data_ptr()
+    assert native.w2_scale.data_ptr() == bundle.w2_block_scales.data_ptr()
     for name in ("native", "packed"):
         arm = arms[name]
         plan = fused_moe.plan_execution(
             experts=arm["experts"],
+            policy=(get_auto_policy(device).with_override(MOE_DECODE, fused_moe.MoeDecodeConfig(
+                backend="w4a16", route_planner="internal", max_active_clusters=None,
+                w4a16_route_mode="direct",
+            )) if name == "native" else None),
             capacity=fused_moe.ExecutionCapacity(
                 max_tokens=args.capacity, top_k=spec.top_k,
                 warmup_token_counts=tuple(args.batch_sizes),

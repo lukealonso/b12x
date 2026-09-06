@@ -29,6 +29,7 @@ from b12x._lib.intrinsics import (
     broadcast_f32_to_half2,
     broadcast_f32_to_bfloat2,
     cp_async4_shared_global,
+    cp_async_u64_shared_global,
     cp_async4_shared_global_pred,
     fabs_f32,
     fmax_f32,
@@ -226,6 +227,58 @@ def _pack_modelopt_words(
         asm_dialect=llvm.AsmDialect.AD_ATT,
         loc=loc,
         ip=ip,
+    ))
+
+
+@dsl_user_op
+def _dequant_native_fp4_word(
+    packed: Uint32, is_fp16: cutlass.Constexpr[bool], *, loc=None, ip=None,
+):
+    dtype = "f16" if is_fp16 else "bf16"
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32(), T.i32(), T.i32(), T.i32()]),
+        [packed.ir_value(loc=loc, ip=ip)],
+        """
+        {
+            .reg .b32 h0, h1, h2, h3, tmp;
+            .reg .b8 q0, q1, q2, q3;
+            cvt.u8.u32 q0, $4;
+            shr.u32 tmp, $4, 8;
+            cvt.u8.u32 q1, tmp;
+            shr.u32 tmp, $4, 16;
+            cvt.u8.u32 q2, tmp;
+            shr.u32 tmp, $4, 24;
+            cvt.u8.u32 q3, tmp;
+        """
+        + "\n".join(f"cvt.rn.{dtype}x2.e2m1x2 h{i}, q{i};" for i in range(4))
+        + """
+            prmt.b32 $0, h0, h2, 0x5410;
+            prmt.b32 $1, h0, h2, 0x7632;
+            prmt.b32 $2, h1, h3, 0x5410;
+            prmt.b32 $3, h1, h3, 0x7632;
+        }
+        """,
+        "=r,=r,=r,=r,r", has_side_effects=False, is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip,
+    )
+    return tuple(Uint32(llvm.extractvalue(T.i32(), result, [i], loc=loc, ip=ip)) for i in range(4))
+
+
+@dsl_user_op
+def _gather_native_scale_bytes(a: Uint32, b: Uint32, c: Uint32, d: Uint32, byte: Uint32, *, loc=None, ip=None):
+    return Uint32(llvm.inline_asm(
+        T.i32(), [v.ir_value(loc=loc, ip=ip) for v in (a, b, c, d, byte)],
+        """
+        {
+            .reg .b32 selector, lo, hi;
+            mad.lo.u32 selector, $5, 17, 64;
+            prmt.b32 lo, $1, $2, selector;
+            prmt.b32 hi, $3, $4, selector;
+            prmt.b32 $0, lo, hi, 0x5410;
+        }
+        """,
+        "=r,r,r,r,r,r", has_side_effects=False, is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip,
     ))
 
 
@@ -1063,6 +1116,9 @@ class W4A16GemmKernel:
             )
         self.b_region_variable = self.weight_layout_trellis256
         self.scale_format = scale_format
+        self.native_nvfp4_scales = (
+            weight_layout == "modelopt" and scale_format == "e4m3_k16"
+        )
         self.scale_format_e8m0_k32 = scale_format == "e8m0_k32"
         # k32 scale cadence (two K16 rows share one scale group); the scale
         # DECODE stays keyed on scale_format_e8m0_k32 (e4m3_k32 uses the e4m3
@@ -1275,6 +1331,7 @@ class W4A16GemmKernel:
             self.trellis_pair_kind,
             self.trellis_rate_axis,
             self.scale_format,
+            self.native_nvfp4_scales,
             self.w13_layout,
             self.source_n_rotation,
             self.single_token_route_fast_path,
@@ -1322,6 +1379,15 @@ class W4A16GemmKernel:
 
     @cute.jit
     def _dequant_scale_x4_to_elem2x2(self, packed: Uint32):
+        if cutlass.const_expr(self.native_nvfp4_scales):
+            if cutlass.const_expr(self.is_fp16):
+                return fp8x4_e4m3_to_half2x2(packed)
+            s0, s1 = fp8x4_e4m3_to_bfloat2x2_native_sm120(packed)
+            # The bitwise FP4 decoder produces values scaled by 2**-126.
+            # All finite E4M3 scales remain representable after a 2**119 lift;
+            # the remaining factor of 128 is applied with the weight global.
+            lift = Uint32(0x7B007B00)
+            return bfloat2_mul(s0, lift), bfloat2_mul(s1, lift)
         if cutlass.const_expr(self.scale_format_e8m0_k32):
             if cutlass.const_expr(self.is_fp16):
                 return packed_dequant_e8m0x4_to_half2x2(packed)
@@ -2093,6 +2159,8 @@ class W4A16GemmKernel:
         active_size_m: Int32,
     ):
         global_scale_f32 = global_scale[expert_idx].to(cutlass.Float32)
+        if cutlass.const_expr(self.native_nvfp4_scales and not self.is_fp16):
+            global_scale_f32 *= cutlass.Float32(128.0)
         if cutlass.const_expr(self.scale_format_e8m0_k32):
             if cutlass.const_expr(self.is_fp16):
                 global_scale_f32 *= cutlass.Float32(_E8M0_K32_FP16_GLOBAL_COMPENSATION)
@@ -3396,7 +3464,31 @@ class W4A16GemmKernel:
             + pipe * Int32(self.s_sh_stage * 16)
             + (s_sh_rd + scale_group_id * Int32(2 * self.s_sh_stride)) * Int32(8)
         )
-        s_pack0, s_pack1 = ld_shared_v2_u32(s_addr)
+        if cutlass.const_expr(self.native_nvfp4_scales):
+            words = cute.make_rmem_tensor((2, 4), Uint32)
+            local_n = (warp_id % Int32(self.tb_n_warps)) * Int32(64) + (
+                (tid & Int32(31)) // Int32(4)
+            )
+            stage_base = (
+                smem_base + Int32(self.sh_s_off * 16)
+                + pipe * Int32(self.s_sh_stage * 16)
+            )
+            vector_n = 128 if self.tile_n % 128 == 0 and self.source_n_rotation % 128 == 0 else 64
+            vector_words = vector_n // 32
+            for i in cutlass.range_constexpr(4):
+                n0 = local_n + Int32(i * 8)
+                word0, word1 = ld_shared_v2_u32(stage_base + (
+                    (scale_group_id // Int32(4)) * Int32(self.tile_n)
+                    + (n0 // Int32(vector_n) * Int32(32) + n0 % Int32(32)) * Int32(vector_words)
+                    + n0 % Int32(vector_n) // Int32(32)
+                ) * Int32(4))
+                words[0, i] = word0
+                words[1, i] = word1
+            byte = Uint32(scale_group_id % Int32(4))
+            s_pack0 = _gather_native_scale_bytes(words[0, 0], words[0, 1], words[0, 2], words[0, 3], byte)
+            s_pack1 = _gather_native_scale_bytes(words[1, 0], words[1, 1], words[1, 2], words[1, 3], byte)
+        else:
+            s_pack0, s_pack1 = ld_shared_v2_u32(s_addr)
         s0, s1 = self._dequant_scale_x4_to_elem2x2(s_pack0)
         s2, s3 = self._dequant_scale_x4_to_elem2x2(s_pack1)
         return q0, q1, q2, q3, s0, s1, s2, s3
@@ -3516,10 +3608,13 @@ class W4A16GemmKernel:
 
     @cute.jit
     def _scaled_dequant_b_fragment(self, frag: cute.Tensor, q: Uint32, s: Uint32):
-        bq1 = q
-        bq0 = bq1 << Uint32(8)
-        b0_0, b0_1 = self._dequant_e2m1x4_to_elem2x2(bq0)
-        b1_0, b1_1 = self._dequant_e2m1x4_to_elem2x2(bq1)
+        if cutlass.const_expr(self.native_nvfp4_scales and self.is_fp16):
+            b0_0, b0_1, b1_0, b1_1 = _dequant_native_fp4_word(q, self.is_fp16)
+        else:
+            bq1 = q
+            bq0 = bq1 << Uint32(8)
+            b0_0, b0_1 = self._dequant_e2m1x4_to_elem2x2(bq0)
+            b1_0, b1_1 = self._dequant_e2m1x4_to_elem2x2(bq1)
         s_lane0 = bfloat2_broadcast_lane(s, Int32(0))
         s_lane1 = bfloat2_broadcast_lane(s, Int32(1))
         b0_0 = self._elem2_mul(b0_0, s_lane0)
@@ -4070,6 +4165,58 @@ class W4A16GemmKernel:
         return byte_offset ^ ((byte_offset >> Int32(3)) & Int32(0x70))
 
     @cute.jit
+    def _stage_modelopt_scales(
+        self,
+        scales_i32_flat: cute.Tensor,
+        smem_base: Int32,
+        tid: Int32,
+        pipe: Int32,
+        expert_idx: Int32,
+        output_n_tile: Int32,
+        tile_idx: Int32,
+    ):
+        words_per_row = self.s_tb_groups // 4
+        vector_n = 128 if self.tile_n % 128 == 0 and self.source_n_rotation % 128 == 0 else 64
+        vector_words = vector_n // 32
+        vectors_per_k_word = self.tile_n // vector_words
+        scale_cols = _covering_count(self.size_k // 16, 4) * 4
+        expert_words = _covering_count(self.size_n, 128) * 128 * scale_cols // 4
+        stage_base = (
+            smem_base + Int32(self.sh_s_off * 16)
+            + pipe * Int32(self.s_sh_stage * 16)
+        )
+        for i in cutlass.range_constexpr(_covering_count(self.s_sh_stage * 4 // vector_words, self.cta_threads)):
+            vector_idx = tid + Int32(i * self.cta_threads)
+            if vector_idx < Int32(self.s_sh_stage * 4 // vector_words):
+                n_group = vector_idx % Int32(vectors_per_k_word)
+                local_n = (n_group // Int32(32)) * Int32(vector_n) + n_group % Int32(32)
+                local_k_word = vector_idx // Int32(vectors_per_k_word)
+                k_word = tile_idx * Int32(words_per_row) + local_k_word
+                logical_n = output_n_tile * Int32(self.tile_n) + local_n
+                source_n = self._source_n_from_logical(logical_n)
+                offset = (
+                    Int64(expert_idx) * Int64(expert_words)
+                    + Int64(source_n // Int32(128)) * Int64(scale_cols * 32)
+                    + Int64(k_word) * Int64(128)
+                    + Int64(source_n % Int32(32)) * Int64(4)
+                    + Int64((source_n % Int32(128)) // Int32(32))
+                )
+                if logical_n < Int32(self.size_n) and k_word < Int32(scale_cols // 4):
+                    if cutlass.const_expr(vector_words == 4):
+                        cp_async4_shared_global(
+                            stage_base + vector_idx * Int32(16),
+                            get_ptr_as_int64(scales_i32_flat, offset),
+                        )
+                    else:
+                        cp_async_u64_shared_global(
+                            stage_base + vector_idx * Int32(8),
+                            get_ptr_as_int64(scales_i32_flat, offset),
+                        )
+                else:
+                    for word in cutlass.range_constexpr(vector_words):
+                        st_shared_u32(stage_base + (vector_idx * Int32(vector_words) + Int32(word)) * Int32(4), Uint32(0))
+
+    @cute.jit
     def _stage_b_tile_modelopt_native(
         self,
         b_u8_flat: cute.Tensor,
@@ -4510,7 +4657,12 @@ class W4A16GemmKernel:
         # before touching scale SMEM.  Const-expr-elide the otherwise dead HBM
         # reads so every layer can share a four-byte aligned dummy scale tensor
         # instead of retaining 54 MiB of packed ones.
-        if cutlass.const_expr(not self.weight_layout_trellis256):
+        if cutlass.const_expr(self.native_nvfp4_scales):
+            self._stage_modelopt_scales(
+                scales_i32_flat, smem_base, tid, pipe, expert_idx,
+                output_n_tile, tile_idx,
+            )
+        elif cutlass.const_expr(not self.weight_layout_trellis256):
             if tid < Int32(self.s_sh_stage):
                 s_k_group = tile_idx * Int32(self.s_tb_groups) + tid // Int32(
                     self.s_sh_stride
@@ -6124,6 +6276,15 @@ class W4A16FusedMoeKernel:
             * Int64(self.fc2.scale_k_groups)
             * Int64(self.fc2.scale_size_n // 4)
         )
+        if cutlass.const_expr(self.fc1.native_nvfp4_scales):
+            w13_metadata_elements = expert_count * Int64(
+                _covering_count(self.fc1.size_n, 128) * 128
+                * _covering_count(self.fc1.size_k // 16, 4)
+            )
+            w2_metadata_elements = expert_count * Int64(
+                _covering_count(self.fc2.size_n, 128) * 128
+                * _covering_count(self.fc2.size_k // 16, 4)
+            )
         w13_scales_i32_flat = cute.make_tensor(
             w13_scales_ptr,
             layout=cute.make_layout((w13_metadata_elements,), stride=(1,)),
@@ -8549,12 +8710,13 @@ def _compile_w4a16_small_m_direct(
         dummy(cutlass.BFloat16),
         barrier_fake,
         barrier_fake,
+        Int32(num_experts),
         Int32(m),
         Int32(kernel.grid_x),
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_facts(
             "moe.w4a16.small_m_direct",
-            2,
+            3,
             ("device_index", None if device is None else int(device.index or 0)),
             ("m", int(m)),
             ("hidden_size", int(hidden_size)),
@@ -8686,12 +8848,13 @@ def _compile_w4a16_fc2_direct(
         dummy(cutlass.BFloat16),
         barrier_fake,
         barrier_fake,
+        Int32(expert_capacity),
         Int32(2),
         Int32(kernel.grid_x),
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_facts(
             "moe.w4a16.fc2_direct",
-            4,
+            5,
             ("device_index", int(device.index or 0)),
             ("hidden_size", int(hidden_size)),
             ("intermediate_size", int(intermediate_size)),
@@ -9861,6 +10024,7 @@ def _w4a16_small_m_direct_launch_flat(
         ptr(cutlass.BFloat16, output),
         barrier_count,
         barrier_epoch,
+        Int32(num_experts),
         Int32(m),
         Int32(direct_launch.grid_x),
         cuda.CUstream(stream_int),
@@ -10008,6 +10172,7 @@ def _w4a16_fc2_direct_launch_flat(
         ptr(cutlass.BFloat16, output),
         barrier_count,
         barrier_epoch,
+        Int32(num_experts),
         Int32(m),
         Int32(launch.grid_x),
         cuda.CUstream(stream_int),

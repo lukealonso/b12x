@@ -161,7 +161,11 @@ def ple_hash_ids_reference(
     table_offsets: torch.Tensor,
     heads_per_order: int,
 ) -> torch.Tensor:
-    """Return one logical embedding ID per token and n-gram head."""
+    """Hash chronological windows with multipliers indexed by token lag.
+
+    ``multipliers[0]`` belongs to the current token, the last column in each
+    window; ``multipliers[i]`` belongs to its predecessor at distance ``i``.
+    """
     if not windows:
         raise ValueError("windows must contain at least one n-gram order")
     orders = sorted(windows)
@@ -190,11 +194,11 @@ def ple_hash_ids_reference(
                 f"windows[{order}] must have shape {(token_count, order)}, "
                 f"got {tuple(token_window.shape)}"
             )
-        mixed = token_window[:, 0] * multipliers[0]
+        mixed = token_window[:, -1] * multipliers[0]
         for index in range(1, order):
             mixed = torch.bitwise_xor(
                 mixed,
-                token_window[:, index] * multipliers[index],
+                token_window[:, -1 - index] * multipliers[index],
             )
         first = (order - 2) * heads_per_order
         last = first + heads_per_order

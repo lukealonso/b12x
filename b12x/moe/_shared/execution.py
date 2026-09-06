@@ -751,9 +751,8 @@ def plan_moe_weight_preparation(
 ) -> MoEWeightPreparationPlan:
     """Choose the minimal representation set for the requested recipes.
 
-    W4A16's automatic policy mirrors the production serving choices: native
-    ModelOpt storage avoids a second full copy, compact E8M0 K tails stay native,
-    and aligned E8M0/CompressedTensors sources use the packed MMA layout.  An
+    Shared NVFP4 recipes retain native weights and scales; uniform W4A16 uses
+    the packed MMA representation. Compact E8M0 K tails stay native. An
     explicit ``w4a16_layout`` is a development/deployment override, not an
     adapter-side reimplementation of the policy.
     """
@@ -800,6 +799,9 @@ def plan_moe_weight_preparation(
     transforms: set[WeightPreparationTransform] = set()
     weight_layouts: set[PreparedWeightLayout] = set()
     scale_layouts: set[PreparedScaleLayout] = set()
+    source_recipe_selected = bool(
+        {"nvfp4", "w4a8_nvfp4"} & {spec.quant_mode for spec in normalized_specs}
+    )
     for spec in normalized_specs:
         if spec.source_format != source_format:
             raise ValueError("all preparation specs must share one source format")
@@ -916,11 +918,20 @@ def plan_moe_weight_preparation(
                 # 352, 3072/TP16 = 192).
                 layout = (
                     PreparedWeightLayout.SOURCE_NATIVE
-                    if source_format == "modelopt_nvfp4"
+                    if (source_format == "modelopt_nvfp4" and source_recipe_selected)
                     or (
                         source_format == "fp4_e8m0_k32" and intermediate_size % 128 != 0
                     )
                     else PreparedWeightLayout.MMA_PACKED
+                )
+            if (
+                source_format == "modelopt_nvfp4"
+                and layout is PreparedWeightLayout.SOURCE_NATIVE
+                and not source_recipe_selected
+            ):
+                raise ValueError(
+                    "uniform NVFP4 W4A16 requires mma_packed storage; "
+                    "select shared NVFP4 recipes for native A16 promotion"
                 )
             if (
                 source_format == "compressed_tensors"
@@ -935,7 +946,11 @@ def plan_moe_weight_preparation(
                 else WeightPreparationTransform.W4A16_PACKED
             )
             weight_layouts.add(layout)
-            scale_layouts.add(PreparedScaleLayout.MMA_PACKED)
+            scale_layouts.add(
+                PreparedScaleLayout.SOURCE_NATIVE
+                if source_format == "modelopt_nvfp4" and layout is PreparedWeightLayout.SOURCE_NATIVE
+                else PreparedScaleLayout.MMA_PACKED
+            )
             continue
         raise ValueError(f"unsupported quant_mode {spec.quant_mode!r}")
 
@@ -943,9 +958,6 @@ def plan_moe_weight_preparation(
         WeightPreparationTransform.W4A16_PACKED,
         WeightPreparationTransform.W4A8_QMMA,
     }
-    source_recipe_selected = bool(
-        {"nvfp4", "w4a8_nvfp4"} & {spec.quant_mode for spec in normalized_specs}
-    )
     native_representation = (
         WeightPreparationTransform.W4A16_NATIVE in transforms
         or WeightPreparationTransform.W4A16_TRELLIS in transforms

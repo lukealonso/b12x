@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import gc
+import weakref
 
 import pytest
 import torch
@@ -52,6 +54,63 @@ def test_auto_requires_nvfp4_native_storage():
         ))
 
 
+def test_uniform_nvfp4_a16_requires_only_mma_packing():
+    activation = replace(weight_plan().activation, mode=fused_moe.ActivationMode.A16)
+    plan = weight_plan(activation=activation)
+    assert plan.prepared_format.available_packings == {fused_moe.WeightPacking.MMA_PACKED}
+    with pytest.raises(ValueError, match="uniform NVFP4 W4A16 requires mma_packed"):
+        weight_plan(activation=activation, constraints=fused_moe.WeightPlanConstraints(
+            required_packing=fused_moe.WeightPacking.SOURCE_NATIVE,
+        ))
+
+
+@pytest.mark.parametrize("name", ["w13_blockscale", "w2_blockscale"])
+@pytest.mark.parametrize("invalid", ["truncated", "strided", "dtype"])
+def test_native_nvfp4_preparation_validates_scale_storage(name, invalid):
+    from b12x.moe._shared.kernels.w4a16.prepare import prepare_w4a16_modelopt_native_weights
+    inputs = dict(
+        w13_fp4=torch.empty((1, 256, 64), dtype=torch.uint8),
+        w2_fp4=torch.empty((1, 128, 64), dtype=torch.uint8),
+        w13_global_scale=torch.ones(1), w2_global_scale=torch.ones(1),
+        w13_blockscale=torch.empty((1, 256, 8), dtype=torch.uint8),
+        w2_blockscale=torch.empty((1, 128, 8), dtype=torch.uint8),
+        activation="silu",
+    )
+    scales = inputs[name]
+    if invalid == "truncated":
+        inputs[name] = scales[:, :-1].contiguous()
+    elif invalid == "strided":
+        inputs[name] = scales.transpose(1, 2)
+    else:
+        inputs[name] = scales.float()
+    with pytest.raises((ValueError, TypeError), match=name):
+        prepare_w4a16_modelopt_native_weights(**inputs)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_uniform_nvfp4_a16_does_not_retain_source_scales():
+    plan = weight_plan(activation=replace(weight_plan().activation, mode=fused_moe.ActivationMode.A16))
+    weights = fused_moe.PackedWeights(
+        w13=torch.zeros((8, 256, 64), dtype=torch.uint8, device="cuda"),
+        w2=torch.zeros((8, 128, 64), dtype=torch.uint8, device="cuda"),
+        w13_block_scales=swizzle_block_scale(torch.ones((8, 256, 8), device="cuda").to(torch.float8_e4m3fn)),
+        w2_block_scales=swizzle_block_scale(torch.ones((8, 128, 8), device="cuda").to(torch.float8_e4m3fn)),
+        w13_global_scales=torch.ones(8, device="cuda"),
+        w2_global_scales=torch.ones(8, device="cuda"),
+    )
+    source_scales = (weakref.ref(weights.w13_block_scales), weakref.ref(weights.w2_block_scales))
+    experts = fused_moe.prepare_weights(plan=plan, weights=weights)
+    prepared = experts._impl.representation_for("w4a16")
+    assert prepared.weight_layout == "packed"
+    assert prepared.w13.data_ptr() == weights.w13.data_ptr()
+    assert prepared.w2.data_ptr() == weights.w2.data_ptr()
+    assert prepared.w13_scale is experts._impl.w1_blockscale
+    assert prepared.w2_scale is experts._impl.w2_blockscale
+    del weights
+    gc.collect()
+    assert all(ref() is None for ref in source_scales)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_auto_shared_weights_precision_plans_replay_without_resolution(monkeypatch):
     torch.manual_seed(927)
@@ -68,8 +127,20 @@ def test_auto_shared_weights_precision_plans_replay_without_resolution(monkeypat
         intermediate_scale=torch.full((8,), 512.0, device=device),
     )
     originals = [t.clone() for t in (packed.w13, packed.w2, packed.w13_block_scales, packed.w2_block_scales)]
+    import b12x.moe._shared.kernels.w4a16.prepare as preparation
+    def no_conversion(*args, **kwargs):
+        raise AssertionError("native preparation attempted a second scale layout")
+    monkeypatch.setattr(preparation, "unswizzle_expert_scales", no_conversion)
+    monkeypatch.setattr(preparation, "_permute_nvfp4_scales", no_conversion)
+    torch.cuda.reset_peak_memory_stats(device)
+    allocated = torch.cuda.memory_allocated(device)
     experts = fused_moe.prepare_weights(plan=weight_plan(), weights=packed)
     native = experts._impl.representation_for("w4a16")
+    assert torch.cuda.max_memory_allocated(device) - allocated <= native.workspace.nbytes + 8192
+    assert native.w13_scale.data_ptr() == packed.w13_block_scales.data_ptr()
+    assert native.w2_scale.data_ptr() == packed.w2_block_scales.data_ptr()
+    assert native.w13_global_scale.data_ptr() == packed.w13_global_scales.data_ptr()
+    assert native.w2_global_scale.data_ptr() == packed.w2_global_scales.data_ptr()
     for source, a4, a16 in (
         (packed.w13, experts._impl.w1_fp4, native.w13),
         (packed.w2, experts._impl.w2_fp4, native.w2),
@@ -85,6 +156,10 @@ def test_auto_shared_weights_precision_plans_replay_without_resolution(monkeypat
         (fused_moe.ActivationMode.A16, fused_moe.MoeDecodeConfig(
             backend="w4a16", route_planner="internal", max_active_clusters=None,
             w4a16_route_mode="direct",
+        )),
+        (fused_moe.ActivationMode.A16, fused_moe.MoeDecodeConfig(
+            backend="w4a16", route_planner="internal", max_active_clusters=None,
+            w4a16_route_mode="packed",
         )),
     ):
         plan = fused_moe.plan_execution(

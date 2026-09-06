@@ -773,7 +773,8 @@ def _w4a16_direct_path(
         return None
     weight_layout = _w4a16_weight_layout(geometry)
     query = _impl.MoeDecodeQuery(
-        quant_mode=geometry.recipe.quant_mode,
+        quant_mode=("nvfp4_auto" if geometry.recipe.recipe_id == "modelopt-nvfp4-auto"
+                    else geometry.recipe.quant_mode),
         source_format=geometry.recipe.source_format,
         activation=geometry.activation,
         num_experts=geometry.num_experts,

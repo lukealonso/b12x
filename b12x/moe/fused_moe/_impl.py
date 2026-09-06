@@ -1430,8 +1430,6 @@ def _w4a16_weight_layout_for_source(
     source_format = _normalize_fp4_source_format(source_format)
     if source_format in _TRELLIS_SOURCE_FORMATS:
         return "trellis_t256"
-    if source_format == "modelopt_nvfp4":
-        return "modelopt"
     if (
         source_format == "fp4_e8m0_k32"
         and intermediate_size is not None
@@ -2438,9 +2436,11 @@ def _heuristic_dynamic_route_mode(
 
 
 def _w4a16_direct_routing_supported(query: MoeDecodeQuery) -> bool:
-    weight_layout = _w4a16_weight_layout_for_source(
-        query.source_format,
-        intermediate_size=query.intermediate_size,
+    weight_layout = (
+        "modelopt" if query.quant_mode == "nvfp4_auto"
+        else _w4a16_weight_layout_for_source(
+            query.source_format, intermediate_size=query.intermediate_size,
+        )
     )
     if weight_layout == "trellis_t256":
         return False
@@ -2529,8 +2529,9 @@ def _heuristic_moe_decode_config(
             and 1 <= query.num_tokens <= 8
             and _w4a16_direct_routing_supported(query)
         ):
-            return _heuristic_moe_decode_config(
-                replace(query, quant_mode="w4a16"), device,
+            return MoeDecodeConfig(
+                backend="w4a16", route_planner="internal",
+                max_active_clusters=None, w4a16_route_mode="direct",
             )
         return _heuristic_moe_decode_config(replace(query, quant_mode="nvfp4"), device)
     if query.quant_mode == "w4a16":
@@ -9478,6 +9479,7 @@ def _get_micro_kernel(
         dummy(cutlass.BFloat16),  # out_ptr
         barrier_fake,  # barrier_count
         barrier_fake,  # barrier_epoch
+        Int32(weight_E),  # route_expert_limit
         Int32(compile_m),  # m_val
         Int32(1),  # grid_x
         current_cuda_stream(),  # stream

@@ -951,9 +951,8 @@ def prepare_w4a16_modelopt_native_weights(
 ) -> W4A16ModelOptWeights:
     """Prepare W4A16 consumers of checkpoint-native ModelOpt NVFP4 weights.
 
-    Decode shares the FP4 payload, swizzled E4M3 block scales, and weight
-    global scales with the source. The tensor-core consumer retains its
-    separate scale permutation without copying the FP4 payload.
+    Direct and tensor-core execution share the FP4 payload, swizzled E4M3
+    block scales, and raw weight global scales with the source.
     """
     source_format = _normalize_source_format(source_format)
     if source_format not in _MODEL_OPT_NVFP4_FORMATS:
@@ -972,19 +971,27 @@ def prepare_w4a16_modelopt_native_weights(
     num_experts = shape.num_experts
     hidden_size = shape.hidden_size
     intermediate_size = shape.intermediate_size
-    w13_rows = shape.w13_rows
     is_gated = shape.is_gated
 
-    w13_scale = unswizzle_expert_scales(
-        w13_blockscale,
-        rows=w13_rows,
-        cols=hidden_size,
-    )
-    w2_scale = unswizzle_expert_scales(
-        w2_blockscale,
-        rows=hidden_size,
-        cols=intermediate_size,
-    )
+    for name, scales, rows, cols in (
+        ("w13_blockscale", w13_blockscale, shape.w13_rows, hidden_size),
+        ("w2_blockscale", w2_blockscale, hidden_size, intermediate_size),
+    ):
+        expected_bytes = num_experts * ((rows + 127) // 128 * 128) * ((cols // 16 + 3) // 4 * 4)
+        if scales.dtype not in (torch.float8_e4m3fn, torch.uint8):
+            raise TypeError(f"{name} must contain E4M3 bytes")
+        if (
+            not scales.is_contiguous()
+            or scales.device != w13_fp4.device
+            or scales.ndim < 1
+            or scales.shape[0] != num_experts
+            or scales.numel() != expected_bytes
+        ):
+            raise ValueError(
+                f"{name} must be contiguous native NVFP4 scales with "
+                f"{num_experts} experts and {expected_bytes} bytes on {w13_fp4.device}"
+            )
+
     native_w13_global_scale = _source_global_scale(
         w13_global_scale,
         source_format=source_format,
@@ -994,33 +1001,13 @@ def prepare_w4a16_modelopt_native_weights(
         source_format=source_format,
     )
 
-    # The W4A16 activation consumes FC1 output in gate/up logical order.
-    # Checkpoint-native ModelOpt GLM tensors are up/gate, while vLLM/FI can
-    # hand over gate/up tensors after its own W13 reorder. Keep that physical
-    # order explicit so source_format never implies a layout transformation.
-    w13_row_rotation = intermediate_size if is_gated and w13_layout == "w13" else None
-    packed_w13_scale, packed_w13_global_scale = _permute_nvfp4_scales(
-        w13_scale,
-        native_w13_global_scale,
-        size_k=hidden_size,
-        size_n=w13_rows,
-        a_dtype=params_dtype,
-        row_rotation=w13_row_rotation,
-    )
-    packed_w2_scale, packed_w2_global_scale = _permute_nvfp4_scales(
-        w2_scale,
-        native_w2_global_scale,
-        size_k=intermediate_size,
-        size_n=hidden_size,
-        a_dtype=params_dtype,
-    )
     return W4A16ModelOptWeights(
         w13=w13_fp4,
-        w13_scale=packed_w13_scale,
-        w13_global_scale=packed_w13_global_scale,
+        w13_scale=w13_blockscale,
+        w13_global_scale=native_w13_global_scale,
         w2=w2_fp4,
-        w2_scale=packed_w2_scale,
-        w2_global_scale=packed_w2_global_scale,
+        w2_scale=w2_blockscale,
+        w2_global_scale=native_w2_global_scale,
         workspace=_make_workspace(w13_fp4.device, max_blocks_per_sm=4),
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,

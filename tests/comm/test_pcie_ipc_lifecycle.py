@@ -43,7 +43,7 @@ def test_pool_explicit_close_coordinates_imports_before_exports(monkeypatch) -> 
     pool._channels = {1: channel_a, 2: channel_b}
     monkeypatch.setattr(
         "b12x.comm.pcie.pcie_oneshot.dist.barrier",
-        lambda *, group: events.append("barrier"),
+        lambda *, group, device_ids: events.append(("barrier", device_ids)),
     )
     monkeypatch.setattr(
         "b12x.comm.pcie.pcie_oneshot.torch.cuda.synchronize",
@@ -59,13 +59,13 @@ def test_pool_explicit_close_coordinates_imports_before_exports(monkeypatch) -> 
 
     assert events == [
         "synchronize",
-        "barrier",
+        ("barrier", [0]),
         "imports:a",
         "imports:b",
-        "barrier",
+        ("barrier", [0]),
         "exports:a",
         "exports:b",
-        "barrier",
+        ("barrier", [0]),
     ]
     assert pool._closed
     assert pool._all_channels == []
@@ -249,7 +249,7 @@ def test_twoshot_explicit_close_coordinates_unmap_then_free(monkeypatch) -> None
     runtime.device = torch.device("cuda:0")
     monkeypatch.setattr(
         "b12x.comm.pcie.pcie_oneshot.dist.barrier",
-        lambda *, group: events.append("barrier"),
+        lambda *, group, device_ids: events.append(("barrier", device_ids)),
     )
     monkeypatch.setattr(
         "b12x.comm.pcie.pcie_oneshot.torch.cuda.synchronize",
@@ -265,12 +265,12 @@ def test_twoshot_explicit_close_coordinates_unmap_then_free(monkeypatch) -> None
 
     assert events == [
         "synchronize",
-        "barrier",
+        ("barrier", [0]),
         ("close", 2000),
         ("close", 3000),
-        "barrier",
+        ("barrier", [0]),
         ("free", 1000),
-        "barrier",
+        ("barrier", [0]),
     ]
     assert runtime._owned_buffers == []
     assert runtime._ipc_imports_closed
@@ -496,7 +496,7 @@ def test_peer_unmap_failure_is_exchanged_before_any_local_export_free(
 
     monkeypatch.setattr(
         "b12x.comm.pcie.pcie_oneshot.dist.barrier",
-        lambda *, group: events.append("barrier"),
+        lambda *, group, device_ids: events.append(("barrier", device_ids)),
     )
     monkeypatch.setattr(
         "b12x.comm.pcie.pcie_oneshot.torch.cuda.synchronize",
@@ -518,7 +518,7 @@ def test_peer_unmap_failure_is_exchanged_before_any_local_export_free(
 
     expected_events = [
         "synchronize",
-        "barrier",
+        ("barrier", [0]),
     ]
     if isinstance(runtime, PCIeOneshotAllReduce):
         expected_events.append(("dispose", 123))
@@ -526,10 +526,10 @@ def test_peer_unmap_failure_is_exchanged_before_any_local_export_free(
         ("close", 2000),
         ("close", 3000),
         "synchronize",
-        "barrier",
-        "barrier",
+        ("barrier", [0]),
+        ("barrier", [0]),
         ("free", 1000),
-        "barrier",
+        ("barrier", [0]),
     ]
     assert events == expected_events
     assert runtime._ipc_exports_freed
@@ -586,7 +586,7 @@ def test_rank_that_freed_locally_retries_until_peer_free_succeeds(
 
     monkeypatch.setattr(
         "b12x.comm.pcie.pcie_oneshot.dist.barrier",
-        lambda *, group: events.append("barrier"),
+        lambda *, group, device_ids: events.append(("barrier", device_ids)),
     )
     monkeypatch.setattr(
         "b12x.comm.pcie.pcie_oneshot.torch.cuda.synchronize",
@@ -610,19 +610,19 @@ def test_rank_that_freed_locally_retries_until_peer_free_succeeds(
     assert events == events_after_success
     expected_events = [
         "synchronize",
-        "barrier",
+        ("barrier", [0]),
     ]
     if isinstance(runtime, PCIeOneshotAllReduce):
         expected_events.append(("dispose", 123))
     expected_events += [
         ("close", 2000),
         ("close", 3000),
-        "barrier",
+        ("barrier", [0]),
         ("free", 1000),
         "synchronize",
-        "barrier",
-        "barrier",
-        "barrier",
+        ("barrier", [0]),
+        ("barrier", [0]),
+        ("barrier", [0]),
     ]
     assert events == expected_events
     assert runtime._coordinated_close_complete
