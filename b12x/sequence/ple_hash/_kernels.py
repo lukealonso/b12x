@@ -183,7 +183,9 @@ def _hash_ids_kernel(
 
     for position in tl.static_range(0, MAX_ORDER):
         in_order = position < order
-        distance_from_current = order - 1 - position
+        # Checkpoint multiplier indices are token lags: index zero belongs
+        # to the current token for every n-gram order.
+        distance_from_current = position
         relative_position = -distance_from_current
         value = _source_token(
             token_ids_ptr,

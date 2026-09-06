@@ -17,7 +17,7 @@ import cutlass
 import cutlass.cute as cute
 import cutlass.utils as cutlass_utils
 import torch
-from cutlass import Float32, Int32, Int64
+from cutlass import Float32, Int32, Int64, Uint32
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import dsl_user_op
 from cutlass.cute.runtime import from_dlpack
@@ -32,7 +32,7 @@ from b12x._lib.compiler import (
 from b12x._lib.compiler import (
     launch as b12x_launch,
 )
-from b12x._lib.intrinsics import shared_ptr_to_u32
+from b12x._lib.intrinsics import shared_ptr_to_u32, st_shared_u32
 
 from .decode_math import (
     s0_load_q_bf16_to_smem,
@@ -1499,6 +1499,29 @@ class UnifiedDecodeKernel:
                 global_sum = [gsum_frag[0], gsum_frag[1]]
 
                 cute.arch.mbarrier_wait(mbar_base + cons_idx, phase=cons_phase)
+                if cutlass.const_expr(t.scale_format == 0):
+                    # Mask V itself: MMA still propagates NaNs when P is zero.
+                    for part in cutlass.range_constexpr(
+                        (t.bi * 4 + self.math_threads - 1) // self.math_threads
+                    ):
+                        entry = tid // Int32(4) + Int32(part * self.math_threads // 4)
+                        if entry < Int32(t.bi) and tok_buf_view[entry] < Int32(0):
+                            for chunk in cutlass.range_constexpr(448 // 16):
+                                offset = (tid % Int32(4)) * Int32(4) + Int32(chunk * 16)
+                                st_shared_u32(
+                                    kv_fp8_b + entry * Int32(staged_kv_stride) + offset,
+                                    Uint32(0),
+                                )
+                            rope_stride = Int32(t.d_rope * 2)
+                            if cutlass.const_expr(
+                                self.native_dsv4_h8 or self.native_dsv4_h16
+                            ):
+                                rope_stride = Int32(staged_kv_stride)
+                            for chunk in cutlass.range_constexpr(128 // 16):
+                                offset = (tid % Int32(4)) * Int32(4) + Int32(chunk * 16)
+                                st_shared_u32(
+                                    kv_rope_b + entry * rope_stride + offset, Uint32(0)
+                                )
                 cute.arch.barrier(barrier_id=3, number_of_threads=self.math_threads)
 
                 # P10f: GLM keeps RAW e4m3 K/V (no S0b dequant+requant -- that
