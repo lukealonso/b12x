@@ -1,5 +1,5 @@
-"""CPU-emulated ring tests: graph-replay static buffers of
-``pcie_dma.PCIeDmaAllReduce``.
+"""CPU-emulated ring tests: graph-replay static buffers and the paired
+all-gather of ``pcie_dma.PCIeDmaAllReduce``.
 
 The emulation (``pcie_dma_emulation.py``) runs the ring's own Python
 schedule per rank over host memory with the device flag protocol and the
@@ -84,11 +84,15 @@ def test_emulated_ring_mirrors_constructor_state() -> None:
     assert not missing, f"emulation lacks constructor attributes: {missing}"
 
 
-def test_flag_slot_range_covers_every_world_size() -> None:
-    assert pcie_dma.AR_SLOT_BASE + pcie_dma.AR_SLOT_COUNT <= pcie_dma.FLAG_SLOTS
+def test_flag_slot_ranges_are_disjoint_for_every_world_size() -> None:
+    ar_end = pcie_dma.AR_SLOT_BASE + pcie_dma.AR_SLOT_COUNT
+    ag_end = pcie_dma.AG_PAIR_SLOT_BASE + pcie_dma.AG_PAIR_SLOT_COUNT
+    assert ar_end <= pcie_dma.AG_PAIR_SLOT_BASE < ag_end <= pcie_dma.FLAG_SLOTS
     for world in pcie_dma.SUPPORTED_WORLD_SIZES:
         # All-reduce: 2(world-1) steps x MAX_PIECES pieces + done.
         assert 2 * (world - 1) * pcie_dma.MAX_PIECES < pcie_dma.AR_SLOT_COUNT
+        # Paired all-gather: world-1 steps + done.
+        assert world <= pcie_dma.AG_PAIR_SLOT_COUNT
 
 
 # ---------------------------------------------------------------------------
@@ -233,7 +237,7 @@ def test_repeated_same_shape_calls_keep_one_entry_and_counters_advance() -> None
             offset = peer_slot_ptr - r._flags_base[rank]
             flag = emu.slabs[rank][offset : offset + 4].view(torch.int32)
             assert int(flag) == calls
-        assert max(used) < pcie_dma.AR_SLOT_BASE + pcie_dma.AR_SLOT_COUNT
+        assert max(used) < pcie_dma.AG_PAIR_SLOT_BASE
 
 
 def test_eviction_guard_keeps_a_borrowed_output_until_its_consumer_reads() -> None:
@@ -275,7 +279,109 @@ def test_eviction_guard_keeps_a_borrowed_output_until_its_consumer_reads() -> No
 
 
 def test_replay_keys_carry_the_op_tag() -> None:
-    latent = torch.empty(144, LATENT, dtype=torch.bfloat16)
+    rows = 144
+    latent = torch.empty(rows, LATENT, dtype=torch.bfloat16)
+    first = torch.empty(rows, ROUTER_COLS, dtype=torch.float32)
+    second = torch.empty(rows, LATENT_COLS, dtype=torch.bfloat16)
     ring = pcie_dma.PCIeDmaAllReduce
     assert ring._all_reduce_key(latent) == ("ar", latent.numel(), latent.dtype)
-    assert ring._all_reduce_key(latent.view(-1)) == ring._all_reduce_key(latent)
+    assert ring._all_gather_pair_key(first, second)[0] == "ag_pair"
+
+
+# ---------------------------------------------------------------------------
+# Item 1: paired all-gather
+# ---------------------------------------------------------------------------
+
+
+def _pair_inputs(rows: int, seed: int) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+    firsts = _inputs(rows, ROUTER_COLS, seed, torch.float32)
+    seconds = _inputs(rows, LATENT_COLS, seed + 50, torch.bfloat16)
+    return firsts, seconds
+
+
+def _check_gathered(
+    outs: list[tuple[torch.Tensor, torch.Tensor]],
+    firsts: list[torch.Tensor],
+    seconds: list[torch.Tensor],
+) -> None:
+    expected_first = torch.stack(firsts)
+    expected_second = torch.stack(seconds)
+    for out_first, out_second in outs:
+        assert out_first.shape == expected_first.shape
+        assert out_second.shape == expected_second.shape
+        # Byte equality, as torch.distributed.all_gather would produce.
+        assert torch.equal(out_first.view(torch.int32), expected_first.view(torch.int32))
+        assert torch.equal(out_second.view(torch.int16), expected_second.view(torch.int16))
+
+
+def test_all_gather_pair_eager_matches_all_gather_semantics() -> None:
+    emu = EmulatedRing(WORLD, MAX_BYTES, graph_replay=False)
+    firsts, seconds = _pair_inputs(144, seed=10)
+    outs = emu.run(lambda ring, rank: ring.all_gather_pair(firsts[rank], seconds[rank]))
+    _check_gathered(outs, firsts, seconds)
+    for rank, ring in enumerate(emu.rings):
+        used = ring._send_counters.nonzero().flatten().tolist()
+        assert used == list(range(pcie_dma.AG_PAIR_SLOT_BASE, pcie_dma.AG_PAIR_SLOT_BASE + WORLD))
+
+
+def test_all_gather_pair_replay_returns_static_outputs_that_track_new_inputs() -> None:
+    emu = EmulatedRing(WORLD, MAX_BYTES)
+    firsts_a, seconds_a = _pair_inputs(144, seed=11)
+    firsts_b, seconds_b = _pair_inputs(144, seed=12)
+
+    def three_calls(ring, rank):
+        eager = ring.all_gather_pair(firsts_a[rank], seconds_a[rank])
+        replayed = ring.all_gather_pair(firsts_a[rank], seconds_a[rank])
+        assert ring.is_ring_storage(replayed[0]) and ring.is_ring_storage(replayed[1])
+        assert not ring.is_ring_storage(eager[0])
+        replayed_clone = (replayed[0].clone(), replayed[1].clone())
+        again = ring.all_gather_pair(firsts_b[rank], seconds_b[rank])
+        assert again[0].data_ptr() == replayed[0].data_ptr()
+        assert again[1].data_ptr() == replayed[1].data_ptr()
+        return eager, replayed_clone, (again[0].clone(), again[1].clone())
+
+    results = emu.run(three_calls)
+    _check_gathered([r[0] for r in results], firsts_a, seconds_a)
+    _check_gathered([r[1] for r in results], firsts_a, seconds_a)
+    _check_gathered([r[2] for r in results], firsts_b, seconds_b)
+    ring = emu.rings[0]
+    assert list(ring._replay_entries) == [
+        ring._all_gather_pair_key(firsts_a[0], seconds_a[0])
+    ]
+
+
+def test_all_gather_pair_static_inputs_skip_staging() -> None:
+    emu = EmulatedRing(WORLD, MAX_BYTES)
+    firsts, seconds = _pair_inputs(144, seed=13)
+
+    def chain(ring, rank):
+        assert (
+            ring.all_gather_pair_inputs(
+                tuple(firsts[rank].shape), torch.float32, tuple(seconds[rank].shape), torch.bfloat16
+            )
+            is None
+        )
+        statics = ring.all_gather_pair_inputs(
+            tuple(firsts[rank].shape), torch.float32, tuple(seconds[rank].shape), torch.bfloat16
+        )
+        assert statics is not None
+        statics[0].copy_(firsts[rank])
+        statics[1].copy_(seconds[rank])
+        out = ring.all_gather_pair(statics[0], statics[1])
+        return out[0].clone(), out[1].clone()
+
+    _check_gathered(emu.run(chain), firsts, seconds)
+
+
+def test_all_gather_pair_rejects_unsupported_inputs() -> None:
+    ring = EmulatedRing(WORLD, MAX_BYTES).rings[0]
+    first = torch.empty(144, ROUTER_COLS, dtype=torch.float32)
+    second = torch.empty(144, LATENT_COLS, dtype=torch.bfloat16)
+    assert ring.should_all_gather_pair(first, second)
+    assert not ring.should_all_gather_pair(first, torch.empty(72, LATENT_COLS, dtype=torch.bfloat16))
+    assert not ring.should_all_gather_pair(first.view(-1), second)
+    assert not ring.should_all_gather_pair(first.t(), second)
+    huge = torch.empty(144, ring.shard_capacity // 2, dtype=torch.bfloat16)
+    assert not ring.should_all_gather_pair(first, huge)
+    with pytest.raises(ValueError, match="paired all-gather"):
+        ring.all_gather_pair(first, huge)

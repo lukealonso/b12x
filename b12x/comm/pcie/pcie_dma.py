@@ -40,14 +40,19 @@ FLAG_SLOTS = 256
 MAX_PIECES = 8
 SCRATCH_ALIGN = 256
 FP8_QUANT_BLOCK = 128
-# Flag-slot range of the all-reduce ring (and the compressed all-to-all): one
-# slot per (step, piece) plus a done slot, at most 2 * (world - 1) *
-# MAX_PIECES + 1 slots, 145 at the largest supported world size. Further
-# collectives on the same channel take disjoint ranges so every slot's
-# monotonic counter is owned by exactly one op kind.
+# Flag-slot ranges per collective. Every slot's monotonic counter is owned by
+# exactly one op kind, so an all-reduce and a paired all-gather can be mixed
+# in any order without agreeing on a piece count. The all-reduce ring (and
+# the compressed all-to-all) publishes one slot per (step, piece) plus a done
+# slot: at most 2 * (world - 1) * MAX_PIECES + 1 slots, 145 at the largest
+# supported world size. The paired all-gather uses one slot per step plus
+# done (world slots).
 AR_SLOT_BASE = 0
 AR_SLOT_COUNT = 2 * (max(SUPPORTED_WORLD_SIZES) - 1) * MAX_PIECES + 1
-assert AR_SLOT_BASE + AR_SLOT_COUNT <= FLAG_SLOTS
+AG_PAIR_SLOT_BASE = 152
+AG_PAIR_SLOT_COUNT = max(SUPPORTED_WORLD_SIZES)
+assert AR_SLOT_BASE + AR_SLOT_COUNT <= AG_PAIR_SLOT_BASE
+assert AG_PAIR_SLOT_BASE + AG_PAIR_SLOT_COUNT <= FLAG_SLOTS
 # Replay entries used within this many ring operations of the newest one are
 # never evicted: a borrowed static output is consumed by its caller before
 # the caller's next op on the same entry, which in the Kimi-K3 layer is at
@@ -356,8 +361,8 @@ class PCIeDmaAllReduce:
         # buffers (insertion order doubles as the LRU order); a shape is
         # captured on its second eager-eligible call so one-off sizes
         # (prefill tail chunks) stay eager instead of churning captures. The
-        # op tag keeps different collectives of equal element counts on
-        # separate entries.
+        # op tag keeps an all-reduce and a paired all-gather of equal element
+        # counts on separate entries.
         self._replay_entries: "OrderedDict[tuple, _ReplayEntry]" = OrderedDict()
         self._replay_seen: dict[tuple, int] = {}
         self._replay_capture_stream: torch.cuda.Stream | None = None
@@ -376,7 +381,7 @@ class PCIeDmaAllReduce:
         # capture during serving never allocates device memory (and can never
         # fail for lack of it): one slot of 2 x max_bytes per cache entry,
         # carved into views per op (an in-place all-reduce uses one buffer of
-        # the tensor size; other collectives carve their inputs and outputs
+        # the tensor size; a paired all-gather carves its inputs and outputs
         # out of the same slot).
         self._replay_slot_bytes = 2 * _align_up(self.max_bytes, SCRATCH_ALIGN)
         self._replay_arena: torch.Tensor | None = None
@@ -1024,6 +1029,240 @@ class PCIeDmaAllReduce:
             self._flag_ptr(rank, done), self._counter_ptr(self._wait_counters, done)
         )
         return out
+
+    # ------------------------------------------------------------------
+    # Paired all-gather (copy-engine ring, rank-major outputs)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _pair_layout(
+        first: torch.Tensor, second: torch.Tensor
+    ) -> tuple[int, int, int]:
+        """Return (first_bytes, second_offset, payload_bytes) of one rank's
+        block in the per-step scratch area: the second tensor's block follows
+        the first at the next 256-byte boundary."""
+        first_bytes = first.numel() * first.element_size()
+        second_offset = _align_up(first_bytes, SCRATCH_ALIGN)
+        return (
+            first_bytes,
+            second_offset,
+            second_offset + second.numel() * second.element_size(),
+        )
+
+    def should_all_gather_pair(self, first: torch.Tensor, second: torch.Tensor) -> bool:
+        """Whether ``all_gather_pair`` accepts these rank-local blocks."""
+        if self._closed or self.world_size < 2:
+            return False
+        for tensor in (first, second):
+            if (
+                tensor.device != self.device
+                or tensor.dtype not in SUPPORTED_DTYPES
+                or tensor.ndim != 2
+                or tensor.numel() <= 0
+                or not tensor.is_contiguous()
+            ):
+                return False
+        if first.shape[0] != second.shape[0]:
+            return False
+        return self._pair_layout(first, second)[2] <= self.shard_capacity
+
+    @staticmethod
+    def _all_gather_pair_key(first: torch.Tensor, second: torch.Tensor) -> tuple:
+        return (
+            "ag_pair",
+            (first.numel(), second.numel()),
+            (first.dtype, second.dtype),
+            (first.shape[0], first.shape[1], second.shape[1]),
+        )
+
+    def all_gather_pair(
+        self, first: torch.Tensor, second: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Gather two rank-local ``[rows, c]`` blocks in one ring pass.
+
+        Returns rank-major ``[world, rows, c_first]`` and
+        ``[world, rows, c_second]`` tensors whose block ``r`` is rank ``r``'s
+        input, byte for byte (an all-gather only copies). Both blocks travel
+        the ring together: one flag per step gates one copy-engine transfer of
+        the combined payload, so the SM only runs the single-thread flag
+        kernels. Issued on a side stream, the gather overlaps whatever the
+        caller keeps on its main stream; the caller orders the consumer after
+        the side stream with an event. The op shares the channel's scratch
+        and streams with the all-reduce and reduce-scatter, so it must be
+        ordered against them like any other op on this channel.
+
+        Replayed calls return the entry's static outputs; they stay valid until
+        the next ``all_gather_pair`` with the same key, and a producer that
+        wrote into ``all_gather_pair_inputs`` skips the input staging copies.
+        Eager calls allocate their outputs on the current stream.
+        """
+        if not self.should_all_gather_pair(first, second):
+            raise ValueError(
+                "inputs do not satisfy paired all-gather requirements "
+                f"(shapes={tuple(first.shape)}, {tuple(second.shape)}, "
+                f"dtypes={first.dtype}, {second.dtype})"
+            )
+        with torch.cuda.device(self.device):
+            key = self._all_gather_pair_key(first, second)
+            entry = None
+            if self._graph_replay and not torch.cuda.is_current_stream_capturing():
+                entry = self._replay_entry_for(
+                    key, lambda: self._capture_all_gather_pair(first, second)
+                )
+            self._op_seq += 1
+            if entry is None:
+                out_first = first.new_empty((self.world_size, *first.shape))
+                out_second = second.new_empty((self.world_size, *second.shape))
+                self._all_gather_pair_on_device(first, second, out_first, out_second)
+                return out_first, out_second
+            entry.last_use = self._op_seq
+            static_first, static_second = entry.inputs
+            if not _same_storage(static_first, first):
+                static_first.copy_(first)
+            if not _same_storage(static_second, second):
+                static_second.copy_(second)
+            entry.graph.replay()
+            return entry.outputs[0], entry.outputs[1]
+
+    def all_gather_pair_inputs(
+        self,
+        first_shape: tuple[int, int],
+        first_dtype: torch.dtype,
+        second_shape: tuple[int, int],
+        second_dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """Static inputs of the paired all-gather replay entry for these
+        shapes, for producers that write the blocks in place (``None`` when
+        the shapes are not replayed; same sighting rule as
+        ``all_reduce_input``)."""
+        if not self._graph_replay or torch.cuda.is_current_stream_capturing():
+            return None
+        first = torch.empty(first_shape, dtype=first_dtype, device="meta")
+        second = torch.empty(second_shape, dtype=second_dtype, device="meta")
+        if self._closed or self.world_size < 2:
+            return None
+        for tensor in (first, second):
+            if tensor.dtype not in SUPPORTED_DTYPES or tensor.ndim != 2:
+                return None
+        if first.shape[0] != second.shape[0]:
+            return None
+        if self._pair_layout(first, second)[2] > self.shard_capacity:
+            return None
+        with torch.cuda.device(self.device):
+            entry = self._replay_entry_for(
+                self._all_gather_pair_key(first, second),
+                lambda: self._capture_all_gather_pair(first, second),
+            )
+        if entry is None:
+            return None
+        return entry.inputs[0], entry.inputs[1]
+
+    def _capture_all_gather_pair(
+        self, first: torch.Tensor, second: torch.Tensor
+    ) -> _ReplayEntry:
+        slot = self._replay_free_slots.pop()
+        world = self.world_size
+        static_first, static_second, out_first, out_second = self._slot_views(
+            slot,
+            [
+                (tuple(first.shape), first.dtype),
+                (tuple(second.shape), second.dtype),
+                ((world, *first.shape), first.dtype),
+                ((world, *second.shape), second.dtype),
+            ],
+        )
+        graph = self._capture_graph(
+            lambda: self._all_gather_pair_on_device(
+                static_first, static_second, out_first, out_second
+            )
+        )
+        return _ReplayEntry(
+            self._all_gather_pair_key(first, second),
+            (static_first, static_second),
+            (out_first, out_second),
+            graph,
+            slot,
+        )
+
+    def _all_gather_pair_on_device(
+        self,
+        first: torch.Tensor,
+        second: torch.Tensor,
+        out_first: torch.Tensor,
+        out_second: torch.Tensor,
+    ) -> None:
+        kernels = self._kernels
+        world = self.world_size
+        rank = self.rank
+        nxt = (rank + 1) % world
+        prv = (rank - 1) % world
+        first_bytes, second_offset, payload_bytes = self._pair_layout(first, second)
+        second_bytes = second.numel() * second.element_size()
+        steps = world - 1
+
+        main = torch.cuda.current_stream(self.device)
+        copy_stream = self._copy_stream
+        flag_stream = self._flag_stream
+        # Persistent events: the first half of ``copied`` gates each step's
+        # flag on its transfer, the second half marks the receipt of each
+        # step on the main stream (the next step's forwarding copy reads that
+        # scratch area).
+        copied = self._copied_events
+        received = self._copied_events[len(self._copied_events) // 2 :]
+
+        def out_block(tensor: torch.Tensor, block: int) -> int:
+            return tensor.data_ptr() + block * tensor.stride(0) * tensor.element_size()
+
+        def slot(step: int) -> int:
+            return AG_PAIR_SLOT_BASE + step
+
+        self._input_ready.record(main)
+        copy_stream.wait_event(self._input_ready)
+        flag_stream.wait_event(self._input_ready)
+        # Own block: the caller's inputs become output block ``rank``.
+        kernels.dma_copy(out_block(out_first, rank), first.data_ptr(), first_bytes)
+        kernels.dma_copy(out_block(out_second, rank), second.data_ptr(), second_bytes)
+
+        for k in range(steps):
+            # Step k forwards block (rank - k) % world: the own block at
+            # k == 0, afterwards the block received at step k - 1, still in
+            # scratch area k - 1 as one contiguous [first | second] payload.
+            recv_block = (rank - k - 1) % world
+            dst = self._scratch_ptr(nxt, k)
+            with torch.cuda.stream(copy_stream):
+                if k == 0:
+                    kernels.dma_copy(dst, first.data_ptr(), first_bytes)
+                    kernels.dma_copy(dst + second_offset, second.data_ptr(), second_bytes)
+                else:
+                    copy_stream.wait_event(received[k - 1])
+                    kernels.dma_copy(dst, self._scratch_ptr(rank, k - 1), payload_bytes)
+                copied[k].record(copy_stream)
+            with torch.cuda.stream(flag_stream):
+                flag_stream.wait_event(copied[k])
+                kernels.dma_set_flag(
+                    self._flag_ptr(nxt, slot(k)),
+                    self._counter_ptr(self._send_counters, slot(k)),
+                )
+            kernels.dma_wait_flag(
+                self._flag_ptr(rank, slot(k)),
+                self._counter_ptr(self._wait_counters, slot(k)),
+            )
+            received[k].record(main)
+            src = self._scratch_ptr(rank, k)
+            kernels.dma_copy(out_block(out_first, recv_block), src, first_bytes)
+            kernels.dma_copy(
+                out_block(out_second, recv_block), src + second_offset, second_bytes
+            )
+
+        main.wait_stream(copy_stream)
+        main.wait_stream(flag_stream)
+        done = slot(steps)
+        kernels.dma_set_flag(
+            self._flag_ptr(prv, done), self._counter_ptr(self._send_counters, done)
+        )
+        kernels.dma_wait_flag(
+            self._flag_ptr(rank, done), self._counter_ptr(self._wait_counters, done)
+        )
 
     def _pick_a2a_chunks(self, shard_elems: int) -> int:
         override = int(os.getenv("B12X_PCIE_DMA_A2A_CHUNKS", "0"))
