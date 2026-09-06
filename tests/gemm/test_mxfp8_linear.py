@@ -91,6 +91,36 @@ def test_mm_matches_quantized_reference_small_n() -> None:
     )
 
 
+def test_mm_persistent_ctas_complete_single_stage_epilogue_stores() -> None:
+    require_b12x()
+    require_mxf8_mma()
+
+    tokens, in_features, out_features = 1372, 128, 4096
+    source_values = torch.ones(
+        (tokens, in_features), device="cuda", dtype=torch.float8_e4m3fn
+    )
+    source_scale = torch.full(
+        (tokens, in_features // 32), 127, device="cuda", dtype=torch.uint8
+    )
+    weight = torch.ones(
+        (out_features, in_features), device="cuda", dtype=torch.float8_e4m3fn
+    )
+    weight_scale = torch.full(
+        (out_features, in_features // 32),
+        127,
+        device="cuda",
+        dtype=torch.uint8,
+    )
+    packed = mxfp8_linear.pack_weight(weight, weight_scale)
+
+    for _ in range(4):
+        actual = mxfp8_linear.mm(
+            (source_values, source_scale), packed, expected_m=tokens
+        )
+        torch.cuda.synchronize()
+        assert torch.all(actual == in_features)
+
+
 @pytest.mark.parametrize("tokens", (2, 3, 8, 15, 16, 17, 32, 99))
 def test_mm_writes_all_rows_for_unaligned_output_width(tokens: int) -> None:
     """A small-batch GEMM must store every live row when N spans multiple tiles."""

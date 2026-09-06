@@ -75,6 +75,7 @@ _GLM_NEXT_GMEM_STRIDE = 528  # Same latent+scales row, with no RoPE suffix.
 # BF16 RoPE. The NoPE+scale+pad region is staged as a 288B row; decode math
 # dequants the E2M1 data and E4M3 group-16 scales in registers.
 _NVFP4_GMEM_STRIDE = 432
+_GLM_NEXT_NVFP4_GMEM_STRIDE = 304
 _NVFP4_NOPE_SCALE_BYTES = 288
 _NVFP4_ROPE_BYTES = 128
 _NVFP4_ROPE_SRC = 304
@@ -173,14 +174,16 @@ def io_issue_gather(
             # BF16-rope smem row. decode_math interprets scale at +0 and E4M3 at +16.
             _ROPE = Int32(_NVFP4_FP8_ROPE_TAIL_BYTES)
             _ROPE_SRC = Int64(_NVFP4_FP8_ROPE_TAIL_SRC)
-        else:
+        elif cutlass.const_expr(rope_smem_stride):
             _IOS = Int64(_NVFP4_GMEM_STRIDE)
             _ROPE = Int32(_NVFP4_ROPE_BYTES)
             _ROPE_SRC = Int64(_NVFP4_ROPE_SRC)
+        else:
+            _IOS = Int64(_GLM_NEXT_NVFP4_GMEM_STRIDE)
+            _ROPE = Int32(0)
+            _ROPE_SRC = Int64(_GLM_NEXT_NVFP4_GMEM_STRIDE)
     else:
-        _IOS = Int64(
-            _GLM_GMEM_STRIDE if rope_smem_stride else _GLM_NEXT_GMEM_STRIDE
-        )
+        _IOS = Int64(_GLM_GMEM_STRIDE if rope_smem_stride else _GLM_NEXT_GMEM_STRIDE)
         _NOPE = Int32(_GLM_NOPE_SCALE_BYTES)  # 528 nope+inline-fp32 -> kv_fp8
         _ROPE = Int32(_GLM_ROPE_BYTES if rope_smem_stride else 0)
         _ROPE_SRC = Int64(_GLM_NOPE_SCALE_BYTES)  # rope follows nope+scales
@@ -344,9 +347,7 @@ def io_issue_gather(
                 s_byte = entry * _FOOT
                 st_shared_u32(kv_sc_dst_addr + s_byte, f0)
                 st_shared_u32(kv_sc_dst_addr + s_byte + Int32(4), f1)
-            elif cutlass.const_expr(
-                scale_format == 2 and fp8_rope and per_token_latent_scale
-            ):
+            elif cutlass.const_expr(scale_format == 2 and per_token_latent_scale):
                 # NVFP4 two-level record: the per-token fp32 latent scale sits
                 # at [292, 296).  292 is not 8B-aligned, so load the 8-aligned
                 # pair at [288, 296) (rope scale, latent scale) and keep the

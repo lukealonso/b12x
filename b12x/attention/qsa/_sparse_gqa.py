@@ -1,10 +1,10 @@
-"""CuTeDSL indexed sparse paged causal GQA for Qwen3.8 Flash Next.
+"""Indexed sparse paged causal GQA for Qwen3.8 Flash Next.
 
 This private stage reads BF16 or globally scaled FP8 E4M3 main-cache K/V at
-caller-selected logical token positions. It never writes either cache. The
-supported Qwen geometry always launches the CuTe split and merge kernels;
-every other geometry, layout, or device fails instead of selecting an alternate
-implementation.
+caller-selected logical token positions. It never writes either cache. Small
+batches use split CuTe kernels to expose enough parallel work. Large prefill
+batches use the direct selected-position entry of the paged CuTe engine. Every
+unsupported geometry, layout, or device fails closed.
 """
 
 from __future__ import annotations
@@ -14,6 +14,8 @@ import math
 import torch
 
 from ._sparse_gqa_cute_config import (
+    MAX_SPLIT_ROWS as _MAX_SPLIT_ROWS,
+    _is_page_token_head_layout,
     is_candidate as _cute_is_candidate,
     is_qwen_geometry as _is_qwen_geometry,
 )
@@ -129,6 +131,19 @@ def _validate_launch(
         raise ValueError("output must be BF16 [capacity_rows, q_heads, head_dim]")
     _require_unit_inner_stride(output, "output")
 
+    if rows > _MAX_SPLIT_ROWS:
+        if not query.is_contiguous():
+            raise ValueError("query must be contiguous for selected-position paging")
+        if not (
+            _is_page_token_head_layout(key_cache)
+            and _is_page_token_head_layout(value_cache)
+        ):
+            raise ValueError(
+                "selected-position paged K/V caches must have non-overlapping rows"
+            )
+        if not output.is_contiguous():
+            raise ValueError("output must be contiguous for selected-position paging")
+
     block_n = int(block_n)
     splits = int(splits)
     if block_n not in (16, 64):
@@ -189,6 +204,7 @@ def launch_sparse_paged_gqa(
     softmax_scale: float,
     block_n: int,
     splits: int,
+    direct_kv_warps: int = 2,
 ) -> torch.Tensor:
     """Launch the allocation-free CuTe Qwen sparse GQA into ``output``."""
     rows, _, _ = _validate_launch(
@@ -223,6 +239,24 @@ def launch_sparse_paged_gqa(
             f"selection_width={int(selected_positions.shape[1])}, "
             f"block_n={int(block_n)}, splits={int(splits)}"
         )
+    if rows > _MAX_SPLIT_ROWS:
+        from ..paged._selected_forward import launch_selected_paged_gqa_direct
+
+        launch_selected_paged_gqa_direct(
+            query=query,
+            key_cache=key_cache,
+            value_cache=value_cache,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            block_table=block_table,
+            request_ids=request_ids,
+            selected_positions=selected_positions,
+            query_positions=query_positions,
+            output=output,
+            softmax_scale=softmax_scale,
+            kv_warps=int(direct_kv_warps),
+        )
+        return output[:rows]
     assert partial_output is not None and partial_lse is not None
     if not _cute_is_candidate(
         query=query,

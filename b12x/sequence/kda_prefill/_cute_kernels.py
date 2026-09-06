@@ -333,6 +333,7 @@ class _PrologueKernel:
         pos_local: cute.Pointer,
         window_table: cute.Pointer,
         ready: cute.Pointer,
+        final_stride: Int64,
         seq_capacity: Int32,
         token_capacity: Int32,
         launched_tiles: Int32,
@@ -341,7 +342,8 @@ class _PrologueKernel:
         self.kernel(
             cu_seqlens, initial_indices, final_indices, checkpoint_indices, checkpoint_offsets,
             num_seqs, num_tokens, error_code, table, band_base, sorted_seq, rank_of, pos_seq,
-            pos_local, window_table, ready, seq_capacity, token_capacity, launched_tiles,
+            pos_local, window_table, ready, final_stride, seq_capacity, token_capacity,
+            launched_tiles,
         ).launch(grid=(1, 1, 1), block=(_PROLOGUE_THREADS, 1, 1), stream=stream)
 
     @cute.jit
@@ -443,6 +445,7 @@ class _PrologueKernel:
         pos_local: cute.Pointer,
         window_table: cute.Pointer,
         ready: cute.Pointer,
+        final_stride: Int64,
         seq_capacity: Int32,
         token_capacity: Int32,
         launched_tiles: Int32,
@@ -538,7 +541,7 @@ class _PrologueKernel:
                     if (start < Int32(0)) | (end < start) | (end > live_tokens):
                         flags[1] = Int32(1)
                     initial = Int64(initial_indices[seq])
-                    final = Int64(final_indices[seq])
+                    final = Int64(final_indices[seq.to(Int64) * final_stride])
                     checkpoint = Int64(checkpoint_indices[seq])
                     offset = checkpoint_offsets[seq].to(Int32)
                     slot_limit = Int64(self.max_state_slots)
@@ -636,7 +639,7 @@ class _PrologueKernel:
         while seq < bounded_seqs:
             if cutlass.const_expr(self.validate):
                 initial = Int64(initial_indices[seq])
-                final = Int64(final_indices[seq])
+                final = Int64(final_indices[seq.to(Int64) * final_stride])
                 if not self._is_null(initial):
                     if (initial >= Int64(0)) & (initial < Int64(self.max_state_slots)):
                         if initial != final:
@@ -1099,6 +1102,7 @@ class _RecurrenceKernel:
         v_stride: Int64,
         out_stride: Int64,
         slot_stride: Int64,
+        final_stride: Int64,
         token_capacity: Int32,
         window: Int32,
         stream: cuda.CUstream,
@@ -1106,7 +1110,8 @@ class _RecurrenceKernel:
         self.kernel(
             v, cu_seqlens, band_base, sorted_seq, window_table, initial_indices, final_indices,
             checkpoint_indices, checkpoint_offsets, num_seqs, error_code, ready, ws,
-            recurrent_state, output, v_stride, out_stride, slot_stride, token_capacity, window,
+            recurrent_state, output, v_stride, out_stride, slot_stride, final_stride,
+            token_capacity, window,
         ).launch(
             grid=(self.heads * self.splits, self.rows, 1),
             block=(self.threads, 1, 1),
@@ -1270,6 +1275,7 @@ class _RecurrenceKernel:
         v_stride: Int64,
         out_stride: Int64,
         slot_stride: Int64,
+        final_stride: Int64,
         token_capacity: Int32,
         window: Int32,
     ):
@@ -1498,7 +1504,7 @@ class _RecurrenceKernel:
                 count = Int32(0)
                 if has_tiles:
                     initial = Int64(initial_indices[seq])
-                    final = Int64(final_indices[seq])
+                    final = Int64(final_indices[seq.to(Int64) * final_stride])
                     checkpoint = Int64(checkpoint_indices[seq])
                     offset = checkpoint_offsets[seq].to(Int32)
                     for nb in cutlass.range_constexpr(self.nb_blocks):
@@ -1753,7 +1759,9 @@ class _RecurrenceKernel:
                     while empty_rank < live_seqs:
                         empty_seq = sorted_seq[empty_rank].to(Int32)
                         empty_initial = Int64(initial_indices[empty_seq])
-                        empty_final = Int64(final_indices[empty_seq])
+                        empty_final = Int64(
+                            final_indices[empty_seq.to(Int64) * final_stride]
+                        )
                         if not self._is_null(empty_final):
                             for nb in cutlass.range_constexpr(self.nb_blocks):
                                 acc[nb, 0] = Float32(0.0)
@@ -1832,10 +1840,11 @@ def _compile_recurrence(binding: Binding) -> tuple[tuple[object, ...], Callable[
         Int64(1),
         Int64(1),
         Int64(1),
+        Int64(1),
         Int32(1),
         Int32(0),
         current_cuda_stream(),
-        compile_spec=KernelCompileSpec.from_key("sequence.kda_prefill.recurrence", 7, key),
+        compile_spec=KernelCompileSpec.from_key("sequence.kda_prefill.recurrence", 8, key),
     )
 
     def launch(active: Binding, window: int) -> None:
@@ -1860,6 +1869,7 @@ def _compile_recurrence(binding: Binding) -> tuple[tuple[object, ...], Callable[
             int(active.v.stride(0)),
             int(active.output.stride(0)),
             int(active.recurrent_state.stride(0)),
+            int(active.final_state_indices.stride(0)),
             int(active.token_capacity),
             int(window),
             current_cuda_stream(),
@@ -1940,11 +1950,12 @@ def _compile_prologue(binding: Binding) -> tuple[tuple[object, ...], Callable[..
         _fake_pointer(Int32),
         _fake_pointer(Int32),
         _fake_pointer(Int32),
+        Int64(1),
         Int32(1),
         Int32(1),
         Int32(1),
         current_cuda_stream(),
-        compile_spec=KernelCompileSpec.from_key("sequence.kda_prefill.prologue", 4, key),
+        compile_spec=KernelCompileSpec.from_key("sequence.kda_prefill.prologue", 5, key),
     )
 
     def launch(active: Binding, launched_tiles: int) -> None:
@@ -1967,6 +1978,7 @@ def _compile_prologue(binding: Binding) -> tuple[tuple[object, ...], Callable[..
             _pointer(active.pos_local, Int32),
             _pointer(active.window_table, Int32),
             _pointer(active.ready_flags, Int32),
+            int(active.final_state_indices.stride(0)),
             int(active.seq_capacity),
             int(active.token_capacity),
             int(launched_tiles),
@@ -2151,10 +2163,11 @@ def run_prefill(
     """Launch the window pipeline: prologue, then prepare and recurrence per window.
 
     Prepare launches run on a per-device side stream, recurrence launches on
-    the current stream. A window's recurrence overlaps its own prepare through
-    the ready flags; prepare of window ``w`` waits for the recurrence of window
-    ``w - 2`` before reusing that workspace ring slot. Under stream capture the
-    fork and join are recorded as graph dependencies.
+    the current stream. Recurrence waits for its window's prepare, while the
+    next prepare can overlap the previous recurrence. Prepare of window ``w``
+    waits for the recurrence of window ``w - 2`` before reusing that workspace
+    ring slot. Under stream capture the fork and join are recorded as graph
+    dependencies.
     """
     device = binding.output.device
     plan = binding.plan
@@ -2179,6 +2192,7 @@ def run_prefill(
                     side.wait_event(consumed[window - 2])
                 run_prepare(binding, lower_bound=lower_bound, scale=scale, eps=eps, window=window)
                 prepared[window].record(side)
+            main.wait_event(prepared[window])
             run_recurrence(binding, window=window)
             consumed[window].record(main)
         main.wait_event(prepared[launched - 1])

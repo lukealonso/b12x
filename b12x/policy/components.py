@@ -9,6 +9,7 @@ MOE_DECODE = "moe.decode"
 QSA_ATTENTION = "attention.qsa"
 SPARSE_MLA_ATTENTION = "attention.sparse_mla"
 VARLEN_ATTENTION = "attention.varlen"
+BLOCKSCALED_PRECISION = "gemm.blockscaled_precision"
 BLOCK_FP8_LINEAR = "gemm.block_fp8_linear"
 BF16_VOCAB_PROJECTION = "gemm.bf16_vocab_projection"
 WO_PROJECTION = "gemm.wo_projection"
@@ -23,6 +24,7 @@ PLE_EMBEDDING = "sequence.ple_embedding"
 PLE_HASH = "sequence.ple_hash"
 
 __all__ = [
+    "BLOCKSCALED_PRECISION",
     "BLOCK_FP8_LINEAR",
     "BF16_VOCAB_PROJECTION",
     "COMPRESSED_SPARSE_MLA_ATTENTION",

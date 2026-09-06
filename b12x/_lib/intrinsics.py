@@ -2941,6 +2941,62 @@ def fp8x4_e4m3_to_bfloat2x2_via_f16(
 
 
 @dsl_user_op
+def nvfp4_pair_to_bf16x2_sm120(
+    packed: Uint32, scale: Uint32, *, loc=None, ip=None
+) -> Uint32:
+    """Decode raw NVFP4 and E4M3 scale bytes using PTX 9.2 on SM120a.
+
+    Every finite E2M1 * E4M3 product is exactly representable in BF16.
+    """
+    return Uint32(llvm.inline_asm(
+        T.i32(), [Uint32(packed).ir_value(loc=loc, ip=ip),
+                  Uint32(scale).ir_value(loc=loc, ip=ip)],
+        """
+        {
+            .reg .b8 q;
+            .reg .b16 sf;
+            .reg .b32 values, factors, sf_pair;
+            cvt.u8.u32 q, $1;
+            shl.b32 sf_pair, $2, 8;
+            or.b32 sf_pair, $2, sf_pair;
+            cvt.u16.u32 sf, sf_pair;
+            cvt.rn.bf16x2.e2m1x2 values, q;
+            cvt.rn.bf16x2.e4m3x2 factors, sf;
+            mul.bf16x2 $0, values, factors;
+        }
+        """,
+        "=r,r,r", has_side_effects=False, is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip,
+    ))
+
+
+@dsl_user_op
+def mxfp8_pair_to_bf16x2_sm120(
+    packed: Uint32, scale: Uint32, *, loc=None, ip=None
+) -> Uint32:
+    """Decode E4M3 pairs and an unmodified UE8M0 byte on SM120a."""
+    return Uint32(llvm.inline_asm(
+        T.i32(), [Uint32(packed).ir_value(loc=loc, ip=ip),
+                  Uint32(scale).ir_value(loc=loc, ip=ip)],
+        """
+        {
+            .reg .b16 q, sf;
+            .reg .b32 values, factors, sf_pair;
+            cvt.u16.u32 q, $1;
+            cvt.rn.bf16x2.e4m3x2 values, q;
+            shl.b32 sf_pair, $2, 8;
+            or.b32 sf_pair, $2, sf_pair;
+            cvt.u16.u32 sf, sf_pair;
+            cvt.rn.bf16x2.ue8m0x2 factors, sf;
+            mul.bf16x2 $0, values, factors;
+        }
+        """,
+        "=r,r,r", has_side_effects=False, is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip,
+    ))
+
+
+@dsl_user_op
 def fp8x4_e4m3_to_bfloat2x2_native_sm120(
     packed: Uint32, *, loc=None, ip=None
 ) -> Tuple[Uint32, Uint32]:

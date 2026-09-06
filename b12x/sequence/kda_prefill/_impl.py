@@ -344,10 +344,19 @@ def bind(
     index_dtypes = (torch.int32, torch.int64)
     for name, tensor in (
         ("initial_state_indices", initial_state_indices),
-        ("final_state_indices", final_state_indices),
         ("checkpoint_state_indices", checkpoint_state_indices),
     ):
         require_tensor(name, tensor, shape=(seq_capacity,), device=device, dtypes=index_dtypes)
+    require_tensor(
+        "final_state_indices",
+        final_state_indices,
+        shape=(seq_capacity,),
+        device=device,
+        dtypes=index_dtypes,
+        contiguous=False,
+    )
+    if final_state_indices.stride(0) <= 0:
+        raise ValueError("final_state_indices must have a positive stride")
     if not (initial_state_indices.dtype == final_state_indices.dtype == checkpoint_state_indices.dtype):
         raise TypeError("state index tensors must share one dtype")
     require_tensor(

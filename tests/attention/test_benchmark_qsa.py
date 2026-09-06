@@ -138,6 +138,28 @@ def test_cache_estimate_uses_disjoint_main_kv_and_scales_state_by_request() -> N
     assert many.compressed_pages_per_request == 512
 
 
+def test_planned_capacity_is_independent_of_live_prefill_shape() -> None:
+    case = benchmark_qsa.BenchmarkCase(
+        benchmark_qsa.PROFILES["tp1"],
+        6_016,
+        32_768,
+        kind="prefill",
+        main_page_size=3_008,
+        planned_max_batch=4,
+        planned_max_q_rows=6_019,
+        planned_max_speculative_tokens=3,
+    )
+
+    assert case.request_count == 1
+    assert case.planned_batch == 4
+    assert case.planned_q_rows == 6_019
+    assert case.max_speculative_tokens == 0
+    assert case.planned_speculative_tokens == 3
+    assert case.main_pages_total == 11
+    assert case.main_pages_capacity == 44
+    assert case.compressed_pages_capacity == 44
+
+
 def test_disjoint_main_page_tables_have_unique_request_ranges() -> None:
     table = benchmark_qsa._disjoint_page_table(
         4,
@@ -292,7 +314,7 @@ def test_benchmark_calls_only_the_public_qsa_lifecycle() -> None:
     )
 
 
-def test_sparse_gqa_has_no_triton_alternate() -> None:
+def test_sparse_gqa_implementation_modules_are_imported_lazily() -> None:
     repository = Path(benchmark_qsa.__file__).resolve().parents[1]
     source = textwrap.dedent(
         """
@@ -302,12 +324,15 @@ def test_sparse_gqa_has_no_triton_alternate() -> None:
         from b12x.attention.qsa import _sparse_gqa
 
         cute_module = "b12x.attention.qsa._sparse_gqa_cute"
+        selected_paged_module = "b12x.attention.paged._selected_forward"
         assert cute_module not in sys.modules
+        assert selected_paged_module not in sys.modules
         source = inspect.getsource(_sparse_gqa).lower()
-        assert "triton" not in source
         assert "_cute_is_candidate" in source
+        assert "launch_selected_paged_gqa_direct" in source
         assert "notimplementederror" in source
         assert cute_module not in sys.modules
+        assert selected_paged_module not in sys.modules
         """
     )
 

@@ -11,6 +11,7 @@ import torch
 from ..._lib.scratch import ScratchBufferSpec, scratch_buffer_spec, scratch_tensor
 from ...policy import PolicyContext, PolicyResolution, get_auto_policy
 from ._policy import QSA_POLICY, QsaConfig, QsaQuery
+from ._sparse_gqa_cute_config import MAX_SPLIT_ROWS as _MAX_SPLIT_ROWS
 
 _ALIGN_BYTES = 256
 _SCORE_WORKSPACE_LIMIT_BYTES = 128 * 1024 * 1024
@@ -516,6 +517,7 @@ class _KernelCaps:
 def _target_splits(caps: Caps, rows: int) -> tuple[int, int]:
     from ._sparse_gqa_cute_config import (
         BLOCK_N as QWEN_CUTE_BLOCK_N,
+        MAX_SPLIT_ROWS as QWEN_CUTE_MAX_SPLIT_ROWS,
         NUM_SPLITS as QWEN_CUTE_NUM_SPLITS,
         is_qwen_geometry,
     )
@@ -529,7 +531,15 @@ def _target_splits(caps: Caps, rows: int) -> tuple[int, int]:
         splits=QWEN_CUTE_NUM_SPLITS,
     ):
         rows = int(rows)
-        splits = 64 if rows == 1 else 32 if rows <= 4 else 16
+        splits = (
+            64
+            if rows == 1
+            else 32
+            if rows <= 4
+            else 16
+            if rows <= QWEN_CUTE_MAX_SPLIT_ROWS
+            else 1
+        )
         return QWEN_CUTE_BLOCK_N, splits
     raise NotImplementedError(
         "QSA requires the CuTe Qwen sparse-GQA geometry: q_heads divisible by "
@@ -571,8 +581,11 @@ def _scratch_layout(
         * torch.bfloat16.itemsize
     )
     score_nbytes = workspace_q_rows * score_workspace_width * torch.float32.itemsize
+    from ._sparse_gqa_cute_config import MAX_SPLIT_ROWS
+
     max_split_row_product = max(
-        rows * _target_splits(caps, rows)[1] for rows in range(1, workspace_q_rows + 1)
+        rows * _target_splits(caps, rows)[1]
+        for rows in range(1, min(workspace_q_rows, MAX_SPLIT_ROWS) + 1)
     )
     partial_output_nbytes = (
         max_split_row_product
@@ -1407,6 +1420,7 @@ def _qsa_decode_impl(
     rope_sin: torch.Tensor,
     output: torch.Tensor,
     selected_positions: torch.Tensor,
+    sparse_gqa_direct_kv_warps: int,
     max_seq_len: int,
     max_speculative_tokens: int,
     compress_ratio: int,
@@ -1833,12 +1847,15 @@ def _qsa_decode_impl(
         )
 
         block_n, splits = _target_splits(caps, chunk_rows)
-        split_output = partial_output_storage[: chunk_rows * splits].view(
-            chunk_rows, splits, q_heads, head_dim
-        )
-        split_lse = partial_lse_storage[: chunk_rows * splits].view(
-            chunk_rows, splits, q_heads
-        )
+        split_output = None
+        split_lse = None
+        if splits > 1:
+            split_output = partial_output_storage[: chunk_rows * splits].view(
+                chunk_rows, splits, q_heads, head_dim
+            )
+            split_lse = partial_lse_storage[: chunk_rows * splits].view(
+                chunk_rows, splits, q_heads
+            )
         active_output = output[row_slice]
         launch_sparse_paged_gqa(
             query=query[row_slice],
@@ -1856,6 +1873,7 @@ def _qsa_decode_impl(
             softmax_scale=1.0 / math.sqrt(head_dim),
             block_n=block_n,
             splits=splits,
+            direct_kv_warps=int(sparse_gqa_direct_kv_warps),
         )
         launch_poison_failed_rows(output=active_output, state_errors=chunk_errors)
 
@@ -1906,6 +1924,7 @@ def _qsa_decode_op(
     rope_sin: torch.Tensor,
     output: torch.Tensor,
     selected_positions: torch.Tensor,
+    sparse_gqa_direct_kv_warps: int,
     max_seq_len: int,
     max_speculative_tokens: int,
     compress_ratio: int,
@@ -1990,6 +2009,7 @@ def _qsa_decode_op(
         rope_sin,
         output,
         selected_positions,
+        sparse_gqa_direct_kv_warps,
         max_seq_len,
         max_speculative_tokens,
         compress_ratio,
@@ -2053,6 +2073,7 @@ def _qsa_decode_fake(
     rope_sin: torch.Tensor,
     output: torch.Tensor,
     selected_positions: torch.Tensor,
+    sparse_gqa_direct_kv_warps: int,
     max_seq_len: int,
     max_speculative_tokens: int,
     compress_ratio: int,
@@ -2180,6 +2201,7 @@ def _qsa_decode_shared_op(
     rope_sin: torch.Tensor,
     output: torch.Tensor,
     selected_positions: torch.Tensor,
+    sparse_gqa_direct_kv_warps: int,
     max_raw_state_slots: int,
     raw_ring_capacity: int,
     max_seq_len: int,
@@ -2274,6 +2296,7 @@ def _qsa_decode_shared_op(
         rope_sin,
         output,
         selected_positions,
+        sparse_gqa_direct_kv_warps,
         max_seq_len,
         max_speculative_tokens,
         compress_ratio,
@@ -2333,6 +2356,7 @@ def _qsa_decode_shared_fake(
     rope_sin: torch.Tensor,
     output: torch.Tensor,
     selected_positions: torch.Tensor,
+    sparse_gqa_direct_kv_warps: int,
     max_raw_state_slots: int,
     raw_ring_capacity: int,
     max_seq_len: int,
@@ -2537,6 +2561,7 @@ def run(
             binding.rope_sin,
             binding.output,
             binding.selected_positions,
+            int(binding.plan.policy_resolution.config.sparse_gqa_direct_kv_warps),
             int(caps.max_raw_state_slots),
             int(caps.raw_ring_capacity),
             int(caps.max_seq_len),
@@ -2600,6 +2625,7 @@ def run(
         binding.rope_sin,
         binding.output,
         binding.selected_positions,
+        int(binding.plan.policy_resolution.config.sparse_gqa_direct_kv_warps),
         int(caps.max_seq_len),
         int(caps.max_speculative_tokens),
         int(caps.compress_ratio),
@@ -2633,6 +2659,85 @@ def run(
     return binding.output[:rows]
 
 
+def prewarm(binding: Binding, *, rows: int | None = None) -> None:
+    """Compile a bound QSA transaction without mutating persistent state.
+
+    Every synthetic row has an invalid request ID and position. The launch
+    therefore compiles the plan's exact row capacity, cache-table stride,
+    selector workspace, and sparse-GQA specialization while all cache accesses
+    and persistent selector-state writes remain masked. Scratch, output, and
+    selected-position buffers are transient and have unspecified contents
+    after this call.
+    """
+    if not isinstance(binding, Binding):
+        raise TypeError("binding must be a qsa.Binding")
+
+    caps = binding.plan.caps
+    requested_rows = int(caps.max_q_rows if rows is None else rows)
+    if not 0 < requested_rows <= int(caps.max_q_rows):
+        raise ValueError("prewarm rows must be within the planned QSA capacity")
+    device = caps.device
+    sequence_lengths = torch.zeros(
+        int(caps.max_batch), dtype=torch.int32, device=device
+    )
+    query_start_loc = torch.zeros(
+        int(caps.max_batch) + 1, dtype=torch.int32, device=device
+    )
+    num_accepted_tokens = torch.ones(
+        int(caps.max_batch), dtype=torch.int32, device=device
+    )
+    is_prefilling = torch.ones(int(caps.max_batch), dtype=torch.bool, device=device)
+    warm_rows = {requested_rows}
+    if int(caps.max_q_rows) > _MAX_SPLIT_ROWS:
+        warm_rows.add(min(_MAX_SPLIT_ROWS, int(caps.max_q_rows)))
+        warm_rows.add(_MAX_SPLIT_ROWS + 1)
+    for warm_row_count in sorted(warm_rows):
+        query = torch.empty(
+            (warm_row_count, int(caps.q_heads), int(caps.head_dim)),
+            dtype=caps.dtype,
+            device=device,
+        )
+        index_query = torch.empty(
+            (warm_row_count, int(caps.index_heads), int(caps.index_head_dim)),
+            dtype=caps.dtype,
+            device=device,
+        )
+        raw_index_key = torch.empty(
+            (warm_row_count, int(caps.index_head_dim)),
+            dtype=caps.dtype,
+            device=device,
+        )
+        query_positions = torch.full(
+            (warm_row_count,), -1, dtype=torch.int64, device=device
+        )
+        rope_positions = torch.full(
+            (warm_row_count, int(caps.position_axes)),
+            -1,
+            dtype=torch.int64,
+            device=device,
+        )
+        for request_id_dtype in (torch.int32, torch.int64):
+            request_ids = torch.full(
+                (warm_row_count,),
+                -1,
+                dtype=request_id_dtype,
+                device=device,
+            )
+            run(
+                binding,
+                query=query,
+                index_query=index_query,
+                raw_index_key=raw_index_key,
+                request_ids=request_ids,
+                query_positions=query_positions,
+                rope_positions=rope_positions,
+                sequence_lengths=sequence_lengths,
+                query_start_loc=query_start_loc,
+                num_accepted_tokens=num_accepted_tokens,
+                is_prefilling=is_prefilling,
+            )
+
+
 def is_supported(device: torch.device | str | None = None) -> bool:
     """Return whether the mandatory CuTe QSA dependencies are available."""
     from ..._lib.gating import has_cutlass_dsl, has_triton
@@ -2649,6 +2754,7 @@ __all__ = [
     "cache_requirements",
     "plan",
     "bind",
+    "prewarm",
     "run",
     "is_supported",
 ]

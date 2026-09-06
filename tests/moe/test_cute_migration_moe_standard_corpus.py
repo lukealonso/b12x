@@ -289,7 +289,12 @@ def _prepare_and_bind(
     quant_mode: str,
     source_format: str,
     num_topk: int = _TOPK,
+    w13_layout: str = "w13",
+    fast_math: bool | None = False,
+    swiglu_limit: float | None = None,
 ) -> _BoundCase:
+    """Prepare checkpoint weights and bind caller-owned launch storage."""
+
     from b12x.moe.fused_moe._impl import TPMoEScratchCaps, plan_tp_moe_scratch
 
     experts = prepare_tp_moe_fp4_experts(
@@ -305,7 +310,7 @@ def _prepare_and_bind(
         activation="silu",
         quant_mode=quant_mode,
         source_format=source_format,
-        w13_layout="w13",
+        w13_layout=w13_layout,
     )
     scratch_plan = plan_tp_moe_scratch(
         TPMoEScratchCaps(
@@ -316,6 +321,7 @@ def _prepare_and_bind(
             quant_mode=quant_mode,
             core_token_counts=(int(inputs.a.shape[0]),),
             route_num_experts=0,
+            swiglu_limit=swiglu_limit,
             frozen=True,
         )
     )
@@ -332,7 +338,7 @@ def _prepare_and_bind(
         topk_ids=inputs.topk_ids,
         output=output,
         input_scales_static=True,
-        fast_math=False,
+        fast_math=fast_math,
     )
     assert binding.output is output
     return _BoundCase(
@@ -384,6 +390,8 @@ def _run_live_graph_check(
     require_bit_exact_replay: bool = True,
     assert_no_replay_allocations: bool = False,
 ) -> None:
+    """Validate eager execution and in-place graph replay against GPU oracles."""
+
     from b12x.moe.fused_moe._impl import b12x_moe_fp4
 
     binding = case.binding
@@ -423,7 +431,13 @@ def _run_live_graph_check(
     initial.a.copy_(changed.a)
     initial.topk_ids.copy_(changed.topk_ids)
     initial.topk_weights.copy_(changed.topk_weights)
-    live_tensors = (*case.scratch, initial.a, initial.topk_ids, initial.topk_weights, output)
+    live_tensors = (
+        *case.scratch,
+        initial.a,
+        initial.topk_ids,
+        initial.topk_weights,
+        output,
+    )
     live_addresses = tuple(tensor.data_ptr() for tensor in live_tensors)
     replay_output = None
     for replay_idx in range(replay_count):
@@ -445,7 +459,9 @@ def _run_live_graph_check(
                 replay_idx,
                 "live CUDA bytes changed during graph replay",
             )
-            assert tuple(tensor.data_ptr() for tensor in live_tensors) == live_addresses, (
+            assert (
+                tuple(tensor.data_ptr() for tensor in live_tensors) == live_addresses
+            ), (
                 context,
                 replay_idx,
                 "serving tensor address changed during graph replay",
@@ -885,6 +901,405 @@ def test_standard_moe_external_route_plan_live_graph_oracle(
     torch.testing.assert_close(case.binding.row_counts, expected_counts)
     expected_tiles = int(((expected_counts + 15) // 16).sum().item())
     assert int(case.binding.expert_tile_base[-1].item()) == expected_tiles
+
+
+def test_standard_moe_glm53_tp4_nvfp4_live_graph_replay(
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+) -> None:
+    """Replay 42 bindings with GLM-5.3 TP4-local NVFP4 expert dimensions.
+
+    One synthetic weight set with 288 experts, hidden width 4096, and local
+    intermediate width 512 backs independent inputs and outputs. All bindings
+    share scratch and run sequentially in one captured graph.
+    """
+
+    from b12x._lib.runtime_control import (
+        freeze_kernel_resolution,
+        unfreeze_kernel_resolution,
+    )
+    from b12x.moe.fused_moe._impl import b12x_moe_fp4
+
+    num_experts = 288
+    hidden_size = 4096
+    intermediate_size = 512
+    topk = 8
+    tokens = 128
+    device = require_b12x()
+    _reset_dispatch_environment(monkeypatch)
+    weights = _make_nvfp4_weights(
+        device,
+        seed=211,
+        num_experts=num_experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+    )
+    weights = _Weights(
+        w1_fp4=weights.w1_fp4,
+        w1_scale=weights.w1_scale,
+        w1_alpha=weights.w1_alpha,
+        a1_scale=torch.linspace(
+            0.7, 1.3, num_experts, dtype=torch.float32, device=device
+        ),
+        w2_fp4=weights.w2_fp4,
+        w2_scale=weights.w2_scale,
+        w2_alpha=weights.w2_alpha,
+        a2_scale=torch.linspace(
+            0.8, 1.2, num_experts, dtype=torch.float32, device=device
+        ),
+    )
+    initial = _make_inputs(
+        device,
+        m=tokens,
+        seed=212,
+        route_shift=0,
+        num_experts=num_experts,
+        hidden_size=hidden_size,
+        topk=topk,
+    )
+    case = _prepare_and_bind(
+        weights,
+        initial,
+        quant_mode="nvfp4",
+        source_format="modelopt_nvfp4",
+        num_topk=topk,
+        w13_layout="w31",
+        fast_math=None,
+        swiglu_limit=10.0,
+    )
+    assert case.scratch_plan.launch_plan.implementation == "dynamic"
+    assert case.binding.implementation == "dynamic"
+
+    layer_inputs = [initial]
+    bindings = [case.binding]
+    for layer_idx in range(1, 42):
+        layer_input = _make_inputs(
+            device,
+            m=tokens,
+            seed=212 + layer_idx,
+            route_shift=layer_idx * 7,
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            topk=topk,
+        )
+        layer_output = torch.empty_like(layer_input.a)
+        layer_binding = case.scratch_plan.bind(
+            scratch=case.scratch,
+            a=layer_input.a,
+            experts=case.experts,
+            topk_weights=layer_input.topk_weights,
+            topk_ids=layer_input.topk_ids,
+            output=layer_output,
+            input_scales_static=True,
+            fast_math=None,
+        )
+        assert layer_binding.implementation == "dynamic"
+        layer_inputs.append(layer_input)
+        bindings.append(layer_binding)
+
+    for binding in bindings:
+        b12x_moe_fp4(binding=binding)
+    torch.cuda.synchronize()
+    assert all(
+        bool(binding.output.float().isfinite().all().item()) for binding in bindings
+    )
+    request.addfinalizer(unfreeze_kernel_resolution)
+    freeze_kernel_resolution("GLM-shaped MoE capture and live replay")
+
+    graph = torch.cuda.CUDAGraph()
+    capture_stream = torch.cuda.Stream()
+    capture_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(capture_stream), torch.cuda.graph(graph):
+        for binding in bindings:
+            b12x_moe_fp4(binding=binding)
+    torch.cuda.current_stream().wait_stream(capture_stream)
+    torch.cuda.synchronize()
+
+    for layer_idx, layer_input in enumerate(layer_inputs):
+        layer_changed = _make_inputs(
+            device,
+            m=tokens,
+            seed=413 + layer_idx,
+            route_shift=97 + layer_idx * 11,
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            topk=topk,
+        )
+        layer_input.a.copy_(layer_changed.a)
+        layer_input.topk_ids.copy_(layer_changed.topk_ids)
+        layer_input.topk_weights.copy_(layer_changed.topk_weights)
+    for binding in bindings:
+        b12x_moe_fp4(binding=binding)
+    torch.cuda.synchronize()
+    expected = tuple(binding.output.clone() for binding in bindings)
+    assert all(bool(output.float().isfinite().all().item()) for output in expected)
+
+    live_tensors = list(case.scratch)
+    for layer_input, binding in zip(layer_inputs, bindings, strict=True):
+        live_tensors.extend(
+            (
+                layer_input.a,
+                layer_input.topk_ids,
+                layer_input.topk_weights,
+                binding.output,
+            )
+        )
+    live_addresses = tuple(tensor.data_ptr() for tensor in live_tensors)
+
+    for replay_idx in range(3):
+        for binding in bindings:
+            binding.output.fill_(37.0)
+        allocation_count_before = torch.cuda.memory_stats(device)[
+            "allocation.all.allocated"
+        ]
+        allocated_bytes_before = torch.cuda.memory_allocated(device)
+        graph.replay()
+        torch.cuda.synchronize()
+        assert (
+            torch.cuda.memory_stats(device)["allocation.all.allocated"]
+            == allocation_count_before
+        ), (replay_idx, "CUDA allocation during 42-layer graph replay")
+        assert torch.cuda.memory_allocated(device) == allocated_bytes_before, (
+            replay_idx,
+            "live CUDA bytes changed during 42-layer graph replay",
+        )
+        assert tuple(tensor.data_ptr() for tensor in live_tensors) == live_addresses, (
+            replay_idx,
+            "serving tensor address changed during 42-layer graph replay",
+        )
+        for layer_idx, (binding, layer_expected) in enumerate(
+            zip(bindings, expected, strict=True)
+        ):
+            assert bool(binding.output.float().isfinite().all().item()), (
+                replay_idx,
+                layer_idx,
+            )
+            error = (
+                (binding.output.float() - layer_expected.float()).square().mean().sqrt()
+            )
+            reference_rms = layer_expected.float().square().mean().sqrt()
+            assert float(error / reference_rms) < 0.01, (replay_idx, layer_idx)
+
+
+def test_standard_moe_glm53_tp4_nvfp4_multishape_graph_replay(
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+) -> None:
+    """Replay token widths 8 through 128 against one shared CUDA workspace.
+
+    Each eight-token increment has an independent captured graph. One uint8
+    allocation backs every graph's scratch after a 256-byte-aligned reservation
+    of tokens * hidden_size * sizeof(BF16) bytes. Outputs have separate storage.
+    Full and half-active route sets reuse the prewarmed plans with kernel
+    resolution frozen.
+    """
+
+    from b12x._lib.runtime_control import (
+        freeze_kernel_resolution,
+        unfreeze_kernel_resolution,
+    )
+    from b12x.moe.fused_moe._impl import (
+        TPMoEScratchCaps,
+        b12x_moe_fp4,
+        plan_tp_moe_scratch,
+    )
+
+    num_experts = 288
+    hidden_size = 4096
+    intermediate_size = 512
+    topk = 8
+    device = require_b12x()
+    _reset_dispatch_environment(monkeypatch)
+    weights = _make_nvfp4_weights(
+        device,
+        seed=251,
+        num_experts=num_experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+    )
+    weights = _Weights(
+        w1_fp4=weights.w1_fp4,
+        w1_scale=weights.w1_scale,
+        w1_alpha=weights.w1_alpha,
+        a1_scale=torch.linspace(
+            0.7, 1.3, num_experts, dtype=torch.float32, device=device
+        ),
+        w2_fp4=weights.w2_fp4,
+        w2_scale=weights.w2_scale,
+        w2_alpha=weights.w2_alpha,
+        a2_scale=torch.linspace(
+            0.8, 1.2, num_experts, dtype=torch.float32, device=device
+        ),
+    )
+    owner_input = _make_inputs(
+        device,
+        m=128,
+        seed=252,
+        route_shift=0,
+        num_experts=num_experts,
+        hidden_size=hidden_size,
+        topk=topk,
+    )
+    owner = _prepare_and_bind(
+        weights,
+        owner_input,
+        quant_mode="nvfp4",
+        source_format="modelopt_nvfp4",
+        num_topk=topk,
+        w13_layout="w31",
+        fast_math=None,
+        swiglu_limit=10.0,
+    )
+
+    plans = []
+    workspace_sizes = []
+    for tokens in range(8, 129, 8):
+        plan = plan_tp_moe_scratch(
+            TPMoEScratchCaps(
+                max_tokens=tokens,
+                num_topk=topk,
+                device=owner.experts.w1_fp4.device,
+                weight_plan=owner.experts.plan,
+                quant_mode="nvfp4",
+                core_token_counts=(tokens,),
+                route_num_experts=0,
+                swiglu_limit=10.0,
+                frozen=True,
+            )
+        )
+        output_nbytes = tokens * hidden_size * torch.bfloat16.itemsize
+        output_workspace_nbytes = (output_nbytes + 255) // 256 * 256
+        scratch_nbytes = plan.scratch_specs()[0].nbytes
+        assert plan.launch_plan.implementation == "dynamic", tokens
+        plans.append((tokens, plan, output_workspace_nbytes))
+        workspace_sizes.append(output_workspace_nbytes + scratch_nbytes)
+
+    workspace = torch.empty(max(workspace_sizes), dtype=torch.uint8, device=device)
+    graphs = []
+    graph_owners = []
+    for graph_idx, (tokens, plan, scratch_offset) in enumerate(plans):
+        inputs = _make_inputs(
+            device,
+            m=tokens,
+            seed=253 + graph_idx,
+            route_shift=graph_idx * 13,
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            topk=topk,
+        )
+        output = torch.empty_like(inputs.a)
+        scratch = workspace.narrow(
+            0,
+            scratch_offset,
+            workspace.numel() - scratch_offset,
+        )
+        binding = plan.bind(
+            scratch=scratch,
+            a=inputs.a,
+            experts=owner.experts,
+            topk_weights=inputs.topk_weights,
+            topk_ids=inputs.topk_ids,
+            output=output,
+            input_scales_static=True,
+            fast_math=None,
+        )
+        assert binding.implementation == "dynamic", tokens
+        b12x_moe_fp4(binding=binding)
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        capture_stream = torch.cuda.Stream()
+        capture_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(capture_stream), torch.cuda.graph(graph):
+            workspace.fill_(0xA5)
+            captured_binding = plan.bind(
+                scratch=scratch,
+                a=inputs.a,
+                experts=owner.experts,
+                topk_weights=inputs.topk_weights,
+                topk_ids=inputs.topk_ids,
+                output=output,
+                input_scales_static=True,
+                fast_math=None,
+            )
+            assert captured_binding.implementation == "dynamic", tokens
+            b12x_moe_fp4(binding=captured_binding)
+        torch.cuda.current_stream().wait_stream(capture_stream)
+        torch.cuda.synchronize()
+        graphs.append(graph)
+        graph_owners.append(
+            (inputs, output, scratch, binding, captured_binding, capture_stream)
+        )
+
+    live_tensors = [workspace]
+    for inputs, output, scratch, _binding, _captured_binding, _stream in graph_owners:
+        live_tensors.extend(
+            (inputs.a, inputs.topk_ids, inputs.topk_weights, output, scratch)
+        )
+    live_addresses = tuple(tensor.data_ptr() for tensor in live_tensors)
+    request.addfinalizer(unfreeze_kernel_resolution)
+    freeze_kernel_resolution("GLM-shaped MoE replay with full and inactive routes")
+
+    for replay_idx in range(3):
+        graph_order = (
+            range(len(graphs)) if replay_idx % 2 == 0 else reversed(range(len(graphs)))
+        )
+        for graph_idx in graph_order:
+            inputs, output, _scratch, binding, _captured_binding, _capture_stream = (
+                graph_owners[graph_idx]
+            )
+            inputs.topk_ids.copy_(
+                torch.arange(topk, dtype=torch.int32, device=device)
+                .unsqueeze(0)
+                .expand_as(inputs.topk_ids)
+            )
+            inputs.topk_weights.fill_(1.0 / topk)
+            live_tokens = inputs.topk_ids.shape[0]
+            if replay_idx == 2:
+                live_tokens = max(1, inputs.topk_ids.shape[0] // 2)
+                inputs.topk_ids[live_tokens:].fill_(-1)
+                inputs.topk_weights[live_tokens:].zero_()
+
+            workspace.fill_(0xA5)
+            b12x_moe_fp4(binding=binding)
+            torch.cuda.synchronize()
+            expected = output.clone()
+
+            output.fill_(37.0)
+            allocation_count_before = torch.cuda.memory_stats(device)[
+                "allocation.all.allocated"
+            ]
+            allocated_bytes_before = torch.cuda.memory_allocated(device)
+            graphs[graph_idx].replay()
+            torch.cuda.synchronize()
+            assert (
+                torch.cuda.memory_stats(device)["allocation.all.allocated"]
+                == allocation_count_before
+            ), (replay_idx, graph_idx, "CUDA allocation during graph replay")
+            assert torch.cuda.memory_allocated(device) == allocated_bytes_before, (
+                replay_idx,
+                graph_idx,
+                "live CUDA bytes changed during graph replay",
+            )
+            assert (
+                tuple(tensor.data_ptr() for tensor in live_tensors) == live_addresses
+            ), (
+                replay_idx,
+                graph_idx,
+                "serving tensor address changed during graph replay",
+            )
+            _assert_oracle(
+                output,
+                expected,
+                context=f"glm53-tp4-nvfp4-multishape-m{output.shape[0]}-replay-{replay_idx}",
+                min_cos=0.999,
+                max_normalized_rmse=0.01,
+            )
+            assert torch.count_nonzero(output[:live_tokens]).item() > 0
+            if live_tokens < inputs.topk_ids.shape[0]:
+                assert (
+                    torch.count_nonzero(inputs.topk_ids[live_tokens:] + 1).item() == 0
+                )
+                assert torch.count_nonzero(output[live_tokens:]).item() == 0
 
 
 @pytest.mark.parametrize("m", [80, 96])

@@ -1577,11 +1577,13 @@ def test_ple_decode_invalid_speculative_metadata_fails_without_mutation(
 
 
 @pytest.mark.parametrize(
-    ("query_start_loc", "num_accepted_tokens", "error_mask"),
+    ("query_start_loc", "num_accepted_tokens", "error_mask", "token_count"),
     [
-        ([0, 1, 6], [99, 1], 4),
-        ([0, 1, 2], [0, 0], 8),
-        ([0, 1, 2], [99, 6], 8),
+        ([0, 1, 6], [99, 1], 4, None),
+        ([0, 1, 2], [0, 0], 8, None),
+        ([0, 1, 2], [99, 6], 8, None),
+        ([0, 1, 2], [99, 1], 1, 1),
+        ([0, 1, 2], [99, 1], 1, 0),
     ],
 )
 @torch.inference_mode()
@@ -1589,6 +1591,7 @@ def test_ple_mixed_invalid_decode_metadata_fails_without_mutation(
     query_start_loc: list[int],
     num_accepted_tokens: list[int],
     error_mask: int,
+    token_count: int | None,
 ) -> None:
     device = require_b12x()
     max_tokens, streams, hidden = 6, 2, 32
@@ -1631,11 +1634,12 @@ def test_ple_mixed_invalid_decode_metadata_fails_without_mutation(
         request_is_prefill=torch.tensor([True, False], dtype=torch.bool, device=device),
     )
 
-    ple.run_mixed(binding, eps=1e-6)
+    out = ple.run_mixed(binding, eps=1e-6, token_count=token_count)
     torch.cuda.synchronize()
 
     assert binding.error_code.item() & error_mask
-    assert bool((binding.out == 0).all().item())
+    assert bool((out == 0).all().item())
+    assert bool((binding.out[out.shape[0] :] == 91).all().item())
     torch.testing.assert_close(conv_state, state_before, rtol=0, atol=0)
 
 
@@ -2080,10 +2084,19 @@ def test_ple_mixed_replays_runtime_request_modes_without_allocation() -> None:
     torch.testing.assert_close(conv_state, expected_state, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize(
+    ("token_count", "high_state_slots"), [(None, False), (8, False), (8, True)]
+)
 @torch.inference_mode()
-def test_ple_target_mixed_graph_replays_dynamic_packed_metadata() -> None:
+def test_ple_target_mixed_graph_replays_dynamic_packed_metadata(
+    token_count: int | None, high_state_slots: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from triton.runtime import JITFunction
+
+    from b12x.sequence.ple import _kernels
+
     device = require_b12x()
-    max_tokens, streams, hidden = 8, 4, 2560
+    max_tokens, streams, hidden = 16, 4, 2560
     kernel_size, dilation, max_speculative = 4, 3, 4
     residual, key, value, weights, generator = _cuda_projected_inputs(
         max_tokens, streams, hidden, device=device, seed=1214
@@ -2098,14 +2111,17 @@ def test_ple_target_mixed_graph_replays_dynamic_packed_metadata() -> None:
         / 32
     ).contiguous()
     state_length = dilation * (kernel_size - 1)
-    conv_state = torch.randn(
-        (3, streams * hidden, state_length + max_speculative),
-        generator=generator,
+    slot_stride = streams * hidden * (state_length + max_speculative)
+    slot_offset = (1 << 31) // slot_stride + 1 if high_state_slots else 0
+    conv_state = torch.empty(
+        (slot_offset + 3, streams * hidden, state_length + max_speculative),
         dtype=torch.bfloat16,
         device=device,
     )
+    live_state = conv_state[slot_offset:]
+    live_state.normal_(generator=generator)
     query_start_loc = torch.tensor([0, 2, 5, 5], dtype=torch.int32, device=device)
-    state_slot_ids = torch.tensor([0, 1, 2], dtype=torch.int64, device=device)
+    state_slot_ids = torch.arange(3, dtype=torch.int64, device=device) + slot_offset
     state_is_fresh = torch.tensor([True, False, False], dtype=torch.bool, device=device)
     num_accepted_tokens = torch.tensor([99, 2, 1], dtype=torch.int32, device=device)
     request_is_prefill = torch.tensor(
@@ -2131,9 +2147,29 @@ def test_ple_target_mixed_graph_replays_dynamic_packed_metadata() -> None:
     )
 
     ple.run_mixed(binding, eps=1e-6)
+
+    def reject_resolution(*args, **kwargs):
+        pytest.fail("Live launch bounds must reuse the warmed PLE kernels")
+
+    for kernel in vars(_kernels).values():
+        if isinstance(kernel, JITFunction):
+            monkeypatch.setattr(kernel, "_do_compile", reject_resolution)
+
+    state_before = live_state.clone()
+    binding.num_seqs.zero_()
+    binding.num_tokens.zero_()
+    for launch_bound in (0, 1, 3, 8):
+        binding.out.fill_(91)
+        out = ple.run_mixed(binding, eps=1e-6, token_count=launch_bound)
+        assert bool((out == 0).all().item())
+        assert bool((binding.out[launch_bound:] == 91).all().item())
+    torch.testing.assert_close(live_state, state_before, rtol=0, atol=0)
+    binding.num_seqs.fill_(2)
+    binding.num_tokens.fill_(5)
+    binding.out.fill_(91)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        captured_out = ple.run_mixed(binding, eps=1e-6)
+        captured_out = ple.run_mixed(binding, eps=1e-6, token_count=token_count)
     output_address = captured_out.data_ptr()
 
     query_start_loc.copy_(torch.tensor([0, 1, 5, 8], dtype=torch.int32, device=device))
@@ -2151,7 +2187,7 @@ def test_ple_target_mixed_graph_replays_dynamic_packed_metadata() -> None:
     residual.copy_(torch.randn_like(residual).mul_(0.2))
     key.copy_(torch.randn_like(key).mul_(0.2))
     value.copy_(torch.randn_like(value).mul_(0.2))
-    conv_state.copy_(torch.randn_like(conv_state).mul_(0.2))
+    live_state.copy_(torch.randn_like(live_state).mul_(0.2))
     expected_out, expected_state = _mixed_layer_reference(
         residual=residual,
         key=key,
@@ -2159,16 +2195,21 @@ def test_ple_target_mixed_graph_replays_dynamic_packed_metadata() -> None:
         weights=weights,
         conv_weight=conv_weight,
         query_start_loc=query_start_loc,
-        state_slot_ids=state_slot_ids,
+        state_slot_ids=state_slot_ids - slot_offset,
         state_is_fresh=state_is_fresh,
         num_accepted_tokens=num_accepted_tokens,
         request_is_prefill=request_is_prefill,
         num_seqs=3,
         num_tokens=8,
-        conv_state=conv_state,
+        conv_state=live_state,
         dilation=dilation,
         eps=1e-6,
     )
+    initial_state = live_state.clone()
+    full_out = ple.run_mixed(binding, eps=1e-6).clone()
+    full_state = live_state.clone()
+    live_state.copy_(initial_state)
+    binding.out.fill_(91)
     allocated_before_replay = torch.cuda.memory_allocated(device)
     graph.replay()
     torch.cuda.synchronize(device)
@@ -2177,8 +2218,15 @@ def test_ple_target_mixed_graph_replays_dynamic_packed_metadata() -> None:
     assert binding.error_code.item() == 0
     assert captured_out.data_ptr() == output_address == binding.out.data_ptr()
     assert allocated_after_replay == allocated_before_replay
-    torch.testing.assert_close(captured_out, expected_out, rtol=0.02, atol=0.0078125)
-    torch.testing.assert_close(conv_state, expected_state, rtol=0, atol=0)
+    torch.testing.assert_close(
+        captured_out, expected_out[: captured_out.shape[0]], rtol=0.02, atol=0.0078125
+    )
+    torch.testing.assert_close(
+        captured_out, full_out[: captured_out.shape[0]], rtol=0, atol=0
+    )
+    assert bool((binding.out[captured_out.shape[0] :] == 91).all().item())
+    torch.testing.assert_close(live_state, expected_state, rtol=0, atol=0)
+    torch.testing.assert_close(live_state, full_state, rtol=0, atol=0)
 
 
 @torch.inference_mode()

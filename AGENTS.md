@@ -1,5 +1,9 @@
 # b12x Guidance
 
+- Follow the repository's existing CuTe DSL patterns for core compute kernels,
+  including GEMM, attention, and MoE. Use Triton only for minor supporting
+  metadata or packing kernels; do not use it for core compute kernels or their
+  prototypes.
 - Benchmark the real target path before making performance claims. Capture the
   command, commit, worktree, GPU mode, correctness state, raw timings, and
   ratio direction.

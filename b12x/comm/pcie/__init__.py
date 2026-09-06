@@ -11,6 +11,8 @@ pools via ``<Class>Pool``.
   (+ ``all_reduce_fused_add_rms_norm``).
 - ``DmaAllReduce``: CE-copy ring reduce-scatter + all-gather for prefill
   sizes, with a runtime crossover autotuner (``autotune_dma_crossovers``).
+- ``PCIeTwoShotBF16``: single-rounding BF16 reduce-scatter, all-gather, and
+  all-reduce with FP32 accumulation followed by one BF16 rounding.
 - ``TwoShotReduceScatter``: two-shot sequence-parallel collectives with
   per-token FP8-e4m3 transport.
 - ``DcpAllToAll``: DCP attention exchange with fused LSE reduce-scatter.
@@ -38,6 +40,7 @@ META = OpMeta(
         "OneshotAllReduce",
         "OneshotAllReducePool",
         "DmaAllReduce",
+        "PCIeTwoShotBF16",
         "TwoShotReduceScatter",
         "DcpAllToAll",
         "DcpAllToAllPool",
@@ -72,6 +75,7 @@ if TYPE_CHECKING:  # static analysis only; runtime resolution is lazy
         DmaAllReduce,
         OneshotAllReduce,
         OneshotAllReducePool,
+        PCIeTwoShotBF16,
         TwoShotReduceScatter,
         VocabParallelArgmax,
         autotune_dma_crossovers,

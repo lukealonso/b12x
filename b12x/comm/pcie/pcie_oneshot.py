@@ -1045,10 +1045,23 @@ def _coordinated_close_channels(
     if not unique_channels:
         return
 
+    def barrier() -> None:
+        if exchange_group is None:
+            return
+        if device.type == "cuda":
+            device_index = (
+                device.index
+                if device.index is not None
+                else torch.cuda.current_device()
+            )
+            dist.barrier(group=exchange_group, device_ids=[device_index])
+        else:
+            dist.barrier(group=exchange_group)
+
     if exchange_group is not None:
         if device.type == "cuda":
             torch.cuda.synchronize(device)
-        dist.barrier(group=exchange_group)
+        barrier()
 
     # Channels with strict cleanup report local unmap status before any rank
     # releases exports. Legacy channels retain their original ordered close.
@@ -1058,12 +1071,10 @@ def _coordinated_close_channels(
     if not uses_strict_protocol:
         for channel in unique_channels:
             channel._close_ipc_imports()
-        if exchange_group is not None:
-            dist.barrier(group=exchange_group)
+        barrier()
         for channel in unique_channels:
             channel._free_ipc_exports()
-        if exchange_group is not None:
-            dist.barrier(group=exchange_group)
+        barrier()
         return
 
     unmap_errors = _run_close_phase(
@@ -1084,8 +1095,7 @@ def _coordinated_close_channels(
             exports_retained=True,
         )
 
-    if exchange_group is not None:
-        dist.barrier(group=exchange_group)
+    barrier()
 
     free_errors = _run_close_phase(
         unique_channels,
@@ -1105,8 +1115,7 @@ def _coordinated_close_channels(
             exports_retained=False,
         )
 
-    if exchange_group is not None:
-        dist.barrier(group=exchange_group)
+    barrier()
     for channel in unique_channels:
         if hasattr(channel, "_close_ipc_imports_strict"):
             channel._coordinated_close_complete = True

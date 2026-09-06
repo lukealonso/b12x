@@ -34,8 +34,10 @@ def _expand_pooled_topk_to_physical_slots_kernel(
 
     sequence_length = tl.load(last_token_positions + row).to(tl.int64) + 1
     complete_pools = sequence_length // POOL_SIZE
+    selected_pools = tl.minimum(complete_pools, HISTORY_TOKENS // POOL_SIZE)
+    selected_history_tokens = selected_pools * POOL_SIZE
     tail_start = complete_pools * POOL_SIZE
-    history = column < HISTORY_TOKENS
+    history = column < selected_history_tokens
     pool_column = column // POOL_SIZE
     pool_offset = column % POOL_SIZE
     pool_id = tl.load(
@@ -44,7 +46,7 @@ def _expand_pooled_topk_to_physical_slots_kernel(
         other=-1,
     ).to(tl.int64)
     history_value = tl.where(pool_id >= 0, pool_id * POOL_SIZE + pool_offset, -1)
-    tail_offset = column - HISTORY_TOKENS
+    tail_offset = column - selected_history_tokens
     tail_count = sequence_length - tail_start
     in_tail = (tail_offset >= 0) & (tail_offset < tail_count)
     logical_token = tl.where(
@@ -70,7 +72,6 @@ def _expand_pooled_topk_to_physical_slots_kernel(
     ).to(tl.int32)
     tl.store(output + row * output_stride + column, physical_token, mask=mask)
 
-    selected_pools = tl.minimum(complete_pools, HISTORY_TOKENS // POOL_SIZE)
     active_count = selected_pools * POOL_SIZE + tail_count
     tl.store(active_counts + row, active_count, mask=tile == 0)
 
@@ -91,7 +92,8 @@ def expand_pooled_topk_to_physical_slots(
     """Expand selected pools and the live tail into physical cache slots.
 
     The caller supplies request-relative pool IDs, scheduler metadata, and
-    caller-owned outputs. The output width must cover every selected pool plus
+    caller-owned outputs. Selected pools and the live tail occupy one contiguous
+    prefix of the output. The output width must cover every selected pool plus
     at most ``pool_size - 1`` unpooled tail tokens. Physical-slot arithmetic is
     performed in 64 bits and the result remains an int32 sparse-MLA index.
     """

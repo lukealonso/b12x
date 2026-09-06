@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any
 
 from .components import (
     BF16_VOCAB_PROJECTION,
+    BLOCKSCALED_PRECISION,
     BLOCK_FP8_LINEAR,
     COMPRESSED_SPARSE_MLA_ATTENTION,
     DSA_INDEXER,
@@ -309,13 +310,26 @@ PLANNING_COMPONENTS = (
 )
 
 
+# One-shot APIs resolve static geometry before capture. They do not
+# acquire a public plan/bind/run surface by participating in offline profiling.
+ONESHOT_COMPONENTS = (
+    PlanningComponentRegistration(
+        op_qualname="gemm.blockscaled",
+        mode=PlanningPolicyMode.PROFILED,
+        component_id=BLOCKSCALED_PRECISION,
+        policy_ref="b12x.gemm.blockscaled._policy:BLOCKSCALED_POLICY",
+        generator_ref="b12x.policy.generation.providers.blockscaled:BlockscaledPrecisionGenerator",
+    ),
+)
+
+
 def _validate_catalog() -> None:
-    op_qualnames = tuple(item.op_qualname for item in PLANNING_COMPONENTS)
+    op_qualnames = tuple(item.op_qualname for item in (*PLANNING_COMPONENTS, *ONESHOT_COMPONENTS))
     if len(op_qualnames) != len(set(op_qualnames)):
         raise ValueError("planned ops cannot have duplicate policy registrations")
     component_ids = tuple(
         item.component_id
-        for item in PLANNING_COMPONENTS
+        for item in (*PLANNING_COMPONENTS, *ONESHOT_COMPONENTS)
         if item.mode is PlanningPolicyMode.PROFILED
     )
     if len(component_ids) != len(set(component_ids)):
@@ -338,7 +352,7 @@ def list_profiled_components() -> tuple[PlanningComponentRegistration, ...]:
         sorted(
             (
                 item
-                for item in PLANNING_COMPONENTS
+                for item in (*PLANNING_COMPONENTS, *ONESHOT_COMPONENTS)
                 if item.mode is PlanningPolicyMode.PROFILED
             ),
             key=lambda item: str(item.component_id),
@@ -348,6 +362,7 @@ def list_profiled_components() -> tuple[PlanningComponentRegistration, ...]:
 
 __all__ = [
     "PLANNING_COMPONENTS",
+    "ONESHOT_COMPONENTS",
     "PlanningComponentRegistration",
     "PlanningPolicyMode",
     "list_planning_components",
