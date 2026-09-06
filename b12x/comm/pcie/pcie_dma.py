@@ -25,6 +25,11 @@ import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
 from ._cuda_ipc import CudaRTLibrary
+from .pcie_dma_reference import (
+    granule_elems_for,
+    piece_offset_elems,
+    ring_schedule,
+)
 from .pcie_oneshot import PCIeOneshotAllReduce, _normalize_device
 
 logger = logging.getLogger(__name__)
@@ -137,6 +142,27 @@ def _load_kernels():
     return DmaKernels(CudaRTLibrary())
 
 
+def _ring_granule_rows() -> int:
+    """Opt-in row-count-invariant chunk mapping of the lossless ring.
+
+    The served mapping reduces flat chunk ``c`` (``numel / world`` contiguous
+    elements) in the rank order ``c, c + 1, ..., c - 1``, so an element's
+    reduction order depends on its row block ``row // (rows / world)`` and a
+    tensor reduced as row slices does not reproduce the bits of the tensor
+    reduced whole. With ``B12X_PCIE_RING_GRANULE_ROWS=g`` (``g > 0``) a 2-D
+    ``[rows, width]`` input is reduced in granules of ``g`` rows: granule
+    ``b`` belongs to chunk ``b mod world``, so the order depends only on
+    ``row mod (world * g)`` and every row slice whose length is a multiple of
+    ``world * g`` rows reduces bit-identically to the whole. The wire bytes
+    and the number of roundings are unchanged; only the summation order of
+    the reduced tensors changes. Inputs that are not 2-D, whose row count is
+    not a multiple of ``world * g``, that would need more than ``MAX_PIECES``
+    granules per chunk, or that use a compressed wire keep the served
+    mapping. 0 (default): served mapping everywhere.
+    """
+    return max(0, int(os.getenv("B12X_PCIE_RING_GRANULE_ROWS", "0")))
+
+
 def _graph_replay_mode() -> bool:
     """Opt-in CUDA-graph replay of eager ring all-reduces.
 
@@ -194,10 +220,17 @@ class PCIeDmaAllReduce:
         max_bytes: int,
         ext_module=None,
         fp8: Optional[str] = None,
+        granule_rows: Optional[int] = None,
     ) -> None:
         # Kept only as a source-compatible keyword for callers that used to
         # inject the removed C++ extension.  Device work is always CuTe DSL.
         del ext_module
+        # Explicit arguments win over the environment (same contract as fp8).
+        self._granule_rows = (
+            max(0, int(granule_rows))
+            if granule_rows is not None
+            else _ring_granule_rows()
+        )
         self.group = exchange_group
         self.rank = dist.get_rank(group=exchange_group)
         self.world_size = dist.get_world_size(group=exchange_group)
@@ -314,7 +347,11 @@ class PCIeDmaAllReduce:
         self.wire_mode = wire_modes.get(
             self._fp8, f"fp8-{self._fp8}" if self._fp8 else "bf16"
         )
-        logger.debug("[PCIe DMA allreduce] wire mode: %s", self.wire_mode)
+        logger.debug(
+            "[PCIe DMA allreduce] wire mode: %s, granule rows: %d",
+            self.wire_mode,
+            self._granule_rows,
+        )
         prepare = getattr(self._kernels, "prepare", None)
         if prepare is not None:
             prepare(world_size=self.world_size, wire_mode=self._fp8)
@@ -386,6 +423,28 @@ class PCIeDmaAllReduce:
     def _scratch_ptr(self, rank: int, step: int) -> int:
         return self._scratch_base[rank] + step * self.shard_capacity
 
+    def _granule_elems(self, inp: torch.Tensor) -> int:
+        """Elements per granule of the row-count-invariant mapping for
+        ``inp``, or 0 when ``inp`` reduces with the served mapping (see
+        ``_ring_granule_rows``). Every rank sees the same shape, so every
+        rank takes the same branch."""
+        if self._fp8:
+            return 0
+        return granule_elems_for(
+            tuple(inp.shape), self.world_size, self._granule_rows, MAX_PIECES
+        )
+
+    def _replay_key(self, inp: torch.Tensor) -> tuple[int, torch.dtype, int]:
+        """Replay cache key: the flat size, the dtype and the granule size.
+
+        The granule size (0 for the served mapping) is part of the key
+        because two tensors of equal size but different widths reduce with
+        different granule mappings ([4608, 3584] and [2304, 7168] are both
+        16,515,072 elements); the served mapping is width-independent, so
+        with granules off the key reduces to the served (numel, dtype).
+        """
+        return (inp.numel(), inp.dtype, self._granule_elems(inp))
+
     @staticmethod
     def _pick_pieces(shard_elems: int, shard_bytes: int) -> int:
         override = int(os.getenv("B12X_PCIE_DMA_PIECES", "0"))
@@ -431,7 +490,7 @@ class PCIeDmaAllReduce:
     def _all_reduce_replayed(
         self, inp: torch.Tensor, out: Optional[torch.Tensor]
     ) -> torch.Tensor:
-        key = (inp.numel(), inp.dtype)
+        key = self._replay_key(inp)
         entry = self._replay_entries.get(key)
         if entry is None:
             seen = self._replay_seen.get(key, 0) + 1
@@ -494,7 +553,7 @@ class PCIeDmaAllReduce:
                 graph.capture_end()
         main.wait_stream(side)
         entry = _ReplayEntry(static_in, static_out, graph, slot)
-        self._replay_entries[(inp.numel(), inp.dtype)] = entry
+        self._replay_entries[self._replay_key(inp)] = entry
         logger.debug(
             "[PCIe DMA allreduce] captured replay graph for numel=%d dtype=%s "
             "(%d cached)",
@@ -543,6 +602,9 @@ class PCIeDmaAllReduce:
         self, inp: torch.Tensor, out: torch.Tensor
     ) -> torch.Tensor:
         """Reduce equal, eight-element-aligned shards into the supplied output."""
+        granule_elems = self._granule_elems(inp)
+        if granule_elems:
+            return self._all_reduce_lossless(inp, out, granule_elems=granule_elems)
         kernels = self._kernels
         world = self.world_size
         rank = self.rank
@@ -789,6 +851,146 @@ class PCIeDmaAllReduce:
         main.wait_stream(copy_stream)
         main.wait_stream(flag_stream)
         done = steps * pieces
+        kernels.dma_set_flag(
+            self._flag_ptr(prv, done), self._counter_ptr(self._send_counters, done)
+        )
+        kernels.dma_wait_flag(
+            self._flag_ptr(rank, done), self._counter_ptr(self._wait_counters, done)
+        )
+        return out
+
+    def _all_reduce_lossless(
+        self,
+        inp: torch.Tensor,
+        out: torch.Tensor,
+        *,
+        granule_elems: int = 0,
+    ) -> torch.Tensor:
+        """Lossless ring all-reduce with a selectable chunk-to-element mapping.
+
+        The step table comes from ``ring_schedule`` and the element mapping
+        from ``piece_offset_elems``, which the CPU proofs execute as well, so
+        what the tests reason about is what this loop issues. The kernel
+        sequence per (step, piece) is the one ``_all_reduce_aligned`` issues
+        on its lossless path: one CE copy on the copy stream, one flag on the
+        flag stream, one wait plus one add (reduce-scatter) or placement copy
+        (all-gather) on the main stream, and one neighbour handshake at the
+        end. Only the mapping differs:
+
+        * ``granule_elems == 0``: the served contiguous mapping, chunk ``c``
+          is elements ``[c * shard, (c + 1) * shard)`` cut into
+          ``_pick_pieces`` pieces.
+        * ``granule_elems > 0``: a piece is one granule and granule ``b`` of
+          the flat buffer belongs to chunk ``b % world``, which fixes the
+          number of pieces at ``shard_elems / granule_elems``.
+
+        Scratch, flag slots and events are the ones ``_all_reduce_aligned``
+        uses; the two schedules never run concurrently on one channel.
+        """
+        kernels = self._kernels
+        world = self.world_size
+        rank = self.rank
+        nxt = (rank + 1) % world
+        prv = (rank - 1) % world
+        dtype_code = SUPPORTED_DTYPES[inp.dtype]
+        elem = inp.element_size()
+        shard_elems = inp.numel() // world
+        shard_bytes = shard_elems * elem
+        if granule_elems:
+            if shard_elems % granule_elems:
+                raise ValueError(
+                    f"granule of {granule_elems} elements does not tile the "
+                    f"{shard_elems}-element shard"
+                )
+            pieces = shard_elems // granule_elems
+            if not 1 <= pieces <= MAX_PIECES:
+                raise ValueError(
+                    f"{pieces} granules per chunk exceed MAX_PIECES={MAX_PIECES}"
+                )
+        else:
+            pieces = self._pick_pieces(shard_elems, shard_bytes)
+        piece_elems = shard_elems // pieces
+        piece_bytes = piece_elems * elem
+        schedule = ring_schedule(world)
+
+        main = torch.cuda.current_stream(self.device)
+        copy_stream = self._copy_stream
+        flag_stream = self._flag_stream
+        add_done = self._piece_events
+        copied = self._copied_events
+        base = out.data_ptr()
+        in_base = inp.data_ptr()
+        self._input_ready.record(main)
+        copy_stream.wait_event(self._input_ready)
+        flag_stream.wait_event(self._input_ready)
+
+        def piece_offset(chunk: int, piece: int) -> int:
+            return (
+                piece_offset_elems(
+                    chunk,
+                    piece,
+                    world=world,
+                    shard_elems=shard_elems,
+                    piece_elems=piece_elems,
+                    granule=bool(granule_elems),
+                )
+                * elem
+            )
+
+        def piece_ptr(chunk: int, piece: int) -> int:
+            return base + piece_offset(chunk, piece)
+
+        def in_piece_ptr(chunk: int, piece: int) -> int:
+            return in_base + piece_offset(chunk, piece)
+
+        def scratch_piece(owner: int, step: int, piece: int) -> int:
+            return self._scratch_ptr(owner, step) + piece * piece_bytes
+
+        for step in schedule:
+            k = step.step
+            send_chunk = (rank + step.send_offset) % world
+            recv_chunk = (rank + step.recv_offset) % world
+            for p in range(pieces):
+                send_src = (
+                    in_piece_ptr(send_chunk, p)
+                    if step.send_from == "input"
+                    else piece_ptr(send_chunk, p)
+                )
+                slot = k * pieces + p
+                with torch.cuda.stream(copy_stream):
+                    if k > 0:
+                        copy_stream.wait_event(add_done[p])
+                    kernels.dma_copy(scratch_piece(nxt, k, p), send_src, piece_bytes)
+                    copied[slot].record(copy_stream)
+                with torch.cuda.stream(flag_stream):
+                    flag_stream.wait_event(copied[slot])
+                    kernels.dma_set_flag(
+                        self._flag_ptr(nxt, slot),
+                        self._counter_ptr(self._send_counters, slot),
+                    )
+                kernels.dma_wait_flag(
+                    self._flag_ptr(rank, slot),
+                    self._counter_ptr(self._wait_counters, slot),
+                )
+                if step.op == "add":
+                    kernels.dma_add(
+                        piece_ptr(recv_chunk, p),
+                        in_piece_ptr(recv_chunk, p),
+                        scratch_piece(rank, k, p),
+                        piece_elems,
+                        dtype_code,
+                    )
+                else:
+                    kernels.dma_copy(
+                        piece_ptr(recv_chunk, p),
+                        scratch_piece(rank, k, p),
+                        piece_bytes,
+                    )
+                add_done[p].record(main)
+
+        main.wait_stream(copy_stream)
+        main.wait_stream(flag_stream)
+        done = len(schedule) * pieces
         kernels.dma_set_flag(
             self._flag_ptr(prv, done), self._counter_ptr(self._send_counters, done)
         )
