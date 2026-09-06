@@ -1670,14 +1670,7 @@ def warmup_mixed_trellis_route_pack(
     *,
     expert_map: torch.Tensor,
 ) -> int:
-    """Materialize every route-pack specialization reachable by ``launch``.
-
-    Route packing buckets token capacity to powers of two. A profile pass at
-    the maximum batch therefore does not cover smaller decode, speculative,
-    or final-prefill-chunk buckets. Load those CUDA modules eagerly while the
-    serving framework is still profiling persistent memory, so KV sizing sees
-    their real driver footprint instead of discovering it under live traffic.
-    """
+    """Warm the fixed routing arena before serving memory profiling."""
     device = buffers.packed_route_indices.device
     if device.type != "cuda":
         raise RuntimeError("mixed Trellis route-pack warmup requires CUDA buffers")
@@ -1695,8 +1688,8 @@ def warmup_mixed_trellis_route_pack(
             key = (
                 device_index,
                 str(launch.route_ids_dtype),
-                int(token_count),
-                int(launch.top_k),
+                int(buffers.packed_route_indices.numel()),
+                int(buffers.block_expert_ids.numel()),
                 route_num_experts,
                 int(launch.moe_block_size),
                 True,

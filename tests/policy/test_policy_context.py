@@ -52,7 +52,7 @@ def _component(
     *,
     heuristic_backend: str = "heuristic",
 ) -> ComponentPolicy[_Query, _Config]:
-    def decode(payload: FrozenMapping) -> _Config:
+    def decode(query: _Query, device: DeviceIdentity | None, payload: FrozenMapping) -> _Config:
         return _Config(
             backend=str(payload["backend"]),
             workers=int(payload["workers"]),
@@ -228,10 +228,10 @@ def test_repeated_preplanned_resolution_is_cached() -> None:
     decode_calls = 0
     validate_calls = 0
 
-    def decode(payload: FrozenMapping) -> _Config:
+    def decode(query: _Query, device: DeviceIdentity | None, payload: FrozenMapping) -> _Config:
         nonlocal decode_calls
         decode_calls += 1
-        return base.decode_profile(payload)
+        return base.decode_profile(query, device, payload)
 
     def validate(
         query: _Query,

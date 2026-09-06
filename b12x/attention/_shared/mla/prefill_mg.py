@@ -10,6 +10,7 @@ from global/L2.
 from __future__ import annotations
 
 import os
+from dataclasses import replace
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -114,6 +115,14 @@ _NVFP4_SCALE_GROUP = 16
 def _ld_global_index_i32(index_base_ptr: Int64, entry: Int32) -> Int32:
     """Load one selected-token index directly from the tile's global row."""
     return Int32(ld_global_nc_u32(index_base_ptr + entry.to(Int64) * Int64(4)))
+
+
+@cute.jit
+def _ld_global_index_i32_bounded(index_base_ptr: Int64, entry: Int32, valid_entries: Int32) -> Int32:
+    index = Int32(-1)
+    if entry < valid_entries:
+        index = _ld_global_index_i32(index_base_ptr, entry)
+    return index
 
 
 @cute.jit
@@ -327,6 +336,7 @@ def s2_qk_rope_global_mg_dsv4(
     q_rope_g1_addr: Int32,
     kv_cache_u8: cute.Tensor,
     index_base_ptr: Int64,
+    valid_entries: Int32,
     warp_first_cand: Int32,
     lane: Int32,
     page_block_size: Int32,
@@ -353,7 +363,7 @@ def s2_qk_rope_global_mg_dsv4(
     a_row = (lane & Int32(7)) + ((lane >> Int32(3)) & Int32(1)) * Int32(8)
     a_col = (lane >> Int32(4)) * Int32(8)
     entry = warp_first_cand + gid
-    idx = _ld_global_index_i32(index_base_ptr, entry)
+    idx = _ld_global_index_i32_bounded(index_base_ptr, entry, valid_entries)
     rope_base = _dsv4_rope_base_off(idx, page_block_size, stride_kv_block)
 
     for ks in cutlass.range_constexpr(d_rope // 16):
@@ -466,6 +476,7 @@ def s2_qk_rope_regs_mg_glm(
     q_rope_regs1,
     kv_cache_u8: cute.Tensor,
     index_base_ptr: Int64,
+    valid_entries: Int32,
     warp_first_cand: Int32,
     lane: Int32,
     page_block_size: Int32,
@@ -491,7 +502,7 @@ def s2_qk_rope_regs_mg_glm(
     gid = lane >> Int32(2)
     tid = lane & Int32(3)
     entry = warp_first_cand + gid
-    idx = _ld_global_index_i32(index_base_ptr, entry)
+    idx = _ld_global_index_i32_bounded(index_base_ptr, entry, valid_entries)
     if cutlass.const_expr(scale_format == 2):
         rope_base = _nvfp4_rope_base_off(
             idx,
@@ -1344,6 +1355,7 @@ def s6b_xv_rope_global_mg_dsv4(
     weight_smem_addr: Int32,
     kv_cache_u8: cute.Tensor,
     index_base_ptr: Int64,
+    valid_entries: Int32,
     warp_id: Int32,
     lane: Int32,
     page_block_size: Int32,
@@ -1417,10 +1429,10 @@ def s6b_xv_rope_global_mg_dsv4(
     for ks in cutlass.range_constexpr(bi // 16):
         k_base = Int32(ks) * Int32(16)
         ent0 = k_base + tid * Int32(2)
-        idx0 = _ld_global_index_i32(index_base_ptr, ent0)
-        idx1 = _ld_global_index_i32(index_base_ptr, ent0 + Int32(1))
-        idx8 = _ld_global_index_i32(index_base_ptr, ent0 + Int32(8))
-        idx9 = _ld_global_index_i32(index_base_ptr, ent0 + Int32(9))
+        idx0 = _ld_global_index_i32_bounded(index_base_ptr, ent0, valid_entries)
+        idx1 = _ld_global_index_i32_bounded(index_base_ptr, ent0 + Int32(1), valid_entries)
+        idx8 = _ld_global_index_i32_bounded(index_base_ptr, ent0 + Int32(8), valid_entries)
+        idx9 = _ld_global_index_i32_bounded(index_base_ptr, ent0 + Int32(9), valid_entries)
         v0 = _ld_global_dsv4_rope_b16(
             rope_dim_ptr, idx0, page_block_size, stride_kv_block
         )
@@ -2891,6 +2903,7 @@ class UnifiedPrefillMGKernel:
                 split_cand_end = split_cand_start + Int32(_CAND_WINDOW)
                 if split_cand_end > sec_len_now:
                     split_cand_end = sec_len_now
+                valid_entries = split_cand_end - split_cand_start
                 buf = ci & Int32(1)
                 kv_fp8_b = kv_fp8_addr + buf * kv_fp8_buf
                 kv_sc_b = kv_sc_addr + buf * kv_sc_buf
@@ -2961,6 +2974,7 @@ class UnifiedPrefillMGKernel:
                         q_rope_regs1,
                         rope_cache,
                         index_base_ptr,
+                        valid_entries,
                         warp_first_cand,
                         lane,
                         rope_pbs,
@@ -2997,7 +3011,7 @@ class UnifiedPrefillMGKernel:
                     # consume the prefetched B operands in S2. The selected raw
                     # pointer also lets the dual-cache path share one S2 body.
                     rope_entry = warp_first_cand + (lane >> Int32(2))
-                    rope_idx = _ld_global_index_i32(index_base_ptr, rope_entry)
+                    rope_idx = _ld_global_index_i32_bounded(index_base_ptr, rope_entry, valid_entries)
                     rope_base = _dsv4_rope_base_off(
                         rope_idx, Int32(self.page_block_size), stride_kv_block
                     )
@@ -3131,6 +3145,7 @@ class UnifiedPrefillMGKernel:
                             q_rope_regs1,
                             rope_cache,
                             index_base_ptr,
+                            valid_entries,
                             warp_first_cand,
                             lane,
                             rope_pbs,
@@ -3152,6 +3167,7 @@ class UnifiedPrefillMGKernel:
                             q_rope_g1,
                             rope_cache,
                             index_base_ptr,
+                            valid_entries,
                             warp_first_cand,
                             lane,
                             rope_pbs,
@@ -3421,6 +3437,7 @@ class UnifiedPrefillMGKernel:
                                 w_fp8_addr,
                                 extra_kv_cache_u8,
                                 index_base_ptr,
+                                valid_entries,
                                 warp_id,
                                 lane,
                                 Int32(self.pbs_extra),
@@ -3443,6 +3460,7 @@ class UnifiedPrefillMGKernel:
                                 w_fp8_addr,
                                 kv_cache_u8,
                                 index_base_ptr,
+                                valid_entries,
                                 warp_id,
                                 lane,
                                 Int32(self.page_block_size),
@@ -3465,6 +3483,7 @@ class UnifiedPrefillMGKernel:
                             w_fp8_addr,
                             rope_cache,
                             index_base_ptr,
+                            valid_entries,
                             warp_id,
                             lane,
                             rope_pbs,
@@ -4159,6 +4178,8 @@ def run_unified_prefill_mg(
             fp8_rope=fp8_rope,
             latent_scale_per_token=bool(latent_scale_per_token),
         )
+        if model_type == ModelType.DSV4:
+            traits = replace(traits, compute_mode=int(compute_mode))
         compute_mode = int(traits.compute_mode)
         fp8_rope = bool(traits.fp8_rope)
         latent_scale_per_token = bool(traits.latent_scale_per_token)

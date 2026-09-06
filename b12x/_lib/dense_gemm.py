@@ -398,6 +398,14 @@ def _use_direct_m1_wo_a_inputs(
     )
 
 
+def _capacity_policy_m(live_m: int, capacity_m: Optional[int]) -> int:
+    if capacity_m is None:
+        return int(live_m)
+    if not 0 < live_m <= capacity_m:
+        raise ValueError(f"dense GEMM live M={live_m} exceeds planned capacity {capacity_m}")
+    return int(capacity_m)
+
+
 def _dense_gemm_policy_for(
     *,
     m: int,
@@ -6616,6 +6624,7 @@ def _dense_gemm_launch_flat(
     alpha_is_one: bool,
     target_occupancy_override: Optional[int],
     stream_int: Optional[int],
+    capacity_m: Optional[int] = None,
 ) -> None:
     b_tile_major = b_tensor_gpu.ndim == 5
     policy = _DenseGemmPolicy(
@@ -6652,7 +6661,7 @@ def _dense_gemm_launch_flat(
         b_tile_major=b_tile_major,
         alpha_is_one=alpha_is_one,
         direct_sfa_live16=_use_direct_sfa_live16(
-            m=int(a_tensor_gpu.shape[0]),
+            m=int(a_tensor_gpu.shape[0]) if capacity_m is None else (1 if capacity_m == 1 else -1),
             n=n,
             k=k,
             l=l,
@@ -6667,7 +6676,7 @@ def _dense_gemm_launch_flat(
             is_mxfp8=ab_dtype == "float8_e4m3fn",
         ),
         direct_m1_wo_a_inputs=_use_direct_m1_wo_a_inputs(
-            m=int(a_tensor_gpu.shape[0]),
+            m=int(a_tensor_gpu.shape[0]) if capacity_m is None else (1 if capacity_m == 1 else -1),
             n=n,
             k=k,
             l=l,
@@ -6732,6 +6741,7 @@ def _dense_gemm_launch_op(
     alpha_is_one: bool,
     target_occupancy_override: Optional[int],
     stream_int: Optional[int],
+    capacity_m: Optional[int] = None,
 ) -> None:
     _dense_gemm_launch_flat(
         a_tensor_gpu,
@@ -6768,6 +6778,7 @@ def _dense_gemm_launch_op(
         alpha_is_one,
         target_occupancy_override,
         stream_int,
+        capacity_m,
     )
 
 
@@ -6807,6 +6818,7 @@ def _dense_gemm_launch_fake(
     alpha_is_one: bool,
     target_occupancy_override: Optional[int],
     stream_int: Optional[int],
+    capacity_m: Optional[int] = None,
 ) -> None:
     return None
 
@@ -6893,6 +6905,7 @@ def _dense_gemm_launch_functional_op(
     sfb_k_reuse: bool,
     alpha_is_one: bool,
     stream_int: Optional[int],
+    capacity_m: Optional[int] = None,
 ) -> torch.Tensor:
     m = int(a_tensor_gpu.shape[0])
     out = _empty_dense_gemm_output(
@@ -6951,6 +6964,7 @@ def _dense_gemm_launch_functional_op(
         alpha_is_one,
         None,
         stream_int,
+        capacity_m,
     )
     if split_k_output and not split_k_atomic_bf16:
         _reduce_split_k2_bf16(c_tensor_gpu, out, m=m, n=n)
@@ -6992,6 +7006,7 @@ def _dense_gemm_launch_functional_fake(
     sfb_k_reuse: bool,
     alpha_is_one: bool,
     stream_int: Optional[int],
+    capacity_m: Optional[int] = None,
 ) -> torch.Tensor:
     del (
         b_tensor_gpu,
@@ -7521,6 +7536,7 @@ def dense_gemm_fused_quant_a(
     *,
     out: Optional[torch.Tensor] = None,
     expected_m: Optional[int] = None,
+    _capacity_m: Optional[int] = None,
     sfb_k_replicated: bool = False,
     rhs_values_tiled: Optional[torch.Tensor] = None,
     a_inner_span: int = 0,
@@ -7571,10 +7587,13 @@ def dense_gemm_fused_quant_a(
     if b.ndim != 3 or int(b.shape[1]) != k or int(b.shape[2]) != 1:
         raise ValueError(f"B must have shape [N,{k},1], got {tuple(b.shape)}")
     n = int(b.shape[0])
+    policy_m = _capacity_policy_m(m, _capacity_m)
+    if policy_m > 8:
+        raise ValueError("fused MXFP8 quantization requires capacity M <= 8")
     sm_count = get_num_sm(source.device)
     if mma_tiler_mn is None:
         plan = _select_default_dense_gemm_plan(
-            m, n, k, sm_count, is_mxfp8=True, expected_m=expected_m
+            policy_m, n, k, sm_count, is_mxfp8=True, expected_m=expected_m
         )
         if plan.swap_ab or plan.load_path != "tma":
             raise ValueError(
@@ -7606,7 +7625,7 @@ def dense_gemm_fused_quant_a(
             )
         b_launch = rhs_values_tiled
     policy = _dense_gemm_policy_for(
-        m=m,
+        m=policy_m,
         n=n,
         k=k,
         l=1,
@@ -7659,7 +7678,7 @@ def dense_gemm_fused_quant_a(
         rhs_values_tiled is not None,
         a_inner_span,
         kernel_c_l,
-        m == 1,
+        policy_m == 1,
     )
     compiled(
         source,
@@ -7713,6 +7732,7 @@ def dense_gemm(
     alpha: Optional[torch.Tensor] = None,
     alpha_dtype: Optional[str] = None,
     expected_m: Optional[int] = None,
+    _capacity_m: Optional[int] = None,
     load_path: Optional[Literal["tma", "cpasync"]] = None,
     swap_ab: Optional[bool] = None,
     sfb_k_replicated: bool = False,
@@ -7742,6 +7762,9 @@ def dense_gemm(
     per-regime-optimal kernel that is still reused across all live M in the regime
     (e.g. expected_m<=128 selects a decode-tuned tile). Ignored when mma_tiler_mn
     is given. Live M stays a runtime arg; only the tile (a compile key) changes.
+
+    _capacity_m: internal planned row bound. Kernel policy uses this bound;
+    live rows remain runtime arguments. It is independent of expected_m.
 
     MX-FP6 (``ab_dtype`` in ``float6_e3m2fn``/``float6_e2m3fn``) parameters:
 
@@ -7790,6 +7813,7 @@ def dense_gemm(
         raise ValueError("b_packed and b_preexpanded are mutually exclusive")
 
     m, k, l = a_torch.shape
+    policy_m = _capacity_policy_m(m, _capacity_m)
     n, _, _ = b_torch.shape
     if sm_count is None:
         sm_count = get_num_sm(a_torch.device)
@@ -7979,12 +8003,12 @@ def dense_gemm(
             b_torch = _expand_packed_mxfp6_ab(b_torch, k)
     c_cutlass_dtype = get_cutlass_dtype(c_dtype)
     c_row_stride_bytes = n * c_cutlass_dtype.width // 8
-    output_requires_swapped_store = (m > 1 or l > 1) and c_row_stride_bytes % 16 != 0
+    output_requires_swapped_store = (policy_m > 1 or l > 1) and c_row_stride_bytes % 16 != 0
     use_default_mma_tiler = mma_tiler_mn is None
     use_default_output_storage = mma_tiler_mn is None and swap_ab is None
     if mma_tiler_mn is None or load_path is None or swap_ab is None:
         default_plan = _select_default_dense_gemm_plan(
-            m,
+            policy_m,
             n,
             k,
             sm_count,
@@ -8011,7 +8035,7 @@ def dense_gemm(
     assert swap_ab is not None
     if ab_dtype == "float4_e2m1fn" and _tile_k_override is None:
         tile_k = _select_fp4_tile_k(
-            m,
+            policy_m,
             n,
             k,
             expected_m,
@@ -8090,7 +8114,7 @@ def dense_gemm(
     if alpha_dtype is None:
         alpha_dtype = "float32" if alpha is None else str(alpha.dtype).split(".")[-1]
     policy = _dense_gemm_policy_for(
-        m=m,
+        m=policy_m,
         n=n,
         k=k,
         l=l,
@@ -8350,7 +8374,7 @@ def dense_gemm(
             quantize_c=True,
             alpha_is_one=alpha_is_one,
             direct_sfa_live16=_use_direct_sfa_live16(
-                m=m,
+                m=m if _capacity_m is None else (1 if _capacity_m == 1 else -1),
                 n=n,
                 k=k,
                 l=l,
@@ -8417,6 +8441,7 @@ def dense_gemm(
             sfb_k_reuse,
             alpha_is_one,
             stream_int,
+            _capacity_m,
         )
     split_storage = None
     split_scratch = None
@@ -8527,6 +8552,7 @@ def dense_gemm(
             alpha_is_one,
             _target_occupancy_override,
             stream_int,
+            _capacity_m,
         )
     result = out
     if split_k_output and not split_k_atomic_bf16:

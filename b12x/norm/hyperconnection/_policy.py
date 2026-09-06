@@ -103,7 +103,7 @@ HYPERCONNECTION_POLICY = ComponentPolicy(
     query_fields=frozenset(HyperConnectionQuery.__dataclass_fields__),
     config_fields=frozenset(HyperConnectionConfig.__dataclass_fields__),
     encode_query=_encode,
-    decode_profile=HyperConnectionConfig.from_profile,
+    decode_profile=lambda query, device, payload: HyperConnectionConfig.from_profile(payload),
     heuristic=_heuristic,
     validate_config=_validate,
 )
@@ -114,3 +114,19 @@ __all__ = [
     "HyperConnectionConfig",
     "HyperConnectionQuery",
 ]
+
+
+from b12x.policy.problem import define_problem
+
+TUNING_PROBLEM = define_problem(
+    policy=HYPERCONNECTION_POLICY, query_type=HyperConnectionQuery, config_type=HyperConnectionConfig,
+    axes=('max_tokens', 'hidden_size', 'streams', 'lowrank'),
+    family=('dtype',),
+    constraints=(),
+    environment=(),
+    model_fields=('hidden_size', 'streams', 'lowrank'),
+    decisions={'backend': ('cutedsl',), 'reduction_block_h': None, 'pointwise_block': None,
+               'reduction_num_warps': (1, 2, 4, 8)},
+    ordered=('reduction_block_h', 'pointwise_block', 'reduction_num_warps'),
+    derived_config_fields=(),
+)

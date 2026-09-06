@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -69,9 +69,33 @@ def test_default_measurement_protocol_is_two_warmups_and_five_by_five() -> None:
     assert (settings.warmup, settings.groups, settings.repetitions) == (2, 5, 5)
     assert (args.warmup, args.groups, args.repetitions) == (2, 5, 5)
     assert settings.minimum_cosine == args.minimum_cosine == 0.998
+    assert settings.timing_clock == args.timing_clock == "cuda_event"
 
 
-def test_relaxed_cosine_gate_resumes_stricter_checkpoints(tmp_path) -> None:
+def test_timing_clock_is_explicit_and_invalidates_checkpoint_identity(tmp_path):
+    context = GenerationContext(device=_DEVICE, device_ordinal=0, work_dir=tmp_path,
+                                source_revision="same-source", settings=GenerationSettings())
+    stamped = replace(context, settings=replace(context.settings, timing_clock="globaltimer"))
+    assert not context.checkpoint_metadata_matches(stamped.checkpoint_metadata())
+    assert not stamped.checkpoint_metadata_matches(context.checkpoint_metadata())
+    assert _parser().parse_args(["--timing-clock", "globaltimer"]).timing_clock == "globaltimer"
+    with pytest.raises(ValueError, match="timing_clock"):
+        GenerationSettings(timing_clock="unknown")
+
+
+def test_full_corpus_has_an_explicit_checkpoint_identity(tmp_path):
+    context = GenerationContext(device=_DEVICE, device_ordinal=0, work_dir=tmp_path,
+                                source_revision="same-source", settings=GenerationSettings())
+    full = replace(context, settings=replace(context.settings, full_corpus=True))
+    assert not context.checkpoint_metadata_matches(full.checkpoint_metadata())
+    assert not full.checkpoint_metadata_matches(context.checkpoint_metadata())
+    assert _parser().parse_args(["--full-corpus"]).full_corpus
+    assert not _parser().parse_args([]).full_corpus
+    with pytest.raises(TypeError, match="full_corpus"):
+        GenerationSettings(full_corpus=1)
+
+
+def test_checkpoint_resume_requires_identical_source_and_protocol(tmp_path) -> None:
     relaxed = GenerationContext(
         device=_DEVICE,
         device_ordinal=0,
@@ -87,7 +111,7 @@ def test_relaxed_cosine_gate_resumes_stricter_checkpoints(tmp_path) -> None:
         settings=GenerationSettings(minimum_cosine=0.999),
     )
 
-    assert relaxed.checkpoint_metadata_matches(strict.checkpoint_metadata())
+    assert not relaxed.checkpoint_metadata_matches(strict.checkpoint_metadata())
     assert not strict.checkpoint_metadata_matches(relaxed.checkpoint_metadata())
 
 
@@ -461,7 +485,7 @@ def _measured_generator(*, backend: str, probe: _Probe):
         query_fields=frozenset({"rows"}),
         config_fields=frozenset({"backend"}),
         encode_query=lambda query: {"rows": query.rows},
-        decode_profile=lambda payload: _MeasuredConfig(backend=str(payload["backend"])),
+        decode_profile=lambda query, device, payload: _MeasuredConfig(backend=str(payload["backend"])),
         heuristic=lambda _query, _device: _MeasuredConfig(backend=backend),
         validate_config=lambda _query, _config, _device: None,
     )
@@ -471,6 +495,26 @@ def _measured_generator(*, backend: str, probe: _Probe):
         encode_config=lambda config: {"backend": config.backend},
         probe=probe,
     )
+
+
+def test_fixed_backend_probe_uses_shared_observations_after_index_loss(tmp_path):
+    from dataclasses import replace
+    from b12x.policy.types import FrozenMapping
+
+    calls = []
+    generator = _measured_generator(backend="cute", probe=_Probe(("decode", "prefill"), calls))
+    context = GenerationContext(device=_DEVICE, device_ordinal=0, work_dir=tmp_path,
+                                source_revision="test", settings=GenerationSettings(),
+                                provenance=FrozenMapping({"source_sha256": "contents", "physical_device": "GPU-a",
+                                                          "toolchain": {"compiler": "test"}}))
+    checkpoints = CheckpointStore(tmp_path / "checkpoints")
+    first = generator._measure(context, checkpoints, FrozenMapping({"backend": "cute"}))
+    (checkpoints.root / generator.component_id / "production-qualification.json").unlink()
+    assert generator._measure(context, checkpoints, FrozenMapping({"backend": "cute"})) == first
+    assert len(calls) == 1
+    generator._measure(replace(context, measurement_cohort="holdout"), checkpoints, FrozenMapping({"backend": "cute"}))
+    assert len(calls) == 2
+    assert "measurements" not in checkpoints.load(generator.component_id, "production-qualification")
 
 
 def test_measured_generator_resume_tracks_case_ids_and_config(tmp_path) -> None:
@@ -510,7 +554,7 @@ def test_measured_generator_resume_tracks_case_ids_and_config(tmp_path) -> None:
         progress=NullProgressReporter(),
         checkpoints=checkpoints,
     )
-    assert calls == [("case-a",)]
+    assert calls == [("case-a",), ("case-a",)]
 
     changed_probe = _Probe(("case-b",), calls)
     _measured_generator(backend="fixed", probe=changed_probe).generate(
@@ -523,10 +567,32 @@ def test_measured_generator_resume_tracks_case_ids_and_config(tmp_path) -> None:
         progress=NullProgressReporter(),
         checkpoints=checkpoints,
     )
-    assert calls == [("case-a",), ("case-b",), ("case-b",)]
+    assert calls == [("case-a",), ("case-a",), ("case-b",), ("case-b",)]
 
     checkpoint = checkpoints.load("test.measured", "production-qualification")
     assert checkpoint is not None
     assert checkpoint["schema_version"] == 2
     assert checkpoint["case_ids"] == ["case-b"]
     assert checkpoint["config"] == {"backend": "new-fixed"}
+
+
+def test_api_qualification_evidence_is_retained_without_runtime_entries(tmp_path):
+    @dataclass(frozen=True)
+    class Qualification(_Generator):
+        artifact_kind: str = "qualification"
+
+    context = GenerationContext(device=_DEVICE, device_ordinal=0, work_dir=tmp_path,
+                                source_revision="fixture", settings=GenerationSettings())
+    arguments = dict(profile_id="nvidia.synthetic.48sm", context=context, progress=NullProgressReporter())
+    runtime = generate_profile_artifact(generators=(_Generator("attention.gqa"),), **arguments)
+    qualification = generate_profile_artifact(generators=(Qualification("gemm.bmm"),), **arguments)
+    assert qualification["profile"]["components"] == []
+    assert qualification["evidence"]["components"] == {}
+    assert qualification["evidence"]["api_qualifications"]["gemm.bmm"] == {
+        "gpu_measurement_cases": 1, "query_schema_version": 1, "config_schema_version": 1,
+    }
+    merged = merge_profile_artifacts(runtime, qualification)
+    assert merged["profile"]["components"] == runtime["profile"]["components"]
+    assert merged["evidence"]["api_qualifications"] == qualification["evidence"]["api_qualifications"]
+    with pytest.raises(ValueError, match="unknown generator artifact kind"):
+        generate_profile_artifact(generators=(Qualification("gemm.bmm", artifact_kind="typo"),), **arguments)

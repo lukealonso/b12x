@@ -35,3 +35,17 @@ __all__ = [
     "PleEmbeddingConfig",
     "PleEmbeddingQuery",
 ]
+
+
+from b12x.policy.problem import define_problem
+
+TUNING_PROBLEM = define_problem(
+    policy=PLE_EMBEDDING_POLICY, query_type=PleEmbeddingQuery, config_type=PleEmbeddingConfig,
+    axes=('max_tokens', 'max_seqs', 'vocab_size', 'max_order', 'heads_per_order', 'base_table_size', 'embedding_dim', 'tp_size'),
+    family=('quant_mode', 'table_memory', 'output_dtype'),
+    constraints=(),
+    environment=(),
+    model_fields=('vocab_size', 'max_order', 'heads_per_order', 'base_table_size', 'embedding_dim', 'tp_size'),
+    decisions={'backend': ('triton',)},
+    derived_config_fields=(),
+)

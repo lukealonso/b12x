@@ -7,18 +7,13 @@ so these assertions are load-bearing.
 from __future__ import annotations
 
 import importlib
+import hashlib
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 compiler = importlib.import_module("b12x._lib.compiler")
-kernel_resources = importlib.import_module(
-    "validation.cutlass_migration.evidence.kernel_resources"
-)
-ptx_capture = importlib.import_module(
-    "validation.cutlass_migration.acceptance.corpus.ptx_capture"
-)
 
 
 def test_package_root_is_the_b12x_package():
@@ -350,7 +345,7 @@ def test_frozen_memory_miss_rejects_before_disk_cache_load(monkeypatch):
         runtime_control.unfreeze_kernel_resolution()
 
 
-def test_v6_semantic_payload_matches_independent_validators(monkeypatch):
+def test_v6_semantic_payload_preserves_device_spec_and_compile_options(monkeypatch):
     device_uuid = ("device_uuid", "gpu-contract")
     monkeypatch.setattr(compiler, "_current_device_ordinal", lambda: 0)
     monkeypatch.setattr(compiler, "_device_uuid_key", lambda ordinal: device_uuid)
@@ -367,22 +362,27 @@ def test_v6_semantic_payload_matches_independent_validators(monkeypatch):
     compile_spec = compiler.KernelCompileSpec.from_facts(
         "test.uuid.manifest",
         1,
-        ("rows", 8),
+        ("capacity_rows", 8),
     )
     payload = compiler._compile_disk_cache_payload(
         object(),
-        test_v6_semantic_payload_matches_independent_validators,
+        test_v6_semantic_payload_preserves_device_spec_and_compile_options,
         (),
         {"mode": "test"},
         compile_spec,
     )
-    serialized_payload = compiler._manifest_json_value(payload)
-    expected = compiler._semantic_compile_manifest_payload(payload)
-
-    assert (
-        ptx_capture._semantic_payload_from_cache_payload(serialized_payload) == expected
-    )
-    assert (
-        kernel_resources._semantic_payload_from_cache_payload(serialized_payload)
-        == expected
-    )
+    expected = {
+        "cache_format": "b12x_cute_compile_cache_v6_explicit_spec",
+        "target": {"kind": "function", "module": __name__,
+                   "qualname": "test_v6_semantic_payload_preserves_device_spec_and_compile_options"},
+        "device_uuid": ["device_uuid", "gpu-contract"],
+        "compile_spec": {"kernel": "test.uuid.manifest", "version": 1, "facts": [["capacity_rows", 8]]},
+        "compile_spec_hash": hashlib.sha256(
+            b'{"facts":[["capacity_rows",8]],"kernel":"test.uuid.manifest","version":1}'
+        ).hexdigest(),
+        "compile_kwargs": {"mode": "test"},
+        "compile_kwargs_hash": hashlib.sha256(b'{"mode":"test"}').hexdigest(),
+        "compile_options": ["--opt-level=2"],
+        "compile_environment": [["CUTE_DSL_ARCH", "sm_120"]],
+    }
+    assert compiler._semantic_compile_manifest_payload(payload) == expected

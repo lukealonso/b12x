@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+from b12x.policy.generation.replay import PreparedCandidate, capture_warmed_graph, measure_prepared_candidates
+
 import gc
-import statistics
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
+
+
 
 from b12x.policy.generation.contracts import GenerationContext
 from b12x.policy.generation.sweep import (
@@ -78,8 +81,8 @@ def _build_gdn_buffers(
     max_tokens = int(case.query["max_tokens"])
     if live_sequences > max_sequences or max(query_lengths) > columns:
         raise ValueError("GDN live shape exceeds the profiled capacity")
-    if max_tokens != max_sequences * columns:
-        raise ValueError("GDN token capacity must equal sequences times columns")
+    if not live_tokens <= max_tokens <= max_sequences * columns:
+        raise ValueError("GDN live tokens and token capacity must fit the sequence/column capacity")
     active_state_cells = live_sequences * columns
     state_slots = max(active_state_cells, live_tokens) + 1
     caps = gdn.Caps(
@@ -91,8 +94,8 @@ def _build_gdn_buffers(
         value_heads=value_heads,
         state_index_columns=columns,
         state_dtype=state_dtype,
-        gate_activation="sigmoid",
-        qk_l2norm=True,
+        gate_activation=str(case.query["gate_activation"]),
+        qk_l2norm=bool(case.query["qk_l2norm"]),
     )
     planned = gdn.plan(
         caps,
@@ -259,7 +262,7 @@ def _gdn_reference(buffers: _GdnBuffers):
             binding.num_seqs,
             binding.num_tokens,
             heads=caps.key_heads,
-            qk_l2norm=True,
+            qk_l2norm=caps.qk_l2norm,
         )
     else:
         output = gdn.reference.decode(
@@ -278,8 +281,8 @@ def _gdn_reference(buffers: _GdnBuffers):
             binding.num_tokens,
             key_heads=caps.key_heads,
             value_heads=caps.value_heads,
-            gate_activation="sigmoid",
-            qk_l2norm=True,
+            gate_activation=caps.gate_activation,
+            qk_l2norm=caps.qk_l2norm,
         )
     return output, state
 
@@ -302,55 +305,6 @@ def _l2_flush_fn(device: object, *, enabled: bool):
         torch.sum(buffer, dim=0, out=reduction)
 
     return flush
-
-
-def _median_of_group_medians(
-    samples: tuple[float, ...],
-    *,
-    groups: int,
-    repetitions: int,
-) -> float:
-    expected = int(groups) * int(repetitions)
-    if len(samples) != expected:
-        raise ValueError(f"expected {expected} timing samples, received {len(samples)}")
-    medians = [
-        statistics.median(samples[start : start + repetitions])
-        for start in range(0, expected, repetitions)
-    ]
-    return float(statistics.median(medians))
-
-
-def _bounded_repetitions(settings, *, pilot_us: float) -> int:
-    budget_us = float(settings.max_candidate_seconds) * 1_000_000.0
-    budgeted = int(budget_us / (max(float(pilot_us), 1.0) * settings.groups))
-    return max(1, min(settings.repetitions, budgeted))
-
-
-def _cuda_event_samples_us(
-    run,
-    *,
-    count: int,
-    device: object,
-    flush=None,
-    before_each=None,
-) -> tuple[float, ...]:
-    import torch
-
-    starts = tuple(torch.cuda.Event(enable_timing=True) for _ in range(count))
-    ends = tuple(torch.cuda.Event(enable_timing=True) for _ in range(count))
-    for start, end in zip(starts, ends, strict=True):
-        if before_each is not None:
-            before_each()
-        if flush is not None:
-            flush()
-        start.record()
-        run()
-        end.record()
-    torch.cuda.synchronize(device)
-    return tuple(
-        float(start.elapsed_time(end)) * 1_000.0
-        for start, end in zip(starts, ends, strict=True)
-    )
 
 
 class _GdnSession(AbstractContextManager["_GdnSession"]):
@@ -415,9 +369,7 @@ class _GdnSession(AbstractContextManager["_GdnSession"]):
                 run()
             torch.cuda.synchronize(device)
             restore()
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
-                run()
+            graph, _ = capture_warmed_graph(run, device=device)
             torch.cuda.synchronize(device)
 
             restore()
@@ -456,52 +408,13 @@ class _GdnSession(AbstractContextManager["_GdnSession"]):
                 )
             )
             flush = _l2_flush_fn(device, enabled=settings.cold_l2)
-            start = torch.cuda.Event(enable_timing=True)
-            end = torch.cuda.Event(enable_timing=True)
-            restore()
-            start.record()
-            graph.replay()
-            end.record()
-            end.synchronize()
-            timed_repetitions = _bounded_repetitions(
-                settings,
-                pilot_us=float(start.elapsed_time(end)) * 1_000.0,
-            )
-            gc.collect()
-            allocated_before = torch.cuda.memory_allocated(device)
-            samples_us = _cuda_event_samples_us(
-                graph.replay,
-                count=settings.groups * timed_repetitions,
-                device=device,
-                flush=flush,
-                before_each=restore,
-            )
-            allocated_after = torch.cuda.memory_allocated(device)
-        latency_us = _median_of_group_medians(
-            tuple(samples_us),
-            groups=settings.groups,
-            repetitions=timed_repetitions,
-        )
-        return (
-            SweepMeasurement(
-                candidate=candidates[0],
-                latency_us=latency_us,
-                correct=(
-                    finite
-                    and output_nonzero > 0
-                    and cosine >= 0.999
-                    and allocated_after <= allocated_before
-                ),
-                metrics={
-                    "output_max_abs": output_max_abs,
-                    "state_max_abs": state_max_abs,
-                    "output_cosine": cosine,
-                    "output_nonzero": output_nonzero,
-                    "stable_addresses": True,
-                    "replay_allocation_bytes": allocated_after - allocated_before,
-                },
-            ),
-        )
+            return measure_prepared_candidates((PreparedCandidate(
+                candidate=candidates[0], graph=graph, owners=(buffers, binding), before_each=restore,
+                correct=finite and output_nonzero > 0 and cosine >= 0.999,
+                metrics={"output_max_abs": output_max_abs, "state_max_abs": state_max_abs,
+                         "output_cosine": cosine, "output_nonzero": output_nonzero,
+                         "stable_addresses": True, "frozen_resolution_capture": True,
+                         "state_reset_before_each": True}),), settings=settings, device=device, flush=flush)
 
 
 class GdnBenchmarkFactory:
@@ -528,6 +441,20 @@ def _ceil_div(value: int, divisor: int) -> int:
     return (int(value) + int(divisor) - 1) // int(divisor)
 
 
+def _gqa_execution_key(
+    case: SweepCase, candidate: SweepCandidate,
+) -> tuple[tuple[str, object], ...]:
+    if case.query["mode"] != "decode" or case.query["query_len"] != 1:
+        return tuple(candidate.config.items())
+    # Decode consumes the resulting schedule and workspace. Verify kernels can
+    # also consume the CTA budget directly and must retain it in their key.
+    planning_budgets = {"graph_ctas_per_sm", "architecture_max_chunks_per_request"}
+    return tuple(
+        (field, value) for field, value in candidate.config.items()
+        if field not in planning_budgets
+    )
+
+
 class _GqaSession(AbstractContextManager["_GqaSession"]):
     def __init__(
         self,
@@ -540,8 +467,10 @@ class _GqaSession(AbstractContextManager["_GqaSession"]):
         if len(page_sizes) != 1:
             raise ValueError("GQA allocation groups must use one page size")
         self._page_size = next(iter(page_sizes))
-        maximum_context = max(int(case.query["cache_tokens"]) for case in cases)
-        self._capture_page_count = _ceil_div(maximum_context, self._page_size)
+        capacities = {int(case.query["cache_tokens"]) for case in cases}
+        if len(capacities) != 1:
+            raise ValueError("GQA allocation groups must preserve each query's planned cache capacity")
+        self._capture_page_count = _ceil_div(next(iter(capacities)), self._page_size)
         self._candidate_cache: dict[str, tuple[SweepCandidate, ...]] = {}
         self._device = None
         self._flush = None
@@ -595,6 +524,8 @@ class _GqaSession(AbstractContextManager["_GqaSession"]):
             max_cache_page_count=self._capture_page_count,
             window_left=int(query["window_left"]),
             graph_ctas_per_sm=graph_ctas_per_sm,
+            max_work_items=query.get("requested_max_work_items"),
+            max_partial_rows=query.get("requested_max_partial_rows"),
             force_split_kv=force_split_kv,
             kv_cache_layout=str(query["kv_cache_layout"]),
             policy=PolicyContext.for_device(
@@ -607,6 +538,7 @@ class _GqaSession(AbstractContextManager["_GqaSession"]):
         cached = self._candidate_cache.get(case.case_id)
         if cached is not None:
             return cached
+        from dataclasses import replace
         from b12x.attention.paged._policy import GqaConfig
 
         query = case.query
@@ -622,19 +554,30 @@ class _GqaSession(AbstractContextManager["_GqaSession"]):
             if requested_split is not None
             else (None, False, True)
         )
-        candidates_by_id: dict[str, SweepCandidate] = {}
+        candidates_by_execution: dict[tuple[tuple[str, object], ...], SweepCandidate] = {}
         for split in split_options:
             for graph_ctas in graph_options:
-                capacity = self._capacity(
-                    case,
-                    graph_ctas_per_sm=graph_ctas,
-                    force_split_kv=split,
-                )
+                try:
+                    capacity = self._capacity(
+                        case,
+                        graph_ctas_per_sm=graph_ctas,
+                        force_split_kv=split,
+                    )
+                except ValueError:
+                    continue
                 candidate = SweepCandidate.create(
-                    GqaConfig.from_capacity(capacity).profile_dict()
+                    GqaConfig.from_capacity(capacity).profile_dict(),
+                    decision={"graph_ctas_per_sm": graph_ctas, "force_split_kv": split},
                 )
-                candidates_by_id.setdefault(candidate.candidate_id, candidate)
-        candidates = tuple(candidates_by_id.values())
+                key = _gqa_execution_key(case, candidate)
+                existing = candidates_by_execution.get(key)
+                if existing is None:
+                    candidates_by_execution[key] = candidate
+                else:
+                    candidates_by_execution[key] = replace(
+                        existing, equivalent_decisions=(*existing.equivalent_decisions, candidate.decision),
+                    )
+        candidates = tuple(candidates_by_execution.values())
         self._candidate_cache[case.case_id] = candidates
         return candidates
 
@@ -793,6 +736,7 @@ class _GqaSession(AbstractContextManager["_GqaSession"]):
                 k_descale=k_descale,
                 v_descale=v_descale,
                 causal=True,
+                window_left=int(query["window_left"]),
             )
             base_policy = PolicyContext.for_device(
                 device,
@@ -820,6 +764,7 @@ class _GqaSession(AbstractContextManager["_GqaSession"]):
                     num_cache_pages=self._capture_page_count,
                     use_cuda_graph=True,
                     copy_runtime_metadata=False,
+                    kv_cache_layout=str(query["kv_cache_layout"]),
                 )
                 plan = paged.plan(caps, policy=policy)
                 plan.prepare_decode_graph_replay_state(
@@ -828,6 +773,7 @@ class _GqaSession(AbstractContextManager["_GqaSession"]):
                     max_page_table_width=self._capture_page_count,
                     max_cache_page_count=self._capture_page_count,
                     force_split_kv=query["force_split_kv"],
+                    window_left=int(query["window_left"]),
                 )
                 (scratch_spec,) = plan.scratch_specs()
                 scratch = torch.empty(
@@ -852,6 +798,7 @@ class _GqaSession(AbstractContextManager["_GqaSession"]):
                             cache_seqlens=cache_seqlens,
                             cu_seqlens_q=cu_seqlens_q,
                             active_total_q=batch,
+                            window_left=int(query["window_left"]),
                             k_descale=k_descale,
                             v_descale=v_descale,
                         )
@@ -860,95 +807,57 @@ class _GqaSession(AbstractContextManager["_GqaSession"]):
                 for _ in range(settings.warmup):
                     run()
                 torch.cuda.synchronize(device)
-                graph = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(graph):
-                    run()
-                torch.cuda.synchronize(device)
-                output.fill_(float("nan"))
-                graph.replay()
-                torch.cuda.synchronize(device)
-                finite = bool(torch.isfinite(output).all().item())
-                output_nonzero = int(torch.count_nonzero(output).item())
-                cosine = float(
-                    torch.nn.functional.cosine_similarity(
-                        output.float().flatten(),
-                        expected_output.float().flatten(),
-                        dim=0,
+                graph, _ = capture_warmed_graph(run, device=device)
+                pointers = tuple(tensor.data_ptr() for tensor in (scratch, output))
+                correct = True
+                for _ in range(3):
+                    output.fill_(float("nan"))
+                    graph.replay()
+                    torch.cuda.synchronize(device)
+                    finite = bool(torch.isfinite(output).all().item())
+                    output_nonzero = int(torch.count_nonzero(output).item())
+                    cosine = float(
+                        torch.nn.functional.cosine_similarity(
+                            output.float().flatten(),
+                            expected_output.float().flatten(),
+                            dim=0,
+                        )
                     )
-                )
-                difference = output.float() - expected_output.float()
-                relative_l2 = float(
-                    torch.linalg.vector_norm(difference)
-                    / torch.linalg.vector_norm(expected_output.float()).clamp_min(
-                        1e-12
+                    difference = output.float() - expected_output.float()
+                    relative_l2 = float(
+                        torch.linalg.vector_norm(difference)
+                        / torch.linalg.vector_norm(expected_output.float()).clamp_min(
+                            1e-12
+                        )
                     )
-                )
-                maximum_absolute_error = float(difference.abs().max())
-                allclose = bool(
-                    torch.allclose(
-                        output.float(),
-                        expected_output.float(),
-                        rtol=0.05,
-                        atol=0.02,
+                    maximum_absolute_error = float(difference.abs().max())
+                    allclose = bool(
+                        torch.allclose(
+                            output.float(),
+                            expected_output.float(),
+                            rtol=0.05,
+                            atol=0.02,
+                        )
                     )
-                )
-                start = torch.cuda.Event(enable_timing=True)
-                end = torch.cuda.Event(enable_timing=True)
-                start.record()
-                graph.replay()
-                end.record()
-                end.synchronize()
-                timed_repetitions = _bounded_repetitions(
-                    settings,
-                    pilot_us=float(start.elapsed_time(end)) * 1_000.0,
-                )
-                allocated_before = torch.cuda.memory_allocated(device)
-                samples_us = _cuda_event_samples_us(
-                    graph.replay,
-                    count=settings.groups * timed_repetitions,
-                    device=device,
-                    flush=self._flush,
-                )
-                allocated_after = torch.cuda.memory_allocated(device)
-                latency_us = _median_of_group_medians(
-                    tuple(samples_us),
-                    groups=settings.groups,
-                    repetitions=timed_repetitions,
-                )
-                correct = (
-                    finite
-                    and output_nonzero > 0
-                    and cosine >= settings.minimum_cosine
-                    and relative_l2 <= 0.02
-                    and allclose
-                    and allocated_after <= allocated_before
-                )
-                measurements.append(
-                    SweepMeasurement(
-                        candidate=candidate,
-                        latency_us=latency_us,
-                        correct=correct,
-                        metrics={
-                            "cosine": cosine,
-                            "relative_l2": relative_l2,
-                            "maximum_absolute_error": maximum_absolute_error,
-                            "allclose": allclose,
-                            "output_nonzero": output_nonzero,
-                            "replay_allocation_bytes": (
-                                allocated_after - allocated_before
-                            ),
-                            "physical_cache_pages": self._capture_page_count,
-                            "shared_pages_across_requests": True,
-                            "graph_ctas_per_sm": config.graph_ctas_per_sm,
-                            "max_chunks_per_request": (
-                                config.max_chunks_per_request
-                            ),
-                        },
-                    )
-                )
-                graph.reset()
-                torch.cuda.synchronize(device)
-        return tuple(measurements)
+                    correct &= finite and output_nonzero > 0 and cosine >= settings.minimum_cosine
+                    correct &= relative_l2 <= 0.02 and allclose
+                stable = pointers == tuple(tensor.data_ptr() for tensor in (scratch, output))
+                measurements.append(PreparedCandidate(
+                    candidate=candidate, graph=graph, correct=bool(correct and stable),
+                    owners=(plan, scratch, output, binding),
+                    metrics={
+                        "cosine": cosine, "relative_l2": relative_l2,
+                        "maximum_absolute_error": maximum_absolute_error,
+                        "allclose": allclose, "output_nonzero": output_nonzero,
+                        "frozen_resolution_capture": True, "poison_replays": 3,
+                        "stable_addresses": stable,
+                        "physical_cache_pages": self._capture_page_count,
+                        "shared_pages_across_requests": True,
+                        "graph_ctas_per_sm": config.graph_ctas_per_sm,
+                        "max_chunks_per_request": config.max_chunks_per_request,
+                    },
+                ))
+            return measure_prepared_candidates(measurements, settings=settings, device=device, flush=self._flush)
 
 
 class GqaBenchmarkFactory:
@@ -957,6 +866,13 @@ class GqaBenchmarkFactory:
     def __call__(self, group_id, cases, context):
         del group_id
         return _GqaSession(cases, context)
+
+
+def _mla_page_id_base(case: SweepCase) -> int:
+    value = case.metadata.get("page_id_base", 0)
+    if type(value) is not int or value < 0:
+        raise ValueError("dense MLA page_id_base must be a nonnegative integer")
+    return value
 
 
 def _dense_mla_caps(
@@ -994,7 +910,7 @@ def _dense_mla_caps(
         max_batch=batch,
         max_cache_tokens=cache_tokens,
         max_page_table_width=pages,
-        num_cache_pages=pages,
+        num_cache_pages=pages + _mla_page_id_base(case),
         use_cuda_graph=True,
         budget=budget,
     )
@@ -1036,32 +952,12 @@ class _MlaSession(AbstractContextManager["_MlaSession"]):
         return None
 
     def candidates(self, case: SweepCase) -> tuple[SweepCandidate, ...]:
-        import torch
-
-        from b12x.attention import dense_mla
-        from b12x.policy import PolicyContext, PolicyMode
+        from .attention import _mla_split_candidates
 
         cached = self._candidate_cache.get(case.case_id)
         if cached is not None:
             return cached
-        device = torch.device("cuda", self._context.device_ordinal)
-        default_plan = dense_mla.plan(
-            _dense_mla_caps(case, device=device, max_splits=None),
-            policy=PolicyContext.for_device(
-                device,
-                mode=PolicyMode.HEURISTIC_ONLY,
-            ),
-        )
-        default_splits = int(default_plan.num_splits)
-        split_limits = {default_splits}
-        split_limit = 1
-        while split_limit < default_splits:
-            split_limits.add(split_limit)
-            split_limit *= 2
-        candidates = tuple(
-            SweepCandidate.create({"max_splits": value})
-            for value in sorted(split_limits)
-        )
+        candidates = _mla_split_candidates(case.query, self._context.device)
         self._candidate_cache[case.case_id] = candidates
         return candidates
 
@@ -1100,13 +996,21 @@ class _MlaSession(AbstractContextManager["_MlaSession"]):
             del q_source
         else:
             q = q_source
+            if kv_dtype == torch.float8_e4m3fn:
+                q_scale = (q.float().abs().amax() / torch.finfo(torch.float8_e4m3fn).max).clamp_min_(
+                    torch.finfo(torch.float32).tiny).reshape(1)
         if kv_dtype == torch.float8_e4m3fn:
             cache, kv_scale = _fp8_tensor_and_scale(cache_source)
             del cache_source
         else:
             cache = cache_source
+        page_id_base = _mla_page_id_base(case)
+        if page_id_base:
+            pool = torch.empty((page_id_base + pages, page_size, qk_dim), dtype=cache.dtype, device=device)
+            pool[page_id_base:].copy_(cache)
+            cache = pool
         batch = query_rows if mode == "decode" else 1
-        page_ids = torch.arange(pages, dtype=torch.int32, device=device)
+        page_ids = torch.arange(page_id_base, page_id_base + pages, dtype=torch.int32, device=device)
         page_table = page_ids.unsqueeze(0).expand(batch, -1).contiguous()
         cache_seqlens = torch.full(
             (batch,),
@@ -1136,7 +1040,7 @@ class _MlaSession(AbstractContextManager["_MlaSession"]):
             kv_scale,
         )
 
-    def _measure_candidate(
+    def _prepare_candidate(
         self,
         *,
         case: SweepCase,
@@ -1145,7 +1049,7 @@ class _MlaSession(AbstractContextManager["_MlaSession"]):
         expected_output: object,
         expected_lse: object,
         device: object,
-    ) -> SweepMeasurement:
+    ) -> PreparedCandidate | SweepMeasurement:
         import torch
 
         from b12x.attention import dense_mla
@@ -1196,9 +1100,7 @@ class _MlaSession(AbstractContextManager["_MlaSession"]):
             for _ in range(settings.warmup):
                 run()
             torch.cuda.synchronize(device)
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
-                run()
+            graph, _ = capture_warmed_graph(run, device=device)
             torch.cuda.synchronize(device)
             output.fill_(float("nan"))
             graph.replay()
@@ -1220,52 +1122,11 @@ class _MlaSession(AbstractContextManager["_MlaSession"]):
                 (output.float() - expected_output.float()).abs().max()
             )
             lse_max_abs = float((actual_lse - expected_lse).abs().max())
-            flush = _l2_flush_fn(device, enabled=settings.cold_l2)
-            start = torch.cuda.Event(enable_timing=True)
-            end = torch.cuda.Event(enable_timing=True)
-            start.record()
-            graph.replay()
-            end.record()
-            end.synchronize()
-            timed_repetitions = _bounded_repetitions(
-                settings,
-                pilot_us=float(start.elapsed_time(end)) * 1_000.0,
-            )
-            gc.collect()
-            allocated_before = torch.cuda.memory_allocated(device)
-            samples_us = _cuda_event_samples_us(
-                graph.replay,
-                count=settings.groups * timed_repetitions,
-                device=device,
-                flush=flush,
-            )
-            allocated_after = torch.cuda.memory_allocated(device)
-            latency_us = _median_of_group_medians(
-                tuple(samples_us),
-                groups=settings.groups,
-                repetitions=timed_repetitions,
-            )
-            return SweepMeasurement(
-                candidate=candidate,
-                latency_us=latency_us,
-                correct=(
-                    finite
-                    and output_nonzero > 0
-                    and cosine >= 0.999
-                    and lse_max_abs < 2e-5
-                    and allocated_after <= allocated_before
-                ),
-                metrics={
-                    "cosine": cosine,
-                    "output_max_abs": output_max_abs,
-                    "lse_max_abs": lse_max_abs,
-                    "output_nonzero": output_nonzero,
-                    "num_splits": int(plan.num_splits),
-                    "query_tile": int(plan.query_tile),
-                    "chunks_per_split": int(plan.chunks_per_split),
-                    "replay_allocation_bytes": allocated_after - allocated_before,
-                },
-            )
+            return PreparedCandidate(candidate=candidate, graph=graph, owners=(plan, binding, scratch, output, inputs),
+                correct=finite and output_nonzero > 0 and cosine >= 0.999 and lse_max_abs < 2e-5,
+                metrics={"frozen_resolution_capture": True, "cosine": cosine, "output_max_abs": output_max_abs, "lse_max_abs": lse_max_abs,
+                         "output_nonzero": output_nonzero, "num_splits": int(plan.num_splits),
+                         "query_tile": int(plan.query_tile), "chunks_per_split": int(plan.chunks_per_split)})
         except Exception as exc:  # noqa: BLE001 - one candidate may fail closed
             return SweepMeasurement(
                 candidate=candidate,
@@ -1273,9 +1134,6 @@ class _MlaSession(AbstractContextManager["_MlaSession"]):
                 correct=False,
                 error=f"{type(exc).__name__}: {exc}",
             )
-        finally:
-            gc.collect()
-            torch.cuda.empty_cache()
 
     def measure(
         self,
@@ -1304,7 +1162,7 @@ class _MlaSession(AbstractContextManager["_MlaSession"]):
                 kv_scale=kv_scale,
             )
             measurements = tuple(
-                self._measure_candidate(
+                self._prepare_candidate(
                     case=case,
                     candidate=candidate,
                     inputs=inputs,
@@ -1314,7 +1172,8 @@ class _MlaSession(AbstractContextManager["_MlaSession"]):
                 )
                 for candidate in candidates
             )
-        return measurements
+        return measure_prepared_candidates(measurements, settings=self._context.settings, device=device,
+            flush=_l2_flush_fn(device, enabled=self._context.settings.cold_l2))
 
 
 class MlaBenchmarkFactory:
@@ -1387,6 +1246,20 @@ def _sparse_indices(
     return ((offsets + columns) % tokens).to(torch.int32)
 
 
+def _compressed_pool_offset(cache, indices, *, page_size, minimum_bytes):
+    if type(minimum_bytes) is not int or minimum_bytes < 0:
+        raise ValueError("minimum_pool_offset_bytes must be a nonnegative integer")
+    if minimum_bytes == 0:
+        return cache, indices
+    import torch
+
+    page_bytes = cache.shape[1]
+    page_base = minimum_bytes // page_bytes + 1
+    pool = torch.empty((page_base + cache.shape[0], page_bytes), dtype=cache.dtype, device=cache.device)
+    pool[page_base:].copy_(cache)
+    return pool, indices + page_base * page_size
+
+
 class _SparseMlaSession(AbstractContextManager["_SparseMlaSession"]):
     def __init__(self, context: GenerationContext) -> None:
         self._context = context
@@ -1407,48 +1280,13 @@ class _SparseMlaSession(AbstractContextManager["_SparseMlaSession"]):
         return None
 
     def candidates(self, case: SweepCase) -> tuple[SweepCandidate, ...]:
-        import torch
-
-        from b12x.attention._shared.mla.compressed_config import (
-            compressed_sparse_mla_split_config_for_contract,
-        )
+        from .attention import _compressed_mla_candidates
 
         cached = self._candidate_cache.get(case.case_id)
-        if cached is not None:
-            return cached
-        query = case.query
-        rows = int(query["query_rows"])
-        width = int(query["swa_width"]) + int(query["indexed_width"])
-        indexed_width = int(query["indexed_width"])
-        indexed_page_size = int(query["indexed_page_size"])
-        capability = tuple(
-            torch.cuda.get_device_capability(self._context.device_ordinal)
-        )
-        uses_single_pass = str(query["mode"]) != "decode" or (
-            capability == (12, 1)
-            and rows >= 16
-            and int(query["num_q_heads"]) == 32
-            and int(query["swa_page_size"]) == 64
-            and (indexed_width == 0 or indexed_page_size == 64)
-        )
-        caps = (1,) if uses_single_pass else (1, 2, 4, 8, 16, 32, 64, 256)
-        representatives: dict[tuple[int, int], int] = {}
-        for chunk_cap in caps:
-            config = compressed_sparse_mla_split_config_for_contract(
-                rows=rows,
-                width=max(1, width),
-                max_chunks=chunk_cap,
-            )
-            representatives.setdefault(
-                (int(config.chunk_size), int(config.num_chunks)),
-                chunk_cap,
-            )
-        candidates = tuple(
-            SweepCandidate.create({"max_chunks_per_row": chunk_cap})
-            for chunk_cap in sorted(representatives.values())
-        )
-        self._candidate_cache[case.case_id] = candidates
-        return candidates
+        if cached is None:
+            cached = _compressed_mla_candidates(case.query, self._context.device)
+            self._candidate_cache[case.case_id] = cached
+        return cached
 
     def _inputs(self, case: SweepCase, *, device: object) -> _SparseMlaInputs:
         import torch
@@ -1494,6 +1332,10 @@ class _SparseMlaSession(AbstractContextManager["_SparseMlaSession"]):
             dtype=torch.int32,
             device=device,
         )
+        minimum_bytes = case.metadata.get("minimum_pool_offset_bytes", 0)
+        swa_cache, swa_indices = _compressed_pool_offset(
+            swa_cache, swa_indices, page_size=swa_page_size, minimum_bytes=minimum_bytes,
+        )
         indexed_cache = None
         indexed_indices = None
         indexed_lengths = None
@@ -1517,6 +1359,9 @@ class _SparseMlaSession(AbstractContextManager["_SparseMlaSession"]):
                 dtype=torch.int32,
                 device=device,
             )
+            indexed_cache, indexed_indices = _compressed_pool_offset(
+                indexed_cache, indexed_indices, page_size=indexed_page_size, minimum_bytes=minimum_bytes,
+            )
         return _SparseMlaInputs(
             q=q,
             swa_cache=swa_cache,
@@ -1527,7 +1372,7 @@ class _SparseMlaSession(AbstractContextManager["_SparseMlaSession"]):
             indexed_lengths=indexed_lengths,
         )
 
-    def _measure_candidate(
+    def _prepare_candidate(
         self,
         *,
         case: SweepCase,
@@ -1535,7 +1380,7 @@ class _SparseMlaSession(AbstractContextManager["_SparseMlaSession"]):
         inputs: _SparseMlaInputs,
         expected_output: object,
         device: object,
-    ) -> SweepMeasurement:
+    ) -> PreparedCandidate | SweepMeasurement:
         import math
 
         import torch
@@ -1566,8 +1411,8 @@ class _SparseMlaSession(AbstractContextManager["_SparseMlaSession"]):
                     num_q_heads=heads,
                     max_q_rows=rows,
                     max_width=max(1, width),
-                    head_dim=COMPRESSED_SPARSE_MLA_HEAD_DIM,
-                    v_head_dim=COMPRESSED_SPARSE_MLA_HEAD_DIM,
+                    head_dim=int(query["qk_head_dim"]),
+                    v_head_dim=int(query["v_head_dim"]),
                     max_batch=rows,
                     page_size=int(query["swa_page_size"]),
                     layout=str(query["layout"]),
@@ -1580,6 +1425,18 @@ class _SparseMlaSession(AbstractContextManager["_SparseMlaSession"]):
                     max_chunks_per_row=chunk_cap,
                 )
             )
+            from b12x.attention.compressed_sparse_mla._policy import SparseMlaQuery
+            from b12x.policy.types import FrozenMapping
+
+            measured_query = SparseMlaQuery(
+                layout=plan.caps.layout, mode=plan.caps.mode, q_dtype="bfloat16", kv_dtype="float8_e4m3fn",
+                num_q_heads=plan.caps.num_q_heads, qk_head_dim=plan.caps.head_dim, v_head_dim=plan.caps.v_head_dim,
+                swa_width=plan.caps.swa_width, indexed_width=plan.caps.indexed_width,
+                swa_page_size=plan.caps.swa_page_size, indexed_page_size=plan.caps.indexed_page_size,
+                query_rows=plan.caps.max_q_rows,
+            )
+            if FrozenMapping(measured_query.profile_fields()) != query:
+                raise ValueError("compressed MLA measured plan does not preserve the requested policy query")
             (scratch_spec,) = plan.scratch_specs()
             scratch = torch.empty(
                 scratch_spec.shape,
@@ -1620,9 +1477,7 @@ class _SparseMlaSession(AbstractContextManager["_SparseMlaSession"]):
             for _ in range(settings.warmup):
                 run()
             torch.cuda.synchronize(device)
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
-                run()
+            graph, _ = capture_warmed_graph(run, device=device)
             torch.cuda.synchronize(device)
             output.fill_(float("nan"))
             graph.replay()
@@ -1639,50 +1494,11 @@ class _SparseMlaSession(AbstractContextManager["_SparseMlaSession"]):
             )
             maximum_absolute_error = float(difference.abs().max())
             rmse = float(torch.sqrt(torch.mean(difference * difference)))
-            flush = _l2_flush_fn(device, enabled=settings.cold_l2)
-            start = torch.cuda.Event(enable_timing=True)
-            end = torch.cuda.Event(enable_timing=True)
-            start.record()
-            graph.replay()
-            end.record()
-            end.synchronize()
-            timed_repetitions = _bounded_repetitions(
-                settings,
-                pilot_us=float(start.elapsed_time(end)) * 1_000.0,
-            )
-            gc.collect()
-            allocated_before = torch.cuda.memory_allocated(device)
-            samples_us = _cuda_event_samples_us(
-                graph.replay,
-                count=settings.groups * timed_repetitions,
-                device=device,
-                flush=flush,
-            )
-            allocated_after = torch.cuda.memory_allocated(device)
-            return SweepMeasurement(
-                candidate=candidate,
-                latency_us=_median_of_group_medians(
-                    tuple(samples_us),
-                    groups=settings.groups,
-                    repetitions=timed_repetitions,
-                ),
-                correct=(
-                    finite
-                    and output_nonzero > 0
-                    and cosine >= 0.995
-                    and allocated_after <= allocated_before
-                ),
-                metrics={
-                    "cosine": cosine,
-                    "maximum_absolute_error": maximum_absolute_error,
-                    "rmse": rmse,
-                    "output_nonzero": output_nonzero,
-                    "chunk_size": int(split_config.chunk_size),
-                    "num_chunks": int(split_config.num_chunks),
-                    "scratch_bytes": int(scratch.numel() * scratch.element_size()),
-                    "replay_allocation_bytes": allocated_after - allocated_before,
-                },
-            )
+            return PreparedCandidate(candidate=candidate, graph=graph, owners=(plan, binding, scratch, output, inputs),
+                correct=finite and output_nonzero > 0 and cosine >= 0.995,
+                metrics={"frozen_resolution_capture": True, "cosine": cosine, "maximum_absolute_error": maximum_absolute_error, "rmse": rmse,
+                         "output_nonzero": output_nonzero, "chunk_size": int(split_config.chunk_size),
+                         "num_chunks": int(split_config.num_chunks), "scratch_bytes": scratch.numel() * scratch.element_size()})
         except Exception as exc:  # noqa: BLE001 - one candidate may fail closed
             return SweepMeasurement(
                 candidate=candidate,
@@ -1690,9 +1506,6 @@ class _SparseMlaSession(AbstractContextManager["_SparseMlaSession"]):
                 correct=False,
                 error=f"{type(exc).__name__}: {exc}",
             )
-        finally:
-            gc.collect()
-            torch.cuda.empty_cache()
 
     def measure(
         self,
@@ -1731,7 +1544,7 @@ class _SparseMlaSession(AbstractContextManager["_SparseMlaSession"]):
                 ),
             )
             measurements = tuple(
-                self._measure_candidate(
+                self._prepare_candidate(
                     case=case,
                     candidate=candidate,
                     inputs=inputs,
@@ -1740,7 +1553,8 @@ class _SparseMlaSession(AbstractContextManager["_SparseMlaSession"]):
                 )
                 for candidate in candidates
             )
-        return measurements
+        return measure_prepared_candidates(measurements, settings=self._context.settings, device=device,
+            flush=_l2_flush_fn(device, enabled=self._context.settings.cold_l2))
 
 
 class SparseMlaBenchmarkFactory:

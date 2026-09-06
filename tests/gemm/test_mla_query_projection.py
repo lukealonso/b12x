@@ -289,3 +289,38 @@ def test_bf16_weight_requires_scale_only_for_fp8() -> None:
     out_fp8 = torch.empty(2, 8, 576, device="cuda", dtype=torch.float8_e4m3fn)
     with pytest.raises(ValueError, match="q_scale is required"):
         mla_query_projection.run(q_nope, weight, q_pe, out_fp8)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+def test_mxfp8_query_live_rows_reuse_frozen_callable(dtype):
+    from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
+    from b12x.gemm._shared import mxfp8_bmm
+    from tests.gemm.test_bmm import _logical_b
+
+    source, weight, rope, scale = _inputs(num_heads=8, m=32)
+    decoded = _logical_b(weight, "n")
+    backing = torch.empty(32, 8, 576, device="cuda", dtype=dtype)
+    kwargs = {"q_scale": scale} if dtype == torch.float8_e4m3fn else {}
+    mla_query_projection.run(source, weight, rope, backing, **kwargs)
+    callables = {key: id(value.compiled) for key, value in mxfp8_bmm._MLA_QUERY_LAUNCH_CACHE.items()}
+    freeze_kernel_resolution("MLA query rows must reuse the warmed capacity")
+    try:
+        for m in (1, 3, 13, 17, 31, 32):
+            lhs, pe, out = source[:, :m], rope[:m], backing[:m]
+            projected = torch.bmm(lhs.float(), decoded.float()).to(torch.bfloat16).transpose(0, 1)
+            expected = torch.cat((projected, pe), dim=-1)
+            if dtype == torch.float8_e4m3fn:
+                expected = _reference_fp8(expected, scale)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                mla_query_projection.run(lhs, weight, pe, out, **kwargs)
+            backing.fill_(torch.nan)
+            allocated = torch.cuda.memory_allocated()
+            graph.replay()
+            torch.cuda.synchronize()
+            assert torch.cuda.memory_allocated() == allocated
+            assert torch.isnan(backing[m:].float()).all()
+            torch.testing.assert_close(out.float(), expected.float(), rtol=0.13 if dtype == torch.float8_e4m3fn else 0.02, atol=0.02)
+    finally:
+        unfreeze_kernel_resolution()
+    assert {key: id(value.compiled) for key, value in mxfp8_bmm._MLA_QUERY_LAUNCH_CACHE.items()} == callables

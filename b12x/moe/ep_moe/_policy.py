@@ -26,3 +26,17 @@ EpMoeConfig = BackendConfig
 
 
 __all__ = ["EP_MOE_POLICY", "EpMoeConfig", "EpMoeQuery"]
+
+
+from b12x.policy.problem import define_problem
+
+TUNING_PROBLEM = define_problem(
+    policy=EP_MOE_POLICY, query_type=EpMoeQuery, config_type=EpMoeConfig,
+    axes=('max_tokens', 'top_k', 'num_experts', 'hidden_size', 'intermediate_size'),
+    family=('activation',),
+    constraints=(),
+    environment=(),
+    model_fields=('top_k', 'num_experts', 'hidden_size', 'intermediate_size'),
+    decisions={'backend': ('w4a16',)},
+    derived_config_fields=(),
+)

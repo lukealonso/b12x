@@ -85,10 +85,26 @@ GDN_POLICY = ComponentPolicy(
     ),
     config_fields=frozenset({"backend"}),
     encode_query=GdnQuery.profile_fields,
-    decode_profile=GdnConfig.from_profile,
+    decode_profile=lambda query, device, payload: GdnConfig.from_profile(payload),
     heuristic=_heuristic,
     validate_config=_validate,
 )
 
 
 __all__ = ["GDN_POLICY", "GdnConfig", "GdnQuery"]
+
+
+from b12x.policy.problem import define_problem
+
+TUNING_PROBLEM = define_problem(
+    policy=GDN_POLICY, query_type=GdnQuery, config_type=GdnConfig,
+    axes=('key_heads', 'value_heads', 'max_seqs', 'max_tokens', 'state_index_columns'),
+    family=('gate_activation', 'qk_l2norm', 'state_dtype'),
+    constraints=(),
+    environment=(),
+    model_fields=('key_heads', 'value_heads'),
+    decisions={'backend': ('cutedsl', 'triton')},
+    axis_domains={'key_heads': (1, 1), 'value_heads': (1, 1), 'max_seqs': (1, 1),
+                  'max_tokens': (1, 1), 'state_index_columns': (1, 1)},
+    derived_config_fields=(),
+)

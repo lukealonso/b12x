@@ -132,10 +132,24 @@ DENSE_MLA_POLICY = ComponentPolicy(
     ),
     config_fields=frozenset({"max_splits"}),
     encode_query=DenseMlaQuery.profile_fields,
-    decode_profile=DenseMlaConfig.from_profile,
+    decode_profile=lambda query, device, payload: DenseMlaConfig.from_profile(payload),
     heuristic=_heuristic,
     validate_config=_validate,
 )
 
 
 __all__ = ["DENSE_MLA_POLICY", "DenseMlaConfig", "DenseMlaQuery"]
+
+
+from b12x.policy.problem import define_problem
+
+TUNING_PROBLEM = define_problem(
+    policy=DENSE_MLA_POLICY, query_type=DenseMlaQuery, config_type=DenseMlaConfig,
+    axes=('num_q_heads', 'qk_head_dim', 'v_head_dim', 'query_rows', 'max_batch', 'cache_tokens'),
+    family=('mode', 'q_dtype', 'kv_dtype', 'page_size', 'physical_record_width', 'window_size'),
+    constraints=('use_cuda_graph',),
+    environment=(),
+    model_fields=('num_q_heads', 'qk_head_dim', 'v_head_dim', 'page_size', 'physical_record_width', 'window_size'),
+    decisions={'max_splits': None},
+    derived_config_fields=(),
+)

@@ -171,3 +171,50 @@ def test_glm_prefill_rejects_an_unplanned_width_without_padding(monkeypatch) -> 
             lse_out=torch.empty((rows, heads), dtype=torch.float32),
             model_type=ModelType.GLM_NSA,
         )
+
+
+@pytest.mark.parametrize("width,indexed_width,expected_mode", ((128, 0, 1), (128, 64, 1), (512, 0, 0)))
+def test_dsv4_prefill_dispatch_preserves_selected_compute_mode_in_traits(width, indexed_width, expected_mode, monkeypatch):
+    import b12x.attention._shared.mla.prefill_mg as prefill_mg
+    from b12x.attention._shared.mla.prefill import run_unified_prefill
+    from b12x.attention._shared.mla.compressed_reference import compressed_sparse_mla_page_nbytes
+
+    captured = []
+    monkeypatch.setattr(prefill_mg, "run_unified_prefill_mg", lambda **kwargs: captured.append(kwargs))
+    extra = {} if indexed_width == 0 else dict(
+        extra_kv_cache=torch.empty((1, compressed_sparse_mla_page_nbytes(64)), dtype=torch.uint8),
+        extra_indices=torch.empty((2, indexed_width), dtype=torch.int32),
+        extra_topk_length=torch.full((2,), indexed_width, dtype=torch.int32), extra_page_block_size=64,
+    )
+    run_unified_prefill(
+        q=torch.empty((2, 32, 512), dtype=torch.bfloat16),
+        kv_cache=torch.empty((1, compressed_sparse_mla_page_nbytes(64)), dtype=torch.uint8),
+        topk_indices=torch.empty((2, width), dtype=torch.int32),
+        topk_length=torch.full((2,), width, dtype=torch.int32), sm_scale=512**-0.5, page_block_size=64,
+        output=torch.empty((2, 32, 512), dtype=torch.bfloat16), lse_out=torch.empty((2, 32)), **extra,
+    )
+    assert len(captured) == 1
+    assert captured[0]["compute_mode"] == expected_mode
+    assert captured[0]["traits_override"].compute_mode == expected_mode
+
+
+@pytest.mark.parametrize("compute_mode", (0, 1))
+def test_dsv4_mg_entrypoint_honors_explicit_compute_mode(compute_mode, monkeypatch):
+    import b12x.attention._shared.mla.prefill_mg as prefill_mg
+    from b12x.attention._shared.mla.compressed_reference import compressed_sparse_mla_page_nbytes
+
+    selected_modes = []
+    monkeypatch.setattr(
+        torch.ops.b12x,
+        "sparse_mla_sm120_prefill_mg",
+        lambda *args: selected_modes.append(args[14]),
+    )
+    prefill_mg.run_unified_prefill_mg(
+        q=torch.empty((2, 32, 512), dtype=torch.bfloat16),
+        kv_cache=torch.empty((1, compressed_sparse_mla_page_nbytes(64)), dtype=torch.uint8),
+        topk_indices=torch.empty((2, 128), dtype=torch.int32),
+        topk_length=torch.full((2,), 128, dtype=torch.int32), sm_scale=512**-0.5, page_block_size=64,
+        output=torch.empty((2, 32, 512), dtype=torch.bfloat16), lse_out=torch.empty((2, 32)),
+        compute_mode=compute_mode,
+    )
+    assert selected_modes == [compute_mode]

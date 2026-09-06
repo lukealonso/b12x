@@ -19,7 +19,6 @@ from b12x.moe._shared.kernels.activations import (
     SITU_DEFAULT_BETA,
     SITU_DEFAULT_LINEAR_BETA,
 )
-from b12x.moe._shared.kernels.w4a16.kernel import _trellis256_dense_launch_geometry
 _MCG = np.uint64(0xCBAC1FED)
 _MUL1 = np.uint64(0x83DCD12D)
 _MASK = np.uint32(0x8FFF8FFF)
@@ -338,40 +337,11 @@ def test_is_supported_uses_standard_sm12x_gate(monkeypatch) -> None:
     assert seen == {"device": "cuda:3", "requires": trellis_linear.META.requires}
 
 
-@pytest.mark.parametrize(
-    ("size_m", "size_k", "size_n", "expected"),
-    [
-        # Narrow profile: avoid a short spill by increasing both M and N work.
-        (512, 16384, 6144, (48, (64, 128))),
-        (1024, 16384, 6144, (48, (64, 256))),
-        # Wide model projection: N already supplies enough work. Splitting N is
-        # useful for the second wave, while M48 only adds scheduler overhead.
-        (192, 2048, 16384, (64, (64, 128))),
-        (384, 2048, 16384, (48, (64, 256))),
-        # A deeper K makes M48 scheduler overhead more expensive.
-        (384, 6144, 16384, (64, (64, 256))),
-        # Full waves retain the throughput-oriented default geometry.
-        (2048, 4096, 6144, (64, (64, 256))),
-    ],
-)
-def test_dense_launch_geometry_avoids_short_spill_waves(
-    size_m: int,
-    size_k: int,
-    size_n: int,
-    expected: tuple[int, tuple[int, int]],
-) -> None:
-    assert (
-        _trellis256_dense_launch_geometry(
-            size_m=size_m,
-            size_k=size_k,
-            size_n=size_n,
-            sms=188,
-        )
-        == expected
-    )
-
 @pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")
-def test_trellis_dense_cuda_graph_replay_is_stable() -> None:
+def test_trellis_dense_cuda_graph_replay_is_stable(monkeypatch) -> None:
+    import sys
+
+    monkeypatch.setitem(sys.modules, "exllamav3_ext", None)
     device = torch.device("cuda", torch.cuda.current_device())
     m = 3
     features = 128
@@ -416,7 +386,10 @@ def test_trellis_dense_cuda_graph_replay_is_stable() -> None:
 
 @pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")
 @pytest.mark.parametrize("bits", [2, 3])
-def test_dense_bf16_reuses_all_scratch_during_cuda_graph_capture(bits: int) -> None:
+def test_dense_bf16_reuses_all_scratch_during_cuda_graph_capture(bits: int, monkeypatch) -> None:
+    import sys
+
+    monkeypatch.setitem(sys.modules, "exllamav3_ext", None)
     device = torch.device("cuda", torch.cuda.current_device())
     m = 2
     features = 128
@@ -445,15 +418,6 @@ def test_dense_bf16_reuses_all_scratch_during_cuda_graph_capture(bits: int) -> N
     gemm_output_f16 = torch.empty_like(input_f16)
     output_f16 = torch.empty_like(input_f16)
 
-    def hadamard_128(
-        source: torch.Tensor,
-        destination: torch.Tensor,
-        _left_scale,
-        _right_scale,
-        _scale: float,
-    ) -> None:
-        destination.copy_(source)
-
     kwargs = {
         "output": output,
         "gemm_output": gemm_output,
@@ -463,7 +427,6 @@ def test_dense_bf16_reuses_all_scratch_during_cuda_graph_capture(bits: int) -> N
         "rotated_compute": rotated_compute,
         "gemm_output_f16": gemm_output_f16,
         "output_f16": output_f16,
-        "hadamard_128": hadamard_128,
     }
     expected = trellis_linear.run(x, weight, **kwargs).clone()
     torch.cuda.synchronize(device)

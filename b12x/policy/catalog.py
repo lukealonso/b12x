@@ -1,4 +1,4 @@
-"""Authoritative registration of planned ops and profiled components."""
+"""Ownership of runtime GPU policies and offline API qualification providers."""
 
 from __future__ import annotations
 
@@ -17,6 +17,7 @@ from .components import (
     GDN_ATTENTION,
     GQA_ATTENTION,
     HYPERCONNECTION,
+    KDA_PREFILL,
     MHC,
     MLA_ATTENTION,
     MOE_DECODE,
@@ -37,15 +38,16 @@ if TYPE_CHECKING:
 
 
 class PlanningPolicyMode(str, Enum):
-    """Whether a planned op consults the device-profile policy layer."""
+    """Runtime selection, offline qualification, or component-local planning."""
 
     LOCAL = "local"
     PROFILED = "profiled"
+    QUALIFICATION = "qualification"
 
 
 @dataclass(frozen=True, kw_only=True)
 class PlanningComponentRegistration:
-    """One planned op's policy ownership and optional profile providers."""
+    """An API's typed execution contract and optional measurement provider."""
 
     op_qualname: str
     mode: PlanningPolicyMode
@@ -57,7 +59,7 @@ class PlanningComponentRegistration:
         references = (self.component_id, self.policy_ref, self.generator_ref)
         if not self.op_qualname or "." not in self.op_qualname:
             raise ValueError("planned op qualname must use '<group>.<op>'")
-        if self.mode is PlanningPolicyMode.PROFILED:
+        if self.mode in (PlanningPolicyMode.PROFILED, PlanningPolicyMode.QUALIFICATION):
             if any(value is None for value in references):
                 raise ValueError(
                     "profiled components require an ID, policy, and generator"
@@ -118,7 +120,24 @@ class PlanningComponentRegistration:
                 f"generator contract {contract!r} does not match runtime policy "
                 f"{expected!r}"
             )
+        generator.problem = self.load_problem()
+        from .generation.engine import measurement_program
+
+        generator.measurement_program = measurement_program(generator, generator.problem)
+        generator.artifact_kind = "qualification" if self.mode is PlanningPolicyMode.QUALIFICATION else "runtime_profile"
         return generator
+
+    def load_problem(self):
+        """Load the component-owned executable definition of its tuning problem."""
+        from .problem import TuningProblem
+
+        if self.policy_ref is None:
+            raise LookupError(f"{self.op_qualname} has no tuning problem")
+        reference = self.policy_ref.split(":", 1)[0] + ":TUNING_PROBLEM"
+        problem = self._load(reference)
+        if not isinstance(problem, TuningProblem) or problem.policy is not self.load_policy():
+            raise ValueError(f"{reference} must describe the registered runtime policy")
+        return problem
 
 
 PLANNING_COMPONENTS = (
@@ -274,6 +293,13 @@ PLANNING_COMPONENTS = (
         ),
     ),
     PlanningComponentRegistration(
+        op_qualname="sequence.kda_prefill",
+        mode=PlanningPolicyMode.PROFILED,
+        component_id=KDA_PREFILL,
+        policy_ref="b12x.sequence.kda_prefill._policy:KDA_PREFILL_POLICY",
+        generator_ref="b12x.policy.generation.providers.kda:KdaPrefillGenerator",
+    ),
+    PlanningComponentRegistration(
         op_qualname="sequence.mtp_feedback",
         mode=PlanningPolicyMode.PROFILED,
         component_id=MTP_FEEDBACK,
@@ -323,14 +349,56 @@ ONESHOT_COMPONENTS = (
 )
 
 
+QUALIFICATION_COMPONENTS = (*tuple(
+    PlanningComponentRegistration(
+        op_qualname=op, mode=PlanningPolicyMode.QUALIFICATION, component_id=op,
+        policy_ref=f"{module}._tuning:EXECUTION_CONTRACT",
+        generator_ref=f"b12x.policy.generation.providers.oneshot:{generator}",
+    )
+    for op, module, generator in (
+        ("gemm.bf16_gemv", "b12x.gemm.bf16_gemv", "Bf16GemvGenerator"),
+        ("gemm.bmm", "b12x.gemm._bmm", "BmmGenerator"),
+        ("gemm.mla_query_projection", "b12x.gemm.mla_query_projection", "MlaQueryProjectionGenerator"),
+        ("gemm.tensor_fp8_linear", "b12x.gemm.tensor_fp8_linear", "TensorFp8LinearGenerator"),
+        ("quantization.mxfp8", "b12x.quantization.mxfp8", "Mxfp8QuantizationGenerator"),
+    )
+), PlanningComponentRegistration(
+    op_qualname="gemm.trellis_linear", mode=PlanningPolicyMode.QUALIFICATION,
+    component_id="gemm.trellis_linear", policy_ref="b12x.gemm.trellis_linear._tuning:EXECUTION_CONTRACT",
+    generator_ref="b12x.policy.generation.providers.trellis:TrellisLinearGenerator",
+))
+
+
+@dataclass(frozen=True, kw_only=True)
+class ApiAliasRegistration:
+    """Public names that resolve to the same production callables as their owner."""
+
+    op_qualname: str
+    owner_op: str
+    entry_points: tuple[str, ...]
+    recipes: tuple[str, ...]
+
+
+API_ALIASES = (
+    ApiAliasRegistration(op_qualname="gemm.mxfp8_linear", owner_op="gemm.blockscaled",
+                         entry_points=("mm", "pack_weight"), recipes=("mxfp8",)),
+)
+
+
+def list_generation_components() -> tuple[PlanningComponentRegistration, ...]:
+    """Return runtime profile providers and API-only qualification providers."""
+    return tuple(sorted((*list_profiled_components(), *QUALIFICATION_COMPONENTS),
+                        key=lambda item: item.component_id))
+
+
 def _validate_catalog() -> None:
-    op_qualnames = tuple(item.op_qualname for item in (*PLANNING_COMPONENTS, *ONESHOT_COMPONENTS))
+    registrations = (*PLANNING_COMPONENTS, *ONESHOT_COMPONENTS, *QUALIFICATION_COMPONENTS)
+    op_qualnames = tuple(item.op_qualname for item in registrations)
     if len(op_qualnames) != len(set(op_qualnames)):
         raise ValueError("planned ops cannot have duplicate policy registrations")
     component_ids = tuple(
         item.component_id
-        for item in (*PLANNING_COMPONENTS, *ONESHOT_COMPONENTS)
-        if item.mode is PlanningPolicyMode.PROFILED
+        for item in registrations if item.mode is not PlanningPolicyMode.LOCAL
     )
     if len(component_ids) != len(set(component_ids)):
         raise ValueError("profile component IDs must be unique")
@@ -367,4 +435,8 @@ __all__ = [
     "PlanningPolicyMode",
     "list_planning_components",
     "list_profiled_components",
+    "list_generation_components",
+    "QUALIFICATION_COMPONENTS",
+    "API_ALIASES",
+    "ApiAliasRegistration",
 ]

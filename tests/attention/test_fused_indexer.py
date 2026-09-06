@@ -746,7 +746,7 @@ def test_dsa_indexer_config_decodes_legacy_and_knob_profiles() -> None:
         num_q_heads=32,
         num_idx_heads=1,
         max_q_rows=4,
-        max_k_rows=0,
+        max_k_rows=32_768,
         top_k=2048,
         page_size=64,
         score_mode="dsa",

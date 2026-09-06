@@ -64,13 +64,13 @@ def _heuristic(
     query: SparseMlaQuery,
     device: DeviceIdentity | None,
 ) -> SparseMlaConfig:
-    capability = None if device is None else device.compute_capability
-    uses_single_pass = query.mode != "decode" or (
-        capability == (12, 1)
-        and query.query_rows >= 16
-        and query.num_q_heads == 32
-        and query.swa_page_size == 64
-        and (query.indexed_width == 0 or query.indexed_page_size == 64)
+    from b12x.attention._shared.mla.compressed_config import compressed_sparse_mla_uses_single_pass_decode
+
+    uses_single_pass = query.mode != "decode" or compressed_sparse_mla_uses_single_pass_decode(
+        rows=query.query_rows, heads=query.num_q_heads, swa_width=query.swa_width,
+        indexed_width=query.indexed_width, swa_page_size=query.swa_page_size,
+        indexed_page_size=query.indexed_page_size,
+        compute_capability=(0, 0) if device is None else device.compute_capability,
     )
     return SparseMlaConfig(max_chunks_per_row=1 if uses_single_pass else 64)
 
@@ -106,7 +106,7 @@ COMPRESSED_SPARSE_MLA_POLICY = ComponentPolicy(
     ),
     config_fields=frozenset({"max_chunks_per_row"}),
     encode_query=SparseMlaQuery.profile_fields,
-    decode_profile=SparseMlaConfig.from_profile,
+    decode_profile=lambda query, device, payload: SparseMlaConfig.from_profile(payload),
     heuristic=_heuristic,
     validate_config=_validate,
 )
@@ -119,3 +119,20 @@ __all__ = [
     "SparseMlaConfig",
     "SparseMlaQuery",
 ]
+
+
+from b12x.policy.problem import define_problem
+
+TUNING_PROBLEM = define_problem(
+    policy=COMPRESSED_SPARSE_MLA_POLICY, query_type=SparseMlaQuery, config_type=SparseMlaConfig,
+    axes=('num_q_heads', 'qk_head_dim', 'v_head_dim', 'swa_width', 'indexed_width', 'query_rows'),
+    family=('layout', 'mode', 'q_dtype', 'kv_dtype', 'swa_page_size', 'indexed_page_size'),
+    constraints=(),
+    environment=(),
+    model_fields=('num_q_heads', 'qk_head_dim', 'v_head_dim', 'swa_width', 'indexed_width', 'swa_page_size', 'indexed_page_size'),
+    decisions={'max_chunks_per_row': (1, 2, 4, 8, 16, 32, 64, 256)},
+    ordered=('max_chunks_per_row',),
+    axis_domains={'num_q_heads': (1, 1), 'qk_head_dim': (1, 1), 'v_head_dim': (1, 1),
+                  'swa_width': (0, 1), 'indexed_width': (0, 1), 'query_rows': (1, 1)},
+    derived_config_fields=(),
+)

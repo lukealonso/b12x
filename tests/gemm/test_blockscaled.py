@@ -302,7 +302,7 @@ def test_mm_mxfp8_grouped_batches_use_their_own_scales(
     )
     a_deq = dequantize_mxfp8_rows_torch(a_q.values, a_q.scale_rows).to(torch.bfloat16)
     b_deq = dequantize_mxfp8_rows_torch(b_q.values, b_q.scale_rows).to(torch.bfloat16)
-    ref = torch.einsum("mkl,nkl->mnl", a_deq, b_deq).to(torch.bfloat16)
+    ref = torch.einsum("mkl,nkl->mnl", a_deq.double(), b_deq.double()).to(torch.bfloat16)
 
     torch.testing.assert_close(out, ref, rtol=0, atol=0)
 

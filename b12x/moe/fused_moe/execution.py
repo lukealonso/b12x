@@ -279,7 +279,7 @@ def prewarm(plan: ExecutionPlan) -> None:
     if warmed.shapes_and_dtypes() != plan._impl.shapes_and_dtypes():
         raise RuntimeError("prewarming changed the planned scratch contract")
     plan._impl = warmed
-    if plan.experts.plan.activation.mode is ActivationMode.AUTO and plan.experts.device.type == "cuda":
+    if plan.experts.device.type == "cuda":
         from .api import run
 
         scratch = {
@@ -288,7 +288,7 @@ def prewarm(plan: ExecutionPlan) -> None:
         }
         for count in plan._caps.core_token_counts:
             x = torch.ones(
-                (count, plan.experts.hidden_size), dtype=torch.bfloat16, device=plan.experts.device,
+                (count, plan.experts.hidden_size), dtype=plan.experts.plan.activation.io_dtype, device=plan.experts.device,
             )
             output = torch.empty_like(x)
             ids = torch.arange(count * plan.capacity.top_k, device=x.device).reshape(

@@ -11,13 +11,13 @@ import torch
 pytest.importorskip("cutlass")
 
 from b12x.moe import fused_moe
+from b12x.policy import MOE_DECODE, PolicyContext, get_auto_policy
 from b12x.moe.fused_moe import META as FUSED_MOE_META
 from b12x.moe._shared.kernels.w4a16.host import plan_w4a16_buffers
 from b12x.moe._shared.kernels.w4a16.host import make_w4a16_packed_buffers
 from b12x.moe._shared.kernels.w4a16.kernel import run_w4a16_moe
 from b12x.moe._shared.execution import PreparedWeightLayout
 from b12x.moe._shared.kernels.w4a16.prepare import (
-    PreparedW4A16MoeWeights,
     prepare_trellis256_moe_weights,
 )
 from b12x.moe.fused_moe._impl import (
@@ -219,6 +219,7 @@ def _plan(
     route_num_experts: int,
     block_size_m: int,
     device: torch.device | str,
+    policy: PolicyContext | None = None,
 ) -> fused_moe.Plan:
     return fused_moe.plan(
         fused_moe.Caps(
@@ -229,7 +230,8 @@ def _plan(
             weight_plan=weights.plan,
             quant_mode="w4a16",
             w4a16_block_size_m=block_size_m,
-        )
+            policy_context=policy,
+        ),
     )
 
 
@@ -609,9 +611,6 @@ def _reference_full_rotation(
 ) -> torch.Tensor:
     device = x.device
     experts = int(w2.shape[0])
-    intermediate = int(w2.shape[1]) * 16
-    hidden = int(w2.shape[2]) * 16
-    hadamard = _hadamard_128(device)
     gate_weights = torch.stack(
         [_reconstruct_native(w13[0, expert]) for expert in range(experts)]
     ).to(device)
@@ -651,7 +650,6 @@ def _reference_full_rotation_decoded(
     activation: str = "silu",
 ) -> torch.Tensor:
     device = x.device
-    experts = int(down_weights.shape[0])
     intermediate = int(down_weights.shape[1])
     hidden = int(down_weights.shape[2])
     hadamard = _hadamard_128(device)
@@ -737,7 +735,6 @@ def _reference_coupled_decoded(
     """Reference the exact transform order of a coupled uniform-rate path."""
 
     device = x.device
-    experts = int(down_weights.shape[0])
     intermediate = int(down_weights.shape[1])
     hidden = int(down_weights.shape[2])
     hadamard = _hadamard_128(device)
@@ -1241,7 +1238,7 @@ def test_planned_full_rotation_matches_reference_and_captures(
         1.0e-9
     )
     cosine = torch.nn.functional.cosine_similarity(
-        mapped_eager.flatten(), reference.flatten(), dim=0
+        mapped_eager.float().flatten(), reference.float().flatten(), dim=0
     )
     assert float(relative_error) <= 2.0e-2
     assert float(cosine) >= 0.999
@@ -1282,6 +1279,10 @@ def test_full_rotation_reuses_compiled_kernels_across_expert_counts(
 
     torch.manual_seed(20260730)
     device = torch.device("cuda", torch.cuda.current_device())
+    policy = get_auto_policy(device).with_override(MOE_DECODE, fused_moe.MoeDecodeConfig(
+        backend="w4a16", route_planner="internal", max_active_clusters=None,
+        w4a16_route_mode="direct",
+    ))
     hidden = intermediate = 128
     topk = max_tokens = 2
     route_experts = 4
@@ -1331,6 +1332,7 @@ def test_full_rotation_reuses_compiled_kernels_across_expert_counts(
             route_num_experts=route_experts,
             block_size_m=8,
             device=device,
+            policy=policy,
         )
         spec = plan.scratch_specs()[0]
         scratch = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
@@ -1389,7 +1391,7 @@ def test_full_rotation_reuses_compiled_kernels_across_expert_counts(
             1.0e-9
         )
         cosine = torch.nn.functional.cosine_similarity(
-            actual.flatten(), reference.flatten(), dim=0
+            actual.float().flatten(), reference.float().flatten(), dim=0
         )
         assert float(relative_error) <= 2.0e-2
         assert float(cosine) >= 0.999

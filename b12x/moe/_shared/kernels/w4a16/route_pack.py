@@ -19,7 +19,7 @@ _SMALL_PREFIX_MAX_ROUTE_BLOCKS = 512
 _FAST_COUNT_BLOCK_T = 1024
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["live_numel"], do_not_specialize_on_alignment=["live_numel"])
 def _w4a16_route_count_kernel(
     topk_ids,
     expert_map,
@@ -33,7 +33,7 @@ def _w4a16_route_count_kernel(
 
     Same expert-id resolution as the sort kernel (expert_map aware).
     Writes ``counts[NUM_EXPERTS]``."""
-    pid = tl.program_id(0)
+    pid = tl.program_id(0).to(tl.int64)
     offsets = pid * BLOCK_T + tl.arange(0, BLOCK_T)
     raw_ids = tl.load(topk_ids + offsets, mask=offsets < live_numel, other=-1).to(
         tl.int32
@@ -122,7 +122,7 @@ def _workspace_slice(
     return tensor[:elements]
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["live_numel"], do_not_specialize_on_alignment=["live_numel"])
 def _pack_topk_routes_post_prefix_kernel(
     packed_route_indices,
     block_expert_ids,
@@ -141,7 +141,7 @@ def _pack_topk_routes_post_prefix_kernel(
     ``expert_offsets`` in place. The rightmost expert whose prefix is <= the
     block's first row owns the block: empty experts share their successor's
     offset, so the binary search cannot land on them."""
-    pid = tl.program_id(0)
+    pid = tl.program_id(0).to(tl.int64)
     offsets = pid * BLOCK_T + tl.arange(0, BLOCK_T)
     tl.store(
         packed_route_indices + offsets,
@@ -168,7 +168,7 @@ def _pack_topk_routes_post_prefix_kernel(
     )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["live_numel"], do_not_specialize_on_alignment=["live_numel"])
 def _pack_topk_routes_small_prefix_kernel(
     topk_ids,
     expert_map,
@@ -264,7 +264,7 @@ def _pack_topk_routes_small_prefix_kernel(
     )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["live_numel"], do_not_specialize_on_alignment=["live_numel"])
 def _pack_topk_routes_sort_kernel(
     topk_ids,
     expert_map,
@@ -275,7 +275,7 @@ def _pack_topk_routes_sort_kernel(
     HAS_EXPERT_MAP: tl.constexpr,
     BLOCK_T: tl.constexpr,
 ):
-    pid = tl.program_id(0)
+    pid = tl.program_id(0).to(tl.int64)
     offsets = pid * BLOCK_T + tl.arange(0, BLOCK_T)
     raw_ids = tl.load(topk_ids + offsets, mask=offsets < live_numel, other=-1).to(
         tl.int32
@@ -317,48 +317,20 @@ def pack_topk_routes_by_expert(
     provided_blocks = (
         None if block_expert_ids is None else int(block_expert_ids.numel())
     )
-    if (
-        provided_routes is not None
-        and provided_blocks is not None
-        and (
-            provided_routes < capacity_packed_routes
-            or provided_blocks < capacity_route_blocks
+    if provided_routes is not None and provided_blocks is not None:
+        _, exact_routes, exact_blocks = route_pack_capacity(
+            numel, int(block_size), int(num_experts), topk=topk, bucket_tokens=False,
         )
-    ):
-        (
-            exact_numel_capacity,
-            exact_packed_routes,
-            exact_route_blocks,
-        ) = route_pack_capacity(
-            numel,
-            int(block_size),
-            int(num_experts),
-            topk=topk,
-            bucket_tokens=False,
-        )
-        if (
-            provided_routes >= exact_packed_routes
-            and provided_blocks >= exact_route_blocks
-        ):
-            # A serving caller can own one fixed arena sized for its configured
-            # maximum while a live prefill tail belongs to a larger power-of-two
-            # bucket. Reuse the full caller capacity instead of specializing each
-            # exact tail. The small-prefix and post-prefix kernels fill unused
-            # route slots with ``live_numel`` and unused blocks with ``-1``. The
-            # recovered live-route capacity also keeps the small-prefix loop bound
-            # stable without changing the caller's allocation or route semantics.
+        if provided_routes < exact_routes or provided_blocks < exact_blocks:
+            numel_capacity = numel
+            capacity_packed_routes = exact_routes
+            capacity_route_blocks = exact_blocks
+        else:
             numel_capacity = _numel_capacity_for_route_workspace(
-                provided_routes,
-                provided_blocks,
-                int(block_size),
-                int(num_experts),
+                provided_routes, provided_blocks, int(block_size), int(num_experts),
             )
             capacity_packed_routes = provided_routes
             capacity_route_blocks = provided_blocks
-        else:
-            numel_capacity = exact_numel_capacity
-            capacity_packed_routes = exact_packed_routes
-            capacity_route_blocks = exact_route_blocks
     max_packed_routes = capacity_packed_routes
     max_route_blocks = capacity_route_blocks
     max_packed_routes = max(max_packed_routes, 1)

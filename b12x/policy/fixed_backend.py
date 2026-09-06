@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, fields
+from collections.abc import Callable
 from typing import TypeVar
 
 from .context import ComponentPolicy
@@ -35,6 +36,7 @@ def make_fixed_backend_policy(
     component_id: str,
     query_type: type[QueryT],
     backend: str,
+    validate_query: Callable[[QueryT], None] | None = None,
 ) -> ComponentPolicy[QueryT, BackendConfig]:
     """Create a typed policy for a component with one valid implementation."""
 
@@ -54,7 +56,7 @@ def make_fixed_backend_policy(
         return BackendConfig(backend=backend)
 
     def validate(
-        _query: QueryT,
+        query: QueryT,
         config: BackendConfig,
         _device: DeviceIdentity | None,
     ) -> None:
@@ -62,6 +64,8 @@ def make_fixed_backend_policy(
             raise TypeError("config must be BackendConfig")
         if config.backend != backend:
             raise ValueError(f"unsupported {component_id} backend {config.backend!r}")
+        if validate_query is not None:
+            validate_query(query)
 
     return ComponentPolicy(
         component_id=component_id,
@@ -70,7 +74,7 @@ def make_fixed_backend_policy(
         query_fields=frozenset(query_fields),
         config_fields=frozenset({"backend"}),
         encode_query=encode_query,
-        decode_profile=BackendConfig.from_profile,
+        decode_profile=lambda query, device, payload: BackendConfig.from_profile(payload),
         heuristic=heuristic,
         validate_config=validate,
     )

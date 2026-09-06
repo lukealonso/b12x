@@ -23,7 +23,7 @@ from typing import Literal
 
 import torch
 
-from b12x.policy import NO_POLICY_OVERRIDE, PolicyContext, get_auto_policy
+from b12x.policy import DeviceIdentity, NO_POLICY_OVERRIDE, PolicyContext, get_auto_policy
 
 from ._policy import GQA_POLICY, GqaConfig, GqaQuery
 
@@ -71,6 +71,18 @@ _BF16_MINIMAX_DECODE_MAX_CHUNKS = (
     (4, 1, 11),
 )
 _PagedMode = Literal["decode", "extend", "verify"]
+
+
+def _planning_sm_count(device: torch.device | DeviceIdentity) -> int:
+    if isinstance(device, DeviceIdentity):
+        return device.sm_count
+    return int(torch.cuda.get_device_properties(device).multi_processor_count)
+
+
+def _planning_compute_capability(device: torch.device | DeviceIdentity) -> tuple[int, int]:
+    if isinstance(device, DeviceIdentity):
+        return device.compute_capability
+    return tuple(torch.cuda.get_device_capability(device))
 
 
 def _merge_backend_supports_split_kv(
@@ -231,7 +243,7 @@ def _graph_max_batch_size_if_split(
         raise ValueError("graph_ctas_per_sm must be positive")
     if num_kv_heads <= 0:
         raise ValueError("num_kv_heads must be positive")
-    num_sms = int(torch.cuda.get_device_properties(device).multi_processor_count)
+    num_sms = _planning_sm_count(device)
     return max((num_sms * blocks_per_sm) // num_kv_heads, 1)
 
 
@@ -278,7 +290,7 @@ def _laguna_page128_one_wave_chunk_budget(
         and int(head_dim_vo) == 128
         and int(page_size) == 128
         and int(batch) == 1
-        and tuple(torch.cuda.get_device_capability(device)) == (12, 0)
+        and _planning_compute_capability(device) == (12, 0)
     ):
         return None
     # One work item launches one CTA per KV head.  Use the physical SM count,
@@ -341,12 +353,12 @@ def _h256_gqa8_decode_chunk_budget(
             or 992 <= int(max_effective_kv_pages) <= 1056
         )
         and int(window_left) < 0
-        and int(torch.cuda.get_device_capability(device)[0]) == 12
+        and _planning_compute_capability(device)[0] == 12
     ):
         return None
     # Preserve the measured chunks-per-SM knees while the device LUT adapts to
     # every live length captured by the same graph.
-    num_sms = int(torch.cuda.get_device_properties(device).multi_processor_count)
+    num_sms = _planning_sm_count(device)
     reference_sm_count = 48
     max_pages = int(max_effective_kv_pages)
     if 224 <= max_pages <= 288:
@@ -396,11 +408,11 @@ def _h256_one_wave_decode_chunk_budget(
         and int(num_kv_heads) >= 1
         and int(query_tiles_per_request) >= 1
         and int(window_left) < 0
-        and int(torch.cuda.get_device_capability(device)[0]) == 12
+        and _planning_compute_capability(device)[0] == 12
     ):
         return None
 
-    num_sms = int(torch.cuda.get_device_properties(device).multi_processor_count)
+    num_sms = _planning_sm_count(device)
     ctas_per_request_chunk = (
         int(batch) * int(num_kv_heads) * int(query_tiles_per_request)
     )
@@ -438,7 +450,7 @@ def _is_laguna_fp8_gqa6_analytic_decode_graph(
         and int(page_size) == 128
         and 1 <= int(batch) <= 8
         and int(window_left) < 0
-        and tuple(torch.cuda.get_device_capability(device)) == (12, 0)
+        and _planning_compute_capability(device) == (12, 0)
     )
 
 
@@ -469,7 +481,7 @@ def _is_laguna_fp8_gqa6_analytic_verify_graph(
         and 1 <= int(batch) <= 8
         and int(query_len) == 8
         and int(window_left) < 0
-        and tuple(torch.cuda.get_device_capability(device)) == (12, 0)
+        and _planning_compute_capability(device) == (12, 0)
     )
 
 
@@ -498,7 +510,7 @@ def _is_laguna_fp8_gqa6_full_prefill_graph(
         and int(page_size) == 128
         and 1 <= int(batch) <= 8
         and int(window_left) < 0
-        and tuple(torch.cuda.get_device_capability(device)) == (12, 0)
+        and _planning_compute_capability(device) == (12, 0)
     )
 
 
@@ -1138,34 +1150,99 @@ def build_decode_chunk_pages_lut(
     max_effective_kv_pages: int,
     max_chunks_per_req: int | None = None,
 ) -> tuple[int, ...]:
+    segments = _decode_chunk_segments(
+        q_dtype=q_dtype, kv_dtype=kv_dtype, batch=batch, page_size=page_size,
+        head_dim_qk=head_dim_qk, head_dim_vo=head_dim_vo, gqa_group_size=gqa_group_size,
+        max_effective_kv_pages=max_effective_kv_pages, max_chunks_per_req=max_chunks_per_req,
+    )
+    values = []
+    low = 1
+    for high, divisor, floor in segments:
+        values.extend(max(floor, _ceil_div(page, divisor)) if divisor else floor
+                      for page in range(low, high + 1))
+        low = high + 1
+    return tuple(values)
+
+
+def _decode_chunk_segments(*, q_dtype, kv_dtype, batch, page_size, head_dim_qk,
+                           head_dim_vo, gqa_group_size, max_effective_kv_pages,
+                           max_chunks_per_req):
+    """Represent chunk pages as max(floor, ceil(pages / divisor)) per interval."""
     if batch is None:
         raise ValueError("batch is required for decode graph chunk policy lookup")
-    max_effective_kv_pages = max(int(max_effective_kv_pages), 1)
-    lut: list[int] = []
-    for page_count in range(1, max_effective_kv_pages + 1):
-        chunk_pages = decode_chunk_pages_for_graph(
-            q_dtype=q_dtype,
-            kv_dtype=kv_dtype,
-            batch=batch,
-            page_size=page_size,
-            head_dim_qk=head_dim_qk,
-            head_dim_vo=head_dim_vo,
-            gqa_group_size=gqa_group_size,
-            max_effective_kv_pages=page_count,
-            max_chunks_per_req=max_chunks_per_req,
-        )
-        if chunk_pages is None:
-            raise ValueError(
-                "decode graph chunk heuristic is unavailable for "
-                f"q_dtype={q_dtype}, kv_dtype={kv_dtype}, batch={batch}, page_size={page_size}"
-            )
-        lut.append(int(chunk_pages))
-    return tuple(lut)
+    if q_dtype != torch.bfloat16 or page_size not in (64, 128):
+        raise ValueError("decode graph chunk heuristic is unavailable for this dtype or page size")
+    batch = int(batch)
+    maximum = max(int(max_effective_kv_pages), 1)
+    nominal = _decode_graph_heuristic_max_chunks_per_req(
+        kv_dtype=kv_dtype, batch=batch, page_size=page_size, head_dim_qk=head_dim_qk,
+        head_dim_vo=head_dim_vo, gqa_group_size=gqa_group_size)
+    cap = None if max_chunks_per_req is None else max(int(max_chunks_per_req), 1)
+    forced = _decode_graph_chunk_pages_env("B12X_PAGED_DECODE_GRAPH_CHUNK_PAGES")
+    if forced is not None:
+        return ((maximum, cap or 0, forced),)
+    floor = _decode_graph_chunk_pages_env("B12X_PAGED_DECODE_GRAPH_MIN_CHUNK_PAGES") or 1
+    minimax = (kv_dtype == torch.bfloat16 and head_dim_qk == 128
+               and head_dim_vo == 128 and gqa_group_size == 6)
+    starts = {1, maximum + 1}
+    if minimax:
+        starts.update(min_pages for tuned_batch, min_pages, _ in _BF16_MINIMAX_DECODE_MAX_CHUNKS
+                      if batch == tuned_batch and 1 < min_pages <= maximum)
+    starts = sorted(starts)
+    segments = []
+    for low, stop in zip(starts, starts[1:], strict=False):
+        divisor = nominal
+        if minimax:
+            tuned = _bf16_minimax_decode_max_chunks(batch=batch, max_effective_kv_pages=low)
+            if tuned is not None:
+                divisor = min(divisor, tuned)
+        if cap is not None:
+            divisor = min(divisor, cap)
+        segments.append((stop - 1, divisor, floor))
+    return tuple(segments)
 
 
-def _plan_decode_graph_capacity_heuristic(
+def _chunk_segment_maximum(low, high, divisor, floor):
+    first_chunk_pages = max(floor, _ceil_div(low, divisor)) if divisor else floor
+    maximum = _ceil_div(high, first_chunk_pages)
+    if divisor:
+        maximum = min(maximum, divisor)
+    witness = max(low, (maximum - 1) * first_chunk_pages + 1)
+    return maximum, witness
+
+
+def _factored_chunk_segment_runs(segments, max_chunks):
+    """Build the exact residual RLE by visiting quotient changes, not every page."""
+    runs = []
+    def append(end, value):
+        if runs and runs[-1][1] == value:
+            runs[-1] = (end, value)
+        else:
+            runs.append((end, value))
+
+    low = 1
+    for high, divisor, floor in segments:
+        if not divisor or divisor >= max_chunks:
+            floor_end = min(high, (floor - 1) * max_chunks)
+            if floor_end >= low:
+                append(floor_end, floor)
+            if floor_end < high:
+                append(high, 1)
+        else:
+            page = low
+            while page <= high:
+                chunk_pages = max(floor, _ceil_div(page, divisor))
+                cap_pages = _ceil_div(page, max_chunks)
+                end = min(high, chunk_pages * divisor, cap_pages * max_chunks)
+                append(end, chunk_pages if chunk_pages > cap_pages else 1)
+                page = end + 1
+        low = high + 1
+    return tuple(runs)
+
+
+def _plan_decode_graph_config_heuristic(
     *,
-    device: torch.device | str,
+    device: torch.device | str | DeviceIdentity,
     q_dtype: torch.dtype,
     kv_dtype: torch.dtype,
     num_q_heads: int,
@@ -1180,7 +1257,7 @@ def _plan_decode_graph_capacity_heuristic(
     max_work_items: int | None = None,
     max_partial_rows: int | None = None,
     force_split_kv: bool | None = None,
-) -> PagedDecodeGraphCapacity:
+) -> GqaConfig:
     """Return the fixed capacity for a graph-safe decode bucket.
 
     Optional work/partial limits describe already-owned caller storage.  Auto
@@ -1189,11 +1266,12 @@ def _plan_decode_graph_capacity_heuristic(
     closed instead of weakening the request.
     """
 
-    device = torch.device(device)
-    if device.type != "cuda":
-        raise ValueError("decode CUDA-graph capacity requires a CUDA device")
-    if device.index is None:
-        device = torch.device("cuda", torch.cuda.current_device())
+    if not isinstance(device, DeviceIdentity):
+        device = torch.device(device)
+        if device.type != "cuda":
+            raise ValueError("decode CUDA-graph capacity requires a CUDA device")
+        if device.index is None:
+            device = torch.device("cuda", torch.cuda.current_device())
     batch = int(batch)
     num_q_heads = int(num_q_heads)
     num_kv_heads = int(num_kv_heads)
@@ -1374,7 +1452,7 @@ def _plan_decode_graph_capacity_heuristic(
             )
 
     if split_policy_supported and force_split_kv is not False:
-        chunk_pages_lut = build_decode_chunk_pages_lut(
+        segments = _decode_chunk_segments(
             q_dtype=q_dtype,
             kv_dtype=kv_dtype,
             batch=batch,
@@ -1386,19 +1464,17 @@ def _plan_decode_graph_capacity_heuristic(
             max_chunks_per_req=max_chunks_budget,
         )
     else:
-        # The replay updater still consumes a fixed LUT on direct graphs.  Each
-        # entry covers the entire active span and therefore selects one chunk.
-        chunk_pages_lut = tuple(
-            page_count for page_count in range(1, max_effective_kv_pages + 1)
-        )
+        segments = ((max_effective_kv_pages, 1, 1),)
 
     worst_page_count = 1
     max_chunks_per_request = 1
-    for page_count, chunk_pages in enumerate(chunk_pages_lut, start=1):
-        num_chunks = _ceil_div(page_count, int(chunk_pages))
+    low = 1
+    for high, divisor, floor in segments:
+        num_chunks, witness = _chunk_segment_maximum(low, high, divisor, floor)
         if num_chunks > max_chunks_per_request:
             max_chunks_per_request = num_chunks
-            worst_page_count = page_count
+            worst_page_count = witness
+        low = high + 1
 
     split_storage_required = force_split_kv is True or max_chunks_per_request > 1
     if (
@@ -1422,7 +1498,7 @@ def _plan_decode_graph_capacity_heuristic(
             batch * max_chunks_per_request if split_storage_required else 0
         )
         capacity_max_chunks_per_request = max_chunks_per_request
-    return PagedDecodeGraphCapacity(
+    return GqaConfig(
         graph_ctas_per_sm=int(resolved_graph_ctas_per_sm),
         cta_tile_q=int(cta_tile_q),
         query_tiles_per_request=int(query_tiles_per_request),
@@ -1432,7 +1508,15 @@ def _plan_decode_graph_capacity_heuristic(
         max_partial_rows=int(capacity_max_partial_rows),
         max_effective_kv_pages=int(max_effective_kv_pages),
         worst_page_count=int(worst_page_count),
-        chunk_pages_lut=tuple(int(v) for v in chunk_pages_lut),
+        base_chunk_pages_runs=_factored_chunk_segment_runs(segments, capacity_max_chunks_per_request),
+    )
+
+
+def _plan_decode_graph_capacity_heuristic(**kwargs) -> PagedDecodeGraphCapacity:
+    config = _plan_decode_graph_config_heuristic(**kwargs)
+    return PagedDecodeGraphCapacity(
+        **{name: getattr(config, name) for name in config.__dataclass_fields__ if name != "base_chunk_pages_runs"},
+        chunk_pages_lut=config.chunk_pages_lut(),
     )
 
 

@@ -4,7 +4,7 @@ import multiprocessing
 import os
 from concurrent.futures import ProcessPoolExecutor
 from contextlib import AbstractContextManager
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from types import SimpleNamespace
 
 import pytest
@@ -74,11 +74,8 @@ _DEVICE = DeviceIdentity(
 )
 
 
-def test_embedded_moe_profiles_and_heuristics_cover_corpus_queries(
+def test_embedded_moe_profiles_cover_every_corpus_query_with_valid_configs(
 ) -> None:
-    from b12x.policy import PolicyContext, PolicySource
-    from b12x.moe.fused_moe._policy import MOE_DECODE_POLICY, MoeDecodeQuery
-
     cases = tuple(
         case for case in expand_sweep_cases()
         if case.geometry.recipe.quant_mode != "nvfp4_auto"
@@ -109,18 +106,8 @@ def test_embedded_moe_profiles_and_heuristics_cover_corpus_queries(
     for profile in EMBEDDED_REGISTRY.list_profiles():
         component = profile.component("moe.decode")
         assert component is not None, profile.profile_id
-        context = PolicyContext.for_identity(profile.targets[0])
         for query in queries.values():
             hit = component.lookup(query)
-            if query["quant_mode"] == "w4a16" and query["source_format"] == "modelopt_nvfp4":
-                # Native-layout measurements cannot qualify uniform MMA-packed A16.
-                assert hit is None, (profile.profile_id, query)
-                resolution = context.resolve(
-                    MOE_DECODE_POLICY, MoeDecodeQuery(**query),
-                )
-                assert resolution.source is PolicySource.HEURISTIC
-                assert _config_covers_query(query, asdict(resolution.config))
-                continue
             assert hit is not None, (profile.profile_id, query)
             assert _config_covers_query(query, hit.config), (
                 profile.profile_id,
@@ -352,10 +339,10 @@ def test_w4a16_tuner_models_native_and_packed_route_kernels() -> None:
         and case.route_pattern == "balanced"
     )
 
-    assert _w4a16_weight_layout(glm_decode.geometry) == "packed"
+    assert _w4a16_weight_layout(glm_decode.geometry) == "modelopt"
     assert (
         _w4a16_direct_path(glm_decode.geometry, glm_decode)
-        == "w4a16.tc_decode"
+        == "w4a16.small_m_direct"
     )
     assert _w4a16_weight_layout(e8m0_decode.geometry) == "packed"
     assert (
@@ -369,7 +356,7 @@ def test_w4a16_tuner_models_native_and_packed_route_kernels() -> None:
     )
     assert (
         _w4a16_direct_path(relu2_direct.geometry, relu2_direct)
-        == "w4a16.direct_topk"
+        == "w4a16.small_m_direct"
     )
     assert _w4a16_direct_path(relu2_packed_only.geometry, relu2_packed_only) is None
 
@@ -958,6 +945,53 @@ def _context(tmp_path):
     )
 
 
+def test_full_corpus_estimate_and_partitions_account_for_every_registered_case(tmp_path):
+    from dataclasses import replace
+
+    generator = MoeDecodeGenerator()
+    staged = _context(tmp_path)
+    full = replace(staged, settings=replace(staged.settings, full_corpus=True))
+    assert generator.estimate(staged).case_count == 196_794
+    assert generator.estimate(full).case_count == len(generator._cases) == 230_724
+    partitions = generator.measurement_partitions(full)
+    assert len(partitions) == len(generator._geometries) == 421
+    assert sum(partition.case_count for partition in partitions) == len(generator._cases)
+
+
+@pytest.mark.parametrize("fail_zipf", [False, True])
+def test_full_corpus_qualifies_every_route_with_oracles_and_resumes(tmp_path, monkeypatch, fail_zipf):
+    from dataclasses import replace
+
+    calls, observed = [], []
+    generator = _generator(calls, token_counts=(1, 512))
+    generator._cases = expand_sweep_cases(geometries=generator._geometries,
+        top_ks=(2,), token_counts=(1, 512), route_patterns=("balanced", "hot", "zipf", "disjoint"))
+    context = _context(tmp_path)
+    context = replace(context, settings=replace(context.settings, full_corpus=True))
+    original = _Session.measure
+
+    def measure(session, case, candidates, *, correctness=False):
+        observed.append((case.case_id, correctness))
+        results = original(session, case, candidates, correctness=correctness)
+        return tuple(replace(item, cosine=.5) for item in results) if fail_zipf and case.route_pattern == "zipf" else results
+
+    monkeypatch.setattr(_Session, "measure", measure)
+    checkpoints = CheckpointStore(tmp_path / "checkpoints")
+    if fail_zipf:
+        with pytest.raises(RuntimeError, match="full-corpus MoE qualification failed"):
+            generator.generate(context, progress=NullProgressReporter(), checkpoints=checkpoints)
+        assert all(correctness for _, correctness in observed)
+        return
+    result = generator.generate(context, progress=NullProgressReporter(), checkpoints=checkpoints)
+    assert {identity for identity, _ in observed} == {case.case_id for case in generator._cases}
+    assert all(correctness for _, correctness in observed)
+    assert result.evidence["route_measurements"] == result.evidence["registered_route_cases"] == 8
+    assert result.evidence["full_corpus"]
+    count = len(observed)
+    generator.generate(context, progress=NullProgressReporter(), checkpoints=checkpoints)
+    assert len(observed) == count
+
+
 def test_moe_measurement_partition_keeps_one_physical_geometry(tmp_path) -> None:
     generator = _generator([], tp_sizes=(1, 2))
     context = _context(tmp_path)
@@ -1067,6 +1101,54 @@ def test_moe_resume_reuses_a_cached_candidate_superset(tmp_path) -> None:
 
     assert calls == []
     assert tuple(item.candidate for item in resumed) == requested
+
+
+def test_moe_observations_share_stages_but_keep_oracles_and_cohorts_independent(tmp_path):
+    from dataclasses import replace
+    import sqlite3
+    from b12x.policy.types import FrozenMapping
+
+    calls = []
+    generator = _generator(calls)
+    context = replace(_context(tmp_path), provenance=FrozenMapping({
+        "source_sha256": "source", "physical_device": "GPU-a", "toolchain": {"compiler": "test"},
+    }))
+    checkpoints = CheckpointStore(tmp_path / "checkpoints")
+    case = generator._cases[0]
+    session = _Session(calls, quant_mode="nvfp4")
+
+    def race(stage, context=context, candidates=session.candidates):
+        return generator._race(stage=stage, case=case, candidates=candidates,
+                               session=session, context=context, checkpoints=checkpoints)
+
+    initial = race("coarse")
+    assert race("full") == initial
+    assert len(calls) == 1
+    race("screen")
+    assert len(calls) == 2
+    race("full", context=replace(context, measurement_cohort="confirmation"))
+    assert len(calls) == 3
+    race("full", candidates=session.candidates[1:])
+    assert len(calls) == 4
+    assert "measurements" not in checkpoints.load(generator.component_id, f"full-{case.case_id}")
+    with sqlite3.connect(tmp_path / "observations.sqlite3") as connection:
+        assert connection.execute("SELECT COUNT(*) FROM observations").fetchone()[0] == 4
+
+
+def test_moe_shared_search_preserves_all_routes_and_candidates(tmp_path):
+    from b12x.moe.fused_moe._policy import TUNING_PROBLEM
+    from b12x.policy.generation.engine import MoeSearch
+    from b12x.policy.generation.search import SearchBudget, SearchStrategy
+
+    calls = []
+    generator = _generator(calls)
+    checkpoints = CheckpointStore(tmp_path / "checkpoints")
+    with MoeSearch(generator, TUNING_PROBLEM, _context(tmp_path), checkpoints) as search:
+        result = search.search(strategy=SearchStrategy.ADAPTIVE, budget=SearchBudget(queries=2))
+    assert len(result.measurements) == 2
+    assert all(item.fresh for item in result.measurements)
+    assert all(len(item.candidate_ids) == 2 for item in result.measurements)
+    assert len(calls) == 4
 
 
 def test_correctness_screen_uses_an_eligible_anchor_per_candidate(tmp_path) -> None:
@@ -1512,16 +1594,19 @@ def test_failed_first_candidate_cannot_become_cross_candidate_reference() -> Non
     )
 
 
-def test_independent_nvfp4_oracle_matches_kernel_scale_math(monkeypatch) -> None:
+@pytest.mark.parametrize("normalized", (False, True))
+def test_independent_nvfp4_oracle_matches_kernel_scale_math(monkeypatch, normalized) -> None:
     from b12x.moe._shared.kernels import reference
+    from b12x.moe.fused_moe import _impl
 
     geometry = _generator([])._geometries[0]
     session = object.__new__(_MoeGeometrySession)
     session._geometry = geometry
     session._experts = SimpleNamespace(
         _impl=SimpleNamespace(
-            w1_fp4=object(),
-            w1_blockscale=object(),
+            w1_fp4=SimpleNamespace(data_ptr=lambda: 123),
+            w1_blockscale=SimpleNamespace(data_ptr=lambda: 456),
+            w13_layout="w31",
             w1_alphas=object(),
             w2_fp4=object(),
             w2_blockscale=object(),
@@ -1538,6 +1623,7 @@ def test_independent_nvfp4_oracle_matches_kernel_scale_math(monkeypatch) -> None
         return "reference"
 
     monkeypatch.setattr(reference, "moe_reference_nvfp4", fake_reference)
+    monkeypatch.setattr(_impl, "_W13_NORMALIZED_STORAGES", {(123, 456): None} if normalized else {})
 
     result = session._independent_reference(
         x=object(),
@@ -1547,6 +1633,7 @@ def test_independent_nvfp4_oracle_matches_kernel_scale_math(monkeypatch) -> None
 
     assert result == "reference"
     assert captured["kwargs"]["quant_scale_math"] == "reciprocal_multiply"
+    assert captured["kwargs"]["w13_layout"] == ("w13" if normalized else "w31")
 
 
 def test_modelopt_profile_weights_pad_and_swizzle_scale_atoms() -> None:
@@ -2054,7 +2141,7 @@ def test_auto_precision_qualifies_each_capacity_and_preserves_exact_holes(tmp_pa
 
 @pytest.mark.parametrize("profile_id,route", [
     ("nvidia.gb10.48sm", "packed"),
-    ("nvidia.rtx.pro.6000.blackwell.max-q", "direct"),
+    ("nvidia.rtx.pro.6000.blackwell", "direct"),
 ])
 def test_embedded_auto_precision_retains_overrides_and_exact_capacity_coverage(profile_id, route):
     from dataclasses import replace

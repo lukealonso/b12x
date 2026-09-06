@@ -9,25 +9,15 @@ def route_pack_prewarm_key(
     device_type: str,
     device_index: int,
     route_ids_dtype: Any,
-    token_count: int,
-    top_k: int,
     packed_route_slots: int,
     route_blocks: int,
     block_size: int,
     num_experts: int,
     mapped: bool,
 ) -> tuple[object, ...]:
-    """Identify every input that can change a route-pack specialization.
-
-    ``token_count`` and ``top_k`` remain separate because equal routed-row
-    counts can select different ``NUMEL_CAPACITY`` values. Caller-owned slot
-    and block capacities are included because a fixed arena can replace the
-    power-of-two bucket selected for the live shape.
-    """
+    """Identify the fixed routing arena, device, and expert-map contract."""
 
     values = {
-        "token_count": token_count,
-        "top_k": top_k,
         "packed_route_slots": packed_route_slots,
         "route_blocks": route_blocks,
         "block_size": block_size,
@@ -43,8 +33,6 @@ def route_pack_prewarm_key(
         str(device_type),
         int(device_index),
         str(route_ids_dtype),
-        normalized["token_count"],
-        normalized["top_k"],
         normalized["packed_route_slots"],
         normalized["route_blocks"],
         normalized["block_size"],

@@ -76,7 +76,7 @@ BLOCKSCALED_POLICY = ComponentPolicy(
     query_fields=frozenset(BlockscaledQuery.__dataclass_fields__),
     config_fields=frozenset(BlockscaledConfig.__dataclass_fields__),
     encode_query=lambda query: dict(vars(query)),
-    decode_profile=BlockscaledConfig.from_profile,
+    decode_profile=lambda query, device, payload: BlockscaledConfig.from_profile(payload),
     heuristic=_heuristic,
     validate_config=_validate,
 )
@@ -92,3 +92,30 @@ def resolve_precision(device, recipe, k, n):
     return get_auto_policy(device).resolve(
         BLOCKSCALED_POLICY, BlockscaledQuery(recipe=recipe, in_features=k, out_features=n)
     )
+
+
+from b12x.policy.problem import define_problem
+from b12x.policy.problem import BindingTime, FieldRole, ProblemField
+
+
+def _materialize_precision_collection(query, device, decisions):
+    rows = tuple(sorted((sample["measured_m"], decision["tile_n"], decision["tile_k"], decision["split_k"])
+                        for sample, decision in decisions if decision["precision"] == "a16"))
+    return BlockscaledConfig(a16_rows=rows)
+
+
+TUNING_PROBLEM = define_problem(
+    policy=BLOCKSCALED_POLICY, query_type=BlockscaledQuery, config_type=BlockscaledConfig,
+    axes=('in_features', 'out_features'),
+    family=('recipe',),
+    constraints=(),
+    environment=(),
+    model_fields=('in_features', 'out_features'),
+    decisions={'precision': ('quantized', 'a16'), 'tile_n': (64, 128), 'tile_k': (64, 128), 'split_k': (1, 2, 4, 8)},
+    decision_conditions={name: {'precision': 'a16'} for name in ('tile_n', 'tile_k', 'split_k')},
+    ordered=('tile_n', 'tile_k', 'split_k'),
+    derived_config_fields=('a16_rows',),
+    sampled_inputs=(ProblemField(name='measured_m', role=FieldRole.AXIS, binding=BindingTime.RUNTIME, minimum=1),),
+    materialize_collection=_materialize_precision_collection,
+    selection_contract='independent_confirmed_a16_parity',
+)

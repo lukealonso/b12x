@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-import math
 import statistics
+from dataclasses import replace
 
 from .moe import MoeMeasurement
+from ..selection import reduce_scenarios
 
 
 def source_identity():
@@ -42,33 +43,30 @@ def qualifies(pairs, candidate, baseline):
     return ratio <= 1.0, ratio, _ratio_interval(pairs, candidate, baseline)
 
 
-def select_winner(grouped, minimum_cosine):
-    """Compare confirmed geometric means across the same route patterns."""
-    from collections import defaultdict
-
-    by_candidate = defaultdict(list)
-    for _case, measurements in grouped:
-        for measurement in measurements:
-            if measurement.passes(minimum_cosine):
-                by_candidate[measurement.candidate.candidate_id].append(measurement)
-    scores = []
-    for measurements in by_candidate.values():
-        if len(measurements) != len(grouped):
-            continue
-        initial, confirmation = (
-            math.exp(statistics.mean(math.log(item.metrics[field]) for item in measurements))
-            for field in ("initial_latency_us", "confirmation_latency_us")
-        )
-        scores.append((initial, confirmation, measurements[0].candidate))
-    baselines = [row for row in scores if row[2].config["backend"] != "w4a16"]
+def reduce_precision(scenarios, minimum_cosine):
+    """Require A16 parity in both independent route-aggregate timing cohorts."""
+    initial, confirmation = (
+        reduce_scenarios(scenarios, qualified=lambda item: item.passes(minimum_cosine),
+                         latency=lambda item, field=field: item.metrics[field])
+        for field in ("initial_latency_us", "confirmation_latency_us")
+    )
+    baselines = [candidate.candidate_id for candidate in confirmation.candidates
+                 if candidate.config["backend"] != "w4a16"
+                 and candidate.candidate_id in confirmation.latencies_us]
     if not baselines:
         raise RuntimeError("automatic MoE precision has no route-robust qualified A4 baseline")
-    eligible = [row for row in scores if row[2].config["backend"] != "w4a16" or all(
-        row[0] <= base[0] and row[1] <= base[1] for base in baselines
-    )]
-    return min(eligible, key=lambda row: (
-        row[1], row[2].config["backend"] != "w4a16", row[2].candidate_id,
-    ))[2]
+    eligible = tuple(candidate.candidate_id for candidate in confirmation.candidates
+                     if candidate.candidate_id in confirmation.latencies_us
+                     and (candidate.config["backend"] != "w4a16" or all(
+                         initial.latencies_us[candidate.candidate_id] <= initial.latencies_us[base]
+                         and confirmation.latencies_us[candidate.candidate_id] <= confirmation.latencies_us[base]
+                         for base in baselines)))
+    return replace(confirmation, eligible_candidates=eligible)
+
+
+def select_winner(grouped, minimum_cosine):
+    scores = reduce_precision(tuple(measurements for _, measurements in grouped), minimum_cosine)
+    return scores.select(lambda candidate: candidate.config["backend"] != "w4a16")
 
 
 def _reference(session, inputs, candidate):
@@ -171,22 +169,28 @@ def measure_precision(session, case, candidates):
     def timed(selected):
         attempts = []
         for _ in range(3):
-            _paired(selected, warmup, count, session._flush)
+            _paired(selected, warmup, count, session._flush, timing_clock=settings.timing_clock)
             before = _snapshot()
             allocated = torch.cuda.memory_allocated(session._device)
-            pairs = _paired(selected, warmup, count, session._flush)
+            pairs = _paired(selected, warmup, count, session._flush, timing_clock=settings.timing_clock)
             allocation_delta = torch.cuda.memory_allocated(session._device) - allocated
             after = _snapshot()
             clocks = _clock_checks(before, after)
             attempts.append(dict(
-                samples_us=pairs, snapshot_before=before, snapshot_after=after,
+                samples_us=pairs, timing_clock=settings.timing_clock, snapshot_before=before, snapshot_after=after,
                 clock_validation=clocks, replay_allocation_bytes=allocation_delta,
             ))
             if clocks["valid"] and allocation_delta == 0:
                 break
         return pairs, clocks["valid"] and allocation_delta == 0, attempts
 
-    b12x.freeze_kernel_resolution("MoE precision race and confirmation")
+    from b12x._lib.runtime_control import kernel_resolution_frozen
+    if settings.timing_clock == "globaltimer":
+        from b12x.policy.generation.timestamps import warm_globaltimer
+        warm_globaltimer(session._device)
+    already_frozen = kernel_resolution_frozen()
+    if not already_frozen:
+        b12x.freeze_kernel_resolution("MoE precision race and confirmation")
     try:
         pairs, valid, attempts = timed(graphs)
         confirmation, confirmation_valid, confirmation_attempts = timed(graphs)
@@ -201,7 +205,8 @@ def measure_precision(session, case, candidates):
             prepared.graph.replay()
             _check(prepared.output, expected, name=name, m=case.num_tokens, oracle_mode=mode)
     finally:
-        b12x.unfreeze_kernel_resolution()
+        if not already_frozen:
+            b12x.unfreeze_kernel_resolution()
     if weight_hashes() != original_hashes:
         raise AssertionError("precision candidate mutated the shared native weights")
     results = []

@@ -16,6 +16,20 @@ from b12x.policy.generation.providers.blockscaled import BlockscaledPrecisionGen
 from b12x.policy.generation.reducer import DecisionRecord
 
 
+def test_precision_factory_keeps_sampled_rows_out_of_runtime_query():
+    from b12x.gemm.blockscaled._policy import TUNING_PROBLEM
+
+    inputs = dict(recipe="mxfp8", in_features=384, out_features=256, measured_m=3)
+    case, = BlockscaledPrecisionGenerator.cases_for_tuning_queries((inputs,))
+    assert case.query == FrozenMapping(inputs)
+    query = TUNING_PROBLEM.query_from_inputs(inputs)
+    assert dict(TUNING_PROBLEM.canonical_inputs(query)) == {key: value for key, value in inputs.items() if key != "measured_m"}
+    assert case == next(BlockscaledPrecisionGenerator.cases_for_tuning_queries((inputs,)))
+    for change in ({"recipe": "tensor_fp8"}, {"measured_m": 0}, {"in_features": 383}):
+        with pytest.raises(ValueError):
+            tuple(BlockscaledPrecisionGenerator.cases_for_tuning_queries(({**inputs, **change},)))
+
+
 def _context(config, device=None):
     if device is None:
         device = EMBEDDED_REGISTRY.get("nvidia.rtx.pro.6000.blackwell").targets[0]
@@ -102,7 +116,7 @@ def test_exact_row_dispatch_and_policy_precedence():
     assert set(BLOCKSCALED_POLICY.encode_query(query)) == {"recipe", "in_features", "out_features"}
 
 
-@pytest.mark.parametrize("profile_id", ["nvidia.rtx.pro.6000.blackwell.max-q", "nvidia.gb10.48sm"])
+@pytest.mark.parametrize("profile_id", ["nvidia.rtx.pro.6000.blackwell", "nvidia.gb10.48sm"])
 @pytest.mark.parametrize("recipe", ["nvfp4", "mxfp8"])
 def test_small_m_heuristic_and_autotuned_quantized_decision(profile_id, recipe):
     measured = _context({"a16_rows": []}, EMBEDDED_REGISTRY.get(profile_id).targets[0])
@@ -122,8 +136,8 @@ def test_small_m_heuristic_and_autotuned_quantized_decision(profile_id, recipe):
     assert not PolicyContext.for_identity(unsupported).resolve(BLOCKSCALED_POLICY, query).config.a16_rows
 
 
-def test_embedded_precision_coverage_is_exact_to_max_q_and_geometry():
-    profile = EMBEDDED_REGISTRY.get("nvidia.rtx.pro.6000.blackwell.max-q")
+def test_embedded_precision_coverage_is_exact_to_rtx_aliases_and_geometry():
+    profile = EMBEDDED_REGISTRY.get("nvidia.rtx.pro.6000.blackwell")
     context = PolicyContext.for_identity(profile.targets[0])
     query = BlockscaledQuery(recipe="nvfp4", in_features=5376, out_features=4096)
     resolution = context.resolve(BLOCKSCALED_POLICY, query)
@@ -133,8 +147,13 @@ def test_embedded_precision_coverage_is_exact_to_max_q_and_geometry():
     uncovered = context.resolve(BLOCKSCALED_POLICY, replace(query, in_features=4096))
     assert uncovered.source is PolicySource.HEURISTIC
     assert uncovered.config.select(8) == (128, 64, 4)
-    for device in EMBEDDED_REGISTRY.get("nvidia.rtx.pro.6000.blackwell").targets:
-        assert PolicyContext.for_identity(device).resolve(BLOCKSCALED_POLICY, query).source is PolicySource.HEURISTIC
+    assert len(profile.targets) == 3
+    for device in profile.targets:
+        selected = PolicyContext.for_identity(device).resolve(BLOCKSCALED_POLICY, query)
+        assert selected.source is PolicySource.PREPLANNED
+        assert selected.config == resolution.config
+    unknown = replace(profile.targets[0], product_name="NVIDIA RTX PRO 6000 Unknown Edition")
+    assert PolicyContext.for_identity(unknown).resolve(BLOCKSCALED_POLICY, query).source is PolicySource.HEURISTIC
 
 
 @pytest.mark.parametrize("rows", [[[1, 64, 64, 3]], [[8, 64, 64, 1], [1, 64, 64, 1]], [[1, 64, 64, 1], [1, 128, 64, 1]]])
@@ -150,7 +169,7 @@ def test_generator_aggregates_measured_rows_without_putting_m_in_runtime_query()
     records = tuple(DecisionRecord(query=case.query, config=FrozenMapping({
         "a16_rows": [] if case.query["measured_m"] == 4 else [[case.query["measured_m"], 64, 64, 4]],
     })) for case in cases)
-    planner = generator.build_planner(records)
+    planner = generator.build_planner(records, device=EMBEDDED_REGISTRY.get("nvidia.gb10.48sm").targets[0])
     query = dict(recipe="nvfp4", in_features=5376, out_features=4096)
     config = BlockscaledConfig.from_profile(planner.lookup(query).config)
     assert config.a16_rows == ((1, 64, 64, 4), (8, 64, 64, 4))
@@ -207,6 +226,41 @@ def test_precision_generator_prefers_a16_at_equal_latency(tmp_path):
     leaf = profile.component(BLOCKSCALED_PRECISION).lookup(
         dict(recipe="nvfp4", in_features=5376, out_features=4096))
     assert leaf.config == a16.config
+
+
+def test_shared_precision_search_uses_shape_independent_decisions_and_parity_constraints(tmp_path):
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+    from b12x.gemm.blockscaled._policy import BlockscaledQuery, TUNING_PROBLEM
+    from b12x.policy.generation import CheckpointStore, GenerationContext, GenerationSettings, SweepCandidate, SweepMeasurement
+    from b12x.policy.generation.engine import DiscreteSearch
+    from b12x.policy.generation.search import SearchBudget, SearchStrategy
+
+    cases = precision_cases(geometries=((256, 128),), counts=(1, 8), recipes=("nvfp4",))
+    generator = BlockscaledPrecisionGenerator(cases=cases)
+    session = SimpleNamespace(
+        candidates=lambda case: (SweepCandidate.create({"a16_rows": []}),
+                                 SweepCandidate.create({"a16_rows": [[case.query["measured_m"], 128, 64, 4]]})),
+        measure=lambda case, candidates: tuple(SweepMeasurement(
+            candidate=candidate, latency_us=.8 if candidate.config["a16_rows"] else 1., correct=True,
+            selection_eligible=not candidate.config["a16_rows"] or case.query["measured_m"] == 8,
+        ) for candidate in candidates),
+    )
+    generator._benchmark_factory = lambda *args: nullcontext(session)
+    device = EMBEDDED_REGISTRY.get("nvidia.gb10.48sm").targets[0]
+    context = GenerationContext(device=device, device_ordinal=0, work_dir=tmp_path,
+                                source_revision="test", settings=GenerationSettings())
+    with DiscreteSearch(generator, TUNING_PROBLEM, context, CheckpointStore(tmp_path)) as search:
+        result = search.search(strategy=SearchStrategy.EXHAUSTIVE, budget=SearchBudget(queries=2))
+    first, second = result.measurements
+    assert set(first.candidate_ids) == set(second.candidate_ids)
+    assert set(first.latencies_us) == set(first.candidate_ids)
+    assert search.configs[first.winner].to_dict() == {"precision": "quantized"}
+    assert search.configs[second.winner].to_dict() == {"precision": "a16", "tile_n": 128, "tile_k": 64, "split_k": 4}
+    config = TUNING_PROBLEM.lower_collection(BlockscaledQuery(recipe="nvfp4", in_features=128, out_features=256),
+                                           device, [({"measured_m": item.point.query["measured_m"]}, search.configs[item.winner])
+                                                    for item in result.measurements])
+    assert config.a16_rows == ((8, 128, 64, 4),)
 
 
 def test_auto_precision_preserves_explicit_mode_and_unqualified_source_layout(monkeypatch):

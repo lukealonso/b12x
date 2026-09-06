@@ -54,14 +54,14 @@ def test_auto_requires_nvfp4_native_storage():
         ))
 
 
-def test_uniform_nvfp4_a16_requires_only_mma_packing():
+def test_uniform_nvfp4_a16_defaults_to_native_packing():
     activation = replace(weight_plan().activation, mode=fused_moe.ActivationMode.A16)
     plan = weight_plan(activation=activation)
-    assert plan.prepared_format.available_packings == {fused_moe.WeightPacking.MMA_PACKED}
-    with pytest.raises(ValueError, match="uniform NVFP4 W4A16 requires mma_packed"):
-        weight_plan(activation=activation, constraints=fused_moe.WeightPlanConstraints(
-            required_packing=fused_moe.WeightPacking.SOURCE_NATIVE,
-        ))
+    assert plan.prepared_format.available_packings == {fused_moe.WeightPacking.SOURCE_NATIVE}
+    packed = weight_plan(activation=activation, constraints=fused_moe.WeightPlanConstraints(
+        required_packing=fused_moe.WeightPacking.MMA_PACKED,
+    ))
+    assert packed.prepared_format.available_packings == {fused_moe.WeightPacking.MMA_PACKED}
 
 
 @pytest.mark.parametrize("name", ["w13_blockscale", "w2_blockscale"])
@@ -88,7 +88,7 @@ def test_native_nvfp4_preparation_validates_scale_storage(name, invalid):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_uniform_nvfp4_a16_does_not_retain_source_scales():
+def test_uniform_nvfp4_a16_shares_native_weights_and_scales():
     plan = weight_plan(activation=replace(weight_plan().activation, mode=fused_moe.ActivationMode.A16))
     weights = fused_moe.PackedWeights(
         w13=torch.zeros((8, 256, 64), dtype=torch.uint8, device="cuda"),
@@ -101,14 +101,16 @@ def test_uniform_nvfp4_a16_does_not_retain_source_scales():
     source_scales = (weakref.ref(weights.w13_block_scales), weakref.ref(weights.w2_block_scales))
     experts = fused_moe.prepare_weights(plan=plan, weights=weights)
     prepared = experts._impl.representation_for("w4a16")
-    assert prepared.weight_layout == "packed"
+    assert prepared.weight_layout == "modelopt"
     assert prepared.w13.data_ptr() == weights.w13.data_ptr()
     assert prepared.w2.data_ptr() == weights.w2.data_ptr()
     assert prepared.w13_scale is experts._impl.w1_blockscale
     assert prepared.w2_scale is experts._impl.w2_blockscale
+    assert prepared.w13_scale is weights.w13_block_scales
+    assert prepared.w2_scale is weights.w2_block_scales
     del weights
     gc.collect()
-    assert all(ref() is None for ref in source_scales)
+    assert all(ref() is not None for ref in source_scales)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -214,5 +216,5 @@ def test_auto_shared_weights_precision_plans_replay_without_resolution(monkeypat
                 graph.reset()
     finally:
         b12x.unfreeze_kernel_resolution()
-    for original, actual in zip(originals, (packed.w13, packed.w2, packed.w13_block_scales, packed.w2_block_scales)):
+    for original, actual in zip(originals, (packed.w13, packed.w2, packed.w13_block_scales, packed.w2_block_scales), strict=True):
         assert torch.equal(original.view(torch.uint8), actual.view(torch.uint8))

@@ -35,3 +35,17 @@ SparseMlaConfig = BackendConfig
 
 
 __all__ = ["SPARSE_MLA_POLICY", "SparseMlaConfig", "SparseMlaQuery"]
+
+
+from b12x.policy.problem import define_problem
+
+TUNING_PROBLEM = define_problem(
+    policy=SPARSE_MLA_POLICY, query_type=SparseMlaQuery, config_type=SparseMlaConfig,
+    axes=('num_q_heads', 'qk_head_dim', 'v_head_dim', 'max_q_rows', 'max_width'),
+    family=('mode', 'dtype', 'kv_dtype', 'page_size', 'model_type', 'head_major_output'),
+    constraints=(),
+    environment=(),
+    model_fields=('num_q_heads', 'qk_head_dim', 'v_head_dim', 'page_size', 'model_type', 'head_major_output'),
+    decisions={'backend': ('native',)},
+    derived_config_fields=(),
+)

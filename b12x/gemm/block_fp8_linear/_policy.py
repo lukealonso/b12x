@@ -105,7 +105,7 @@ BLOCK_FP8_LINEAR_POLICY = ComponentPolicy(
     query_fields=frozenset(BlockFp8LinearQuery.__dataclass_fields__),
     config_fields=frozenset(BlockFp8LinearConfig.__dataclass_fields__),
     encode_query=_encode,
-    decode_profile=BlockFp8LinearConfig.from_profile,
+    decode_profile=lambda query, device, payload: BlockFp8LinearConfig.from_profile(payload),
     heuristic=_heuristic,
     validate_config=_validate,
 )
@@ -116,3 +116,19 @@ __all__ = [
     "BlockFp8LinearConfig",
     "BlockFp8LinearQuery",
 ]
+
+
+from b12x.policy.problem import define_problem
+
+TUNING_PROBLEM = define_problem(
+    policy=BLOCK_FP8_LINEAR_POLICY, query_type=BlockFp8LinearQuery, config_type=BlockFp8LinearConfig,
+    axes=('max_tokens', 'in_features', 'out_features'),
+    family=('output_dtype',),
+    constraints=(),
+    environment=(),
+    model_fields=('in_features', 'out_features'),
+    decisions={'backend': ('mxfp8',), 'tile_m': (16, 32, 64, 128), 'tile_n': (64, 128)},
+    ordered=('tile_m', 'tile_n'),
+    axis_domains={'max_tokens': (1, 1), 'in_features': (128, 128), 'out_features': (1, 1)},
+    derived_config_fields=(),
+)

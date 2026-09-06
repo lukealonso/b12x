@@ -513,3 +513,57 @@ def test_pack_topk_routes_by_expert_large_expert_decode_capture(
         )
         expected = expected.flatten().sort().values
         assert torch.equal(actual, expected), expert
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("capacity,topk,experts", [(24, 1, 32), (1536, 16, 896)])
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+def test_fixed_route_arena_reuses_kernels_across_live_counts(capacity, topk, experts, dtype):
+    from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    block = 8
+    _, slots, blocks = route_pack_capacity(capacity * topk, block, experts, topk=topk, bucket_tokens=False)
+    arena = dict(
+        packed_route_indices=torch.empty(slots, device=device, dtype=torch.int32),
+        block_expert_ids=torch.empty(blocks, device=device, dtype=torch.int32),
+        packed_route_count=torch.empty(1, device=device, dtype=torch.int32),
+        expert_offsets=torch.empty(experts+1, device=device, dtype=torch.int32),
+        expert_counts=torch.empty(experts, device=device, dtype=torch.int32),
+    )
+    ids = (torch.arange(capacity*topk, device=device).reshape(capacity, topk) % experts).to(dtype)
+    mapping = torch.arange(experts, device=device, dtype=torch.int32)
+    mapping[::7] = -1
+    def run(rows):
+        return pack_topk_routes_by_expert(ids[:rows], block, experts, expert_map=mapping, **arena)
+    run(capacity)
+    torch.cuda.synchronize(device)
+    for rows in dict.fromkeys((capacity, 1, 3, 17, capacity-1)):
+        expected_ids, valid, count, expected_blocks = _expected_route_pack(ids[:rows], block, experts, mapping)
+        freeze_kernel_resolution("fixed route arenas must reuse warmed kernels across live counts")
+        graph = torch.cuda.CUDAGraph()
+        try:
+            with torch.cuda.graph(graph):
+                packed, owners, live_count = run(rows)
+            assert packed.numel() == slots and owners.numel() == blocks
+            allocated = torch.cuda.memory_allocated(device)
+            for _ in range(3):
+                arena["packed_route_indices"].fill_(-123)
+                arena["block_expert_ids"].fill_(-123)
+                graph.replay()
+                torch.cuda.synchronize(device)
+                assert torch.cuda.memory_allocated(device) == allocated
+                torch.testing.assert_close(live_count.cpu(), count)
+                live_blocks = int(count.item()) // block
+                torch.testing.assert_close(owners[:live_blocks].cpu(), expected_blocks)
+                assert bool((owners[live_blocks:] == -1).all())
+                host = packed.cpu().long()
+                selected = host[host < rows*topk]
+                torch.testing.assert_close(selected.sort().values, torch.nonzero(valid).flatten())
+                for index, expert in enumerate(expected_blocks.tolist()):
+                    routes = host[index*block:(index+1)*block]
+                    routes = routes[routes < rows*topk]
+                    assert bool((expected_ids[routes] == expert).all())
+        finally:
+            unfreeze_kernel_resolution()
+            graph.reset()

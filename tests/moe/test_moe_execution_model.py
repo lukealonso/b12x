@@ -288,12 +288,12 @@ def test_source_native_w4a16_and_nvfp4_share_one_allocation() -> None:
     assert PreparedScaleLayout.MMA_PACKED not in plan.scale_layouts
 
 
-def test_uniform_nvfp4_w4a16_uses_one_packed_representation() -> None:
+def test_uniform_nvfp4_w4a16_uses_one_native_representation() -> None:
     plan = _weight_plan("w4a16", source_format="modelopt_nvfp4")
-    assert plan.storage_policy is WeightStoragePolicy.REUSE_SOURCE
-    assert plan.transforms == {WeightPreparationTransform.W4A16_PACKED}
-    assert plan.weight_layouts == {PreparedWeightLayout.MMA_PACKED}
-    assert plan.scale_layouts == {PreparedScaleLayout.MMA_PACKED}
+    assert plan.storage_policy is WeightStoragePolicy.TRANSFER_SOURCE
+    assert plan.transforms == {WeightPreparationTransform.W4A16_NATIVE}
+    assert plan.weight_layouts == {PreparedWeightLayout.SOURCE_NATIVE}
+    assert plan.scale_layouts == {PreparedScaleLayout.SOURCE_NATIVE}
 
 
 def test_planner_rejects_source_plus_model_sized_repack() -> None:

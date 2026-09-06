@@ -139,18 +139,22 @@ def balanced_samples_us(
     )
 
 
-def git_revision(repo: pathlib.Path) -> str:
-    return subprocess.check_output(
-        ["git", "rev-parse", "HEAD"], cwd=repo, text=True
-    ).strip()
-
-
-def git_is_dirty(repo: pathlib.Path) -> bool:
-    return bool(
-        subprocess.check_output(
-            ["git", "status", "--porcelain"], cwd=repo, text=True
+def git_revision(repo: pathlib.Path) -> str | None:
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=repo, text=True, stderr=subprocess.DEVNULL
         ).strip()
-    )
+    except subprocess.CalledProcessError:
+        return None
+
+
+def git_is_dirty(repo: pathlib.Path) -> bool | None:
+    try:
+        return bool(subprocess.check_output(
+            ["git", "status", "--porcelain"], cwd=repo, text=True, stderr=subprocess.DEVNULL
+        ).strip())
+    except subprocess.CalledProcessError:
+        return None
 
 
 def gpu_snapshot() -> list[str]:
@@ -317,11 +321,13 @@ def main() -> None:
     baseline_median = statistics.median(baseline_us)
     fused_median = statistics.median(fused_us)
     repo = pathlib.Path(__file__).resolve().parents[1]
+    from b12x.policy.generation.provenance import capture_measurement_provenance
     result = {
         "command": shlex.join([sys.executable, *sys.argv]),
         "commit": git_revision(repo),
         "worktree": str(repo),
         "git_dirty": git_is_dirty(repo),
+        "provenance": capture_measurement_provenance(device.index).to_dict(),
         "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
         "device": str(device),
         "gpu_name": torch.cuda.get_device_name(device),

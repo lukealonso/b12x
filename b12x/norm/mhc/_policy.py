@@ -213,10 +213,28 @@ MHC_POLICY = ComponentPolicy(
     query_fields=frozenset(MhcQuery.__dataclass_fields__),
     config_fields=frozenset(MhcConfig.__dataclass_fields__),
     encode_query=_encode,
-    decode_profile=MhcConfig.from_profile,
+    decode_profile=lambda query, device, payload: MhcConfig.from_profile(payload),
     heuristic=_heuristic,
     validate_config=_validate,
 )
 
 
 __all__ = ["MHC_POLICY", "MhcConfig", "MhcQuery"]
+
+
+from b12x.policy.problem import define_problem
+
+TUNING_PROBLEM = define_problem(
+    policy=MHC_POLICY, query_type=MhcQuery, config_type=MhcConfig,
+    axes=('max_tokens', 'hidden_size'),
+    family=('dtype',),
+    constraints=('split_k',),
+    environment=(),
+    model_fields=('hidden_size', 'split_k'),
+    decisions={'backend': ('native', 'tf32_tma'), 'projection_tile_m': (16, 32, 64, 128, 192),
+               'projection_tile_n': (8, 24), 'projection_tile_k': (64, 256),
+               'projection_num_stages': (1, 2, 3), 'projection_num_m_warps': (1, 2, 4, 8, 12),
+               'projection_num_n_warps': (1,), 'projection_k_splits': (1, 4, 8)},
+    axis_domains={'max_tokens': (1, 1), 'hidden_size': (1, 1)},
+    derived_config_fields=(),
+)

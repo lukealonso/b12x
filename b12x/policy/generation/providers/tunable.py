@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+from b12x.policy.generation.replay import PreparedCandidate, capture_warmed_graph, measure_prepared_candidates
+
 import dataclasses
 import gc
 import math
 from collections.abc import Sequence
 from contextlib import AbstractContextManager
+
 
 from b12x.policy.components import DSA_INDEXER, NVFP4_QUANTIZATION, VARLEN_ATTENTION
 from b12x.policy.generation.contracts import (
@@ -24,10 +27,7 @@ from b12x.policy.generation.sweep import (
 )
 
 from .gpu_workers import (
-    _bounded_repetitions,
-    _cuda_event_samples_us,
     _l2_flush_fn,
-    _median_of_group_medians,
 )
 
 
@@ -166,9 +166,7 @@ class _Nvfp4Session(AbstractContextManager["_Nvfp4Session"]):
                     for _ in range(settings.warmup):
                         run()
                     torch.cuda.synchronize(device)
-                    graph = torch.cuda.CUDAGraph()
-                    with torch.cuda.graph(graph):
-                        run()
+                    graph, _ = capture_warmed_graph(run, device=device)
                     graph.replay()
                     torch.cuda.synchronize(device)
                     packed_actual = outputs.packed_a_storage.permute(1, 2, 0)
@@ -178,49 +176,11 @@ class _Nvfp4Session(AbstractContextManager["_Nvfp4Session"]):
                         torch.count_nonzero(packed_actual).item()
                         and torch.count_nonzero(outputs.scale_flat).item()
                     )
-                    start = torch.cuda.Event(enable_timing=True)
-                    end = torch.cuda.Event(enable_timing=True)
-                    start.record()
-                    graph.replay()
-                    end.record()
-                    end.synchronize()
-                    repetitions = _bounded_repetitions(
-                        settings,
-                        pilot_us=float(start.elapsed_time(end)) * 1_000.0,
-                    )
-                    allocated_before = torch.cuda.memory_allocated(device)
-                    samples = _cuda_event_samples_us(
-                        graph.replay,
-                        count=settings.groups * repetitions,
-                        device=device,
-                        flush=flush,
-                    )
-                    allocated_after = torch.cuda.memory_allocated(device)
-                    latency = _median_of_group_medians(
-                        samples,
-                        groups=settings.groups,
-                        repetitions=repetitions,
-                    )
-                    measurements.append(
-                        SweepMeasurement(
-                            candidate=candidate,
-                            latency_us=latency,
-                            correct=(
-                                packed_exact
-                                and scales_exact
-                                and nonzero
-                                and allocated_after <= allocated_before
-                            ),
-                            metrics={
-                                "packed_exact": packed_exact,
-                                "scales_exact": scales_exact,
-                                "nonzero": nonzero,
-                                "replay_allocation_bytes": (
-                                    allocated_after - allocated_before
-                                ),
-                            },
-                        )
-                    )
+                    measurements.append(PreparedCandidate(
+                        candidate=candidate, graph=graph, owners=(plan, outputs),
+                        correct=packed_exact and scales_exact and nonzero,
+                        metrics={"frozen_resolution_capture": True, "packed_exact": packed_exact, "scales_exact": scales_exact, "nonzero": nonzero},
+                    ))
                 except Exception as exc:  # noqa: BLE001 - failed candidates survive
                     measurements.append(
                         SweepMeasurement(
@@ -230,7 +190,7 @@ class _Nvfp4Session(AbstractContextManager["_Nvfp4Session"]):
                             error=f"{type(exc).__name__}: {exc}",
                         )
                     )
-            return tuple(measurements)
+            return measure_prepared_candidates(measurements, settings=settings, device=device, flush=flush)
 
     @staticmethod
     def _context_policy(device):
@@ -249,6 +209,21 @@ class _Nvfp4BenchmarkFactory:
 
 class Nvfp4QuantizationGenerator(DiscreteSweepGenerator):
     """Race both real NVFP4 register-liveness schedules."""
+
+    @staticmethod
+    def validate_region_decision(inputs, device, decision):
+        from b12x.quantization.nvfp4._policy import TUNING_PROBLEM
+
+        TUNING_PROBLEM.lower(TUNING_PROBLEM.query_from_inputs(inputs), device, decision)
+
+    @staticmethod
+    def cases_for_tuning_queries(queries):
+        from b12x.quantization.nvfp4._policy import TUNING_PROBLEM
+
+        for values in queries:
+            query = TUNING_PROBLEM.query_from_inputs(values)
+            TUNING_PROBLEM.lower(query, None, {"backend": "cutedsl", "liveness_strategy": "packed"})
+            yield SweepCase.create(group_id=f"m{query.rows}-k{query.columns}", query=values)
 
     def __init__(self, *, cases: Sequence[SweepCase] | None = None) -> None:
         super().__init__(
@@ -274,6 +249,15 @@ def _attention_candidates(head_dim: int) -> tuple[SweepCandidate, ...]:
         SweepCandidate.create({"tile_m": tile_m, "tile_n": tile_n})
         for tile_m, tile_n in tiles
     )
+
+
+def _attention_lengths(query, rows_field, maximum_field):
+    batch, rows, maximum = (int(query[name]) for name in ("batch_size", rows_field, maximum_field))
+    if batch <= 0 or maximum <= 0 or not batch <= rows <= batch * maximum:
+        raise ValueError("contiguous attention races require nonempty sequences within their declared capacities")
+    if query["variant"] == "batched" and rows != batch * maximum:
+        raise ValueError("batched attention row counts must equal batch times sequence length")
+    return tuple(rows // batch + (index < rows % batch) for index in range(batch))
 
 
 def _attention_reference(case: SweepCase, q, k, v, cu_q, cu_k):
@@ -345,6 +329,9 @@ class _VarlenAttentionSession(
         v_head_dim = int(case.query["v_head_dim"])
         max_q = int(case.query["max_seqlen_q"])
         max_k = int(case.query["max_seqlen_k"])
+        q_lengths = _attention_lengths(case.query, "query_rows", "max_seqlen_q")
+        k_lengths = _attention_lengths(case.query, "kv_rows", "max_seqlen_k")
+        dtype = getattr(torch, str(case.query["dtype"]))
         causal = bool(case.query["causal"])
         generator = torch.Generator(device=device).manual_seed(
             settings.seed + int(case.case_id[-8:], 16)
@@ -357,36 +344,28 @@ class _VarlenAttentionSession(
                 cu_q = None
                 cu_k = None
             elif variant == "varlen":
-                q_shape = (batch_size * max_q, q_heads, q_head_dim)
-                k_shape = (batch_size * max_k, kv_heads, q_head_dim)
-                v_shape = (batch_size * max_k, kv_heads, v_head_dim)
-                cu_q = torch.arange(
-                    batch_size + 1,
-                    dtype=torch.int32,
-                    device=device,
-                ).mul_(max_q)
-                cu_k = torch.arange(
-                    batch_size + 1,
-                    dtype=torch.int32,
-                    device=device,
-                ).mul_(max_k)
+                q_shape = (sum(q_lengths), q_heads, q_head_dim)
+                k_shape = (sum(k_lengths), kv_heads, q_head_dim)
+                v_shape = (sum(k_lengths), kv_heads, v_head_dim)
+                cu_q = torch.tensor((0, *q_lengths), dtype=torch.int32, device=device).cumsum(0, dtype=torch.int32)
+                cu_k = torch.tensor((0, *k_lengths), dtype=torch.int32, device=device).cumsum(0, dtype=torch.int32)
             else:
                 raise ValueError(f"unsupported attention variant {variant!r}")
             q = torch.randn(
                 q_shape,
-                dtype=torch.bfloat16,
+                dtype=dtype,
                 device=device,
                 generator=generator,
             ).mul_(0.25)
             k = torch.randn(
                 k_shape,
-                dtype=torch.bfloat16,
+                dtype=dtype,
                 device=device,
                 generator=generator,
             ).mul_(0.25)
             v = torch.randn(
                 v_shape,
-                dtype=torch.bfloat16,
+                dtype=dtype,
                 device=device,
                 generator=generator,
             ).mul_(0.25)
@@ -461,9 +440,7 @@ class _VarlenAttentionSession(
                     for _ in range(settings.warmup):
                         run()
                     torch.cuda.synchronize(device)
-                    graph = torch.cuda.CUDAGraph()
-                    with torch.cuda.graph(graph):
-                        run()
+                    graph, _ = capture_warmed_graph(run, device=device)
                     binding.output.fill_(float("nan"))
                     graph.replay()
                     torch.cuda.synchronize(device)
@@ -475,46 +452,11 @@ class _VarlenAttentionSession(
                             expected.float().reshape(1, -1),
                         ).item()
                     )
-                    start = torch.cuda.Event(enable_timing=True)
-                    end = torch.cuda.Event(enable_timing=True)
-                    start.record()
-                    graph.replay()
-                    end.record()
-                    end.synchronize()
-                    repetitions = _bounded_repetitions(
-                        settings,
-                        pilot_us=float(start.elapsed_time(end)) * 1_000.0,
-                    )
-                    allocated_before = torch.cuda.memory_allocated(device)
-                    samples = _cuda_event_samples_us(
-                        graph.replay,
-                        count=settings.groups * repetitions,
-                        device=device,
-                        flush=flush,
-                    )
-                    allocated_after = torch.cuda.memory_allocated(device)
-                    measurements.append(
-                        SweepMeasurement(
-                            candidate=candidate,
-                            latency_us=_median_of_group_medians(
-                                samples,
-                                groups=settings.groups,
-                                repetitions=repetitions,
-                            ),
-                            correct=(
-                                finite
-                                and cosine >= 0.999
-                                and allocated_after <= allocated_before
-                            ),
-                            metrics={
-                                "cosine": cosine,
-                                "finite": finite,
-                                "replay_allocation_bytes": (
-                                    allocated_after - allocated_before
-                                ),
-                            },
-                        )
-                    )
+                    measurements.append(PreparedCandidate(
+                        candidate=candidate, graph=graph, owners=(plan, scratch, binding),
+                        correct=finite and cosine >= 0.999,
+                        metrics={"frozen_resolution_capture": True, "cosine": cosine, "finite": finite},
+                    ))
                 except Exception as exc:  # noqa: BLE001 - failed tiles survive
                     measurements.append(
                         SweepMeasurement(
@@ -524,7 +466,7 @@ class _VarlenAttentionSession(
                             error=f"{type(exc).__name__}: {exc}",
                         )
                     )
-            return tuple(measurements)
+            return measure_prepared_candidates(measurements, settings=settings, device=device, flush=flush)
 
 
 class _VarlenAttentionBenchmarkFactory:
@@ -538,11 +480,33 @@ class _VarlenAttentionBenchmarkFactory:
 class VarlenAttentionGenerator(DiscreteSweepGenerator):
     """Race production contiguous-attention tiles on reviewed shapes."""
 
+    @staticmethod
+    def validate_region_decision(inputs, device, decision):
+        from b12x.attention.varlen._policy import TUNING_PROBLEM
+
+        query = TUNING_PROBLEM.query_from_inputs(inputs)
+        if query.q_head_dim != query.v_head_dim or query.q_head_dim not in (64, 128, 256):
+            raise ValueError("contiguous attention search requires matched 64/128/256 head dimensions")
+        _attention_lengths(inputs, "query_rows", "max_seqlen_q")
+        _attention_lengths(inputs, "kv_rows", "max_seqlen_k")
+        TUNING_PROBLEM.lower(query, device, decision)
+        if dict(decision) not in tuple(dict(candidate.config) for candidate in _attention_candidates(query.q_head_dim)):
+            raise ValueError("attention tile is outside the production candidate domain for this head dimension")
+
+    @staticmethod
+    def cases_for_tuning_queries(queries):
+        from b12x.policy.problem import stable_identity
+
+        for query in queries:
+            VarlenAttentionGenerator.validate_region_decision(query, None, _attention_candidates(query["q_head_dim"])[0].config)
+            yield SweepCase.create(group_id=f"shape-{stable_identity(query)[:24]}", query=query)
+
     def __init__(self, *, cases: Sequence[SweepCase] | None = None) -> None:
         super().__init__(
             component_id=VARLEN_ATTENTION,
             query_schema_version=1,
             config_schema_version=1,
+            candidate_contract_version=2,
             query_fields=(
                 "variant",
                 "dtype",
@@ -618,7 +582,7 @@ def _dsa_indexer_merge_cases() -> tuple[SweepCase, ...]:
                             "num_q_heads": heads,
                             "num_idx_heads": 1,
                             "max_q_rows": rows,
-                            "max_k_rows": 0,
+                            "max_k_rows": _DSA_INDEXER_MERGE_PAGE_TABLE_WIDTH * 64,
                             "top_k": topk,
                             "page_size": 64,
                             "score_mode": "dsa",
@@ -709,21 +673,21 @@ class _DsaIndexerMergeSession(AbstractContextManager["_DsaIndexerMergeSession"])
     ) -> tuple[SweepMeasurement, ...]:
         import torch
 
+        from b12x.attention import dsa_indexer
         from b12x.attention.dsa_indexer._policy import DsaIndexerConfig
-        from b12x.attention.dsa_indexer.fused_indexer import (
-            _resolve_default_ctas_per_group,
-            fused_indexer_scratch_capacity,
-            resolve_fused_merge_threshold,
-            run_fused_paged_indexer,
-        )
+        from b12x.policy import PolicyContext, PolicyMode
 
         settings = self._context.settings
         device = torch.device("cuda", self._context.device_ordinal)
         heads = int(case.query["num_q_heads"])
-        rows = int(case.query["max_q_rows"])
+        capacity_rows = int(case.query["max_q_rows"])
+        rows = int(case.metadata.get("live_rows", capacity_rows))
         topk = int(case.query["top_k"])
         seq_len = int(case.metadata["seq_len"])
         width = int(case.metadata["page_table_width"])
+        DsaIndexerMergeGenerator.validate_region_decision(case.query, self._context.device, candidates[0].config)
+        if width * 64 != case.query["max_k_rows"] or not 0 < rows <= capacity_rows:
+            raise ValueError("DSA merge fixture must preserve planned K and row capacities")
         pages_per_row = (seq_len + 63) // 64
         if pages_per_row > width:
             raise ValueError("sweep case seq_len exceeds its page table width")
@@ -749,11 +713,19 @@ class _DsaIndexerMergeSession(AbstractContextManager["_DsaIndexerMergeSession"])
                 )
                 + 0.1
             )
+            page_bytes = 64 * (128 + 4)
+            minimum_offset = int(case.metadata.get("minimum_pool_offset_bytes", 0))
+            page_base = minimum_offset // page_bytes + 1 if minimum_offset else 0
+            index_k_cache = torch.empty((page_base + capacity_rows * width, page_bytes), dtype=torch.uint8, device=device)
+            live_cache = index_k_cache[page_base:page_base + num_pages]
+            live_cache[:, :64 * 128].copy_(k_fp8.view(torch.uint8).reshape(num_pages, -1))
+            live_cache[:, 64 * 128:].copy_(k_scales.view(torch.uint8).reshape(num_pages, -1))
             page_table = torch.full((rows, width), -1, dtype=torch.int32, device=device)
             page_table[:, :pages_per_row] = torch.arange(
-                num_pages, dtype=torch.int32, device=device
+                page_base, page_base + num_pages, dtype=torch.int32, device=device
             ).view(rows, pages_per_row)
             seqlens = torch.full((rows,), seq_len, dtype=torch.int32, device=device)
+            active_width = torch.tensor([seq_len], dtype=torch.int32, device=device)
             # Exact reference: relu(q . k) weighted per head, scaled per token.
             expected_sets = []
             expected_values = []
@@ -770,56 +742,38 @@ class _DsaIndexerMergeSession(AbstractContextManager["_DsaIndexerMergeSession"])
                 expected_sets.append(set(top.indices.tolist()))
                 expected_values.append(top.values)
             expected_sorted = torch.stack(expected_values)
-            num_sms = torch.cuda.get_device_properties(device).multi_processor_count
-            ctas_per_group = _resolve_default_ctas_per_group(
-                num_rows=rows, max_pages=width, device=device
-            )
-            pack_capacity, state_words = fused_indexer_scratch_capacity(
-                rows, topk, num_sms
-            )
-            pack_values = torch.empty(pack_capacity, dtype=torch.float32, device=device)
-            pack_indices = torch.empty(pack_capacity, dtype=torch.int32, device=device)
-            merge_state = torch.zeros(state_words, dtype=torch.int32, device=device)
             out_indices = torch.empty((rows, topk), dtype=torch.int32, device=device)
             out_values = torch.empty((rows, topk), dtype=torch.float32, device=device)
             flush = _l2_flush_fn(device, enabled=settings.cold_l2)
+            policy = PolicyContext.for_device(device, mode=PolicyMode.HEURISTIC_ONLY)
             measurements = []
             for candidate in candidates:
                 try:
                     config = DsaIndexerConfig.from_profile(candidate.config)
-                    merge_threshold = resolve_fused_merge_threshold(
-                        config.fused_merge,
-                        ctas_per_group=ctas_per_group,
-                        num_heads=heads,
-                        topk=topk,
+                    plan = dsa_indexer.plan(
+                        dsa_indexer.Caps(device=device, num_q_heads=heads, max_q_rows=capacity_rows,
+                                         max_page_table_width=width, topk=topk),
+                        policy=policy.with_override(DSA_INDEXER, config),
                     )
+                    spec, = plan.scratch_specs()
+                    scratch = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
+                    binding = dsa_indexer.bind(
+                        plan, scratch=scratch, q_fp8=q_fp8, query_weights=weights,
+                        index_k_cache=index_k_cache, page_table=page_table, cache_lengths=seqlens,
+                        active_width=active_width, output_indices=out_indices, output_scores=out_values,
+                    )
+                    if binding.runtime.route != "paged_fused":
+                        raise ValueError("DSA merge decision requires the public plan's fused route")
+                    ctas_per_group = binding.runtime.scratch.fused_ctas_per_group
+                    merge_threshold = binding.runtime.scratch.fused_merge_threshold
 
                     def run() -> None:
-                        run_fused_paged_indexer(
-                            q_bytes=q_fp8.view(torch.uint8),
-                            weights=weights,
-                            k_quant_bytes=k_fp8.view(torch.uint8),
-                            k_scales=k_scales,
-                            real_page_table=page_table,
-                            seqlens=seqlens,
-                            num_heads=heads,
-                            topk=topk,
-                            out_indices=out_indices,
-                            out_values=out_values,
-                            ctas_per_group=ctas_per_group,
-                            merge_threshold=merge_threshold,
-                            pack_values=pack_values,
-                            pack_indices=pack_indices,
-                            merge_state=merge_state,
-                            merge_state_preinitialized=True,
-                        )
+                        dsa_indexer.run(binding)
 
                     for _ in range(settings.warmup):
                         run()
                     torch.cuda.synchronize(device)
-                    graph = torch.cuda.CUDAGraph()
-                    with torch.cuda.graph(graph):
-                        run()
+                    graph, _ = capture_warmed_graph(run, device=device)
                     out_indices.fill_(-1)
                     out_values.fill_(float("nan"))
                     graph.replay()
@@ -831,53 +785,11 @@ class _DsaIndexerMergeSession(AbstractContextManager["_DsaIndexerMergeSession"])
                     ) and bool(
                         torch.allclose(actual_sorted, expected_sorted, atol=1e-2, rtol=0)
                     )
-                    # The first replays after capture carry graph upload cost, so
-                    # the pilot is the fastest of a few bracketed replays.
-                    pilot_us = min(
-                        _cuda_event_samples_us(
-                            graph.replay,
-                            count=_MERGE_PILOT_REPLAYS,
-                            device=device,
-                            flush=flush,
-                        )
-                    )
-                    replays_per_sample = _merge_replays_per_sample(pilot_us)
-                    repetitions = _bounded_repetitions(
-                        settings,
-                        pilot_us=pilot_us * replays_per_sample,
-                    )
-                    allocated_before = torch.cuda.memory_allocated(device)
-                    inner_samples = _cuda_event_samples_us(
-                        graph.replay,
-                        count=settings.groups * repetitions * replays_per_sample,
-                        device=device,
-                        flush=flush,
-                    )
-                    allocation_delta = torch.cuda.memory_allocated(device) - allocated_before
-                    latency = _median_of_group_medians(
-                        _mean_of_consecutive(inner_samples, width=replays_per_sample),
-                        groups=settings.groups,
-                        repetitions=repetitions,
-                    )
-                    measurements.append(
-                        SweepMeasurement(
-                            candidate=candidate,
-                            latency_us=latency,
-                            correct=correct and allocation_delta == 0,
-                            metrics={
-                                "merge_threshold": int(merge_threshold),
-                                "ctas_per_group": int(ctas_per_group),
-                                "seq_len": seq_len,
-                                "repetitions": int(repetitions),
-                                "replays_per_sample": int(replays_per_sample),
-                                "inner_samples_us": [
-                                    round(value, 3) for value in inner_samples
-                                ],
-                                "replay_allocation_bytes": int(allocation_delta),
-                            },
-                        )
-                    )
-                    del graph
+                    measurements.append(PreparedCandidate(candidate=candidate, graph=graph,
+                        owners=(plan, binding, scratch), correct=correct,
+                        sample_width=_merge_replays_per_sample, pilot_replays=_MERGE_PILOT_REPLAYS,
+                        metrics={"merge_threshold": int(merge_threshold), "ctas_per_group": int(ctas_per_group),
+                                 "seq_len": seq_len, "frozen_resolution_capture": True}))
                 except Exception as exc:  # noqa: BLE001 - recorded as a measurement failure
                     measurements.append(
                         SweepMeasurement(
@@ -887,7 +799,7 @@ class _DsaIndexerMergeSession(AbstractContextManager["_DsaIndexerMergeSession"])
                             error=f"{type(exc).__name__}: {exc}",
                         )
                     )
-        return tuple(measurements)
+        return measure_prepared_candidates(measurements, settings=settings, device=device, flush=flush)
 
 
 class _DsaIndexerMergeBenchmarkFactory:
@@ -899,11 +811,42 @@ class _DsaIndexerMergeBenchmarkFactory:
 class DsaIndexerMergeGenerator(DiscreteSweepGenerator):
     """Race the fused paged indexer's cross-CTA merge arms per decode shape."""
 
+    @staticmethod
+    def validate_region_decision(inputs, device, decision):
+        from b12x.attention.dsa_indexer._policy import TUNING_PROBLEM
+        from b12x.attention.dsa_indexer.fused_indexer import resolve_fused_indexer_path
+
+        query = TUNING_PROBLEM.query_from_inputs(inputs)
+        TUNING_PROBLEM.lower(query, device, decision)
+        capability = (12, 0) if device is None else device.compute_capability
+        if (query.source_layout != "paged" or query.mode != "decode" or query.dtype != "bfloat16"
+                or query.kv_dtype != "uint8" or query.num_idx_heads != 1 or query.page_size != 64
+                or query.score_mode != "dsa" or query.shared_page_table
+                or query.num_q_heads not in (32, 64) or query.top_k > query.max_k_rows
+                or not resolve_fused_indexer_path(topk=query.top_k, num_rows=query.max_q_rows,
+                    width=query.max_k_rows, num_heads=query.num_q_heads, compute_capability=capability)):
+            raise ValueError("DSA merge fixtures require a production fused decode query with top-k within planned K capacity")
+
+    @staticmethod
+    def cases_for_tuning_queries(queries):
+        from b12x.policy.problem import stable_identity
+
+        for query in queries:
+            DsaIndexerMergeGenerator.validate_region_decision(query, None, {"backend": "native", "fused_merge": "auto"})
+            for scenario, rows, length in (
+                ("full", query["max_q_rows"], query["max_k_rows"]),
+                ("partial", max(1, query["max_q_rows"] // 2), max(query["top_k"], query["max_k_rows"] // 2)),
+            ):
+                yield SweepCase.create(group_id=f"shape-{stable_identity(query)[:24]}", query=query,
+                    scenario=scenario, metadata={"seq_len": length, "live_rows": rows,
+                                                "page_table_width": query["max_k_rows"] // query["page_size"]})
+
     def __init__(self, *, cases: Sequence[SweepCase] | None = None) -> None:
         super().__init__(
             component_id=DSA_INDEXER,
-            query_schema_version=1,
+            query_schema_version=2,
             config_schema_version=1,
+            candidate_contract_version=2,
             query_fields=_DSA_INDEXER_QUERY_FIELDS,
             range_fields=frozenset({"max_q_rows"}),
             cases=_dsa_indexer_merge_cases() if cases is None else cases,
@@ -969,6 +912,9 @@ class DsaIndexerProfileGenerator:
     def reviewed_queries(self):
         return self._qualification.reviewed_queries()
 
+    def measurement_children(self):
+        return (("production-qualification", self._qualification), ("merge-race", self._race))
+
     def estimate(self, context: GenerationContext) -> WorkEstimate:
         qualification = self._qualification.estimate(context)
         race = self._race.estimate(context)
@@ -1019,7 +965,8 @@ class DsaIndexerProfileGenerator:
                 "config_schema_version": self.config_schema_version,
                 "coverage": coverage,
                 "planner": decision_node_to_dict(
-                    _with_default_leaf(self._race.build_planner(records), default_leaf)
+                    _with_default_leaf(self._race.build_planner(records), default_leaf),
+                    compact=True,
                 ),
             },
             evidence={

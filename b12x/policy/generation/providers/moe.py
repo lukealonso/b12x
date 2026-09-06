@@ -32,6 +32,8 @@ from b12x.policy.generation.reducer import (
     decision_node_to_dict,
 )
 from b12x.policy.generation.store import CheckpointStore
+from b12x.policy.generation.selection import reduce_scenarios
+from b12x.policy.generation.observations import ObservationStore, measure_observation
 from b12x.policy.types import ExactDecisionNode, FrozenMapping
 
 _QUERY_FIELDS = (
@@ -52,7 +54,7 @@ _TRITON_ROUTE_MAX_ROWS = 256
 _PREFILL_CAPACITY_TOKENS = frozenset(COMMON_PREFILL_TOKEN_CAPACITIES)
 _QUALIFICATION_TOKENS = frozenset({1, 2, 3, 4, 5, 6, 7, 8, 32, 128})
 _QUALIFICATION_PATTERNS = frozenset({"balanced", "hot"})
-_MOE_CANDIDATE_CONTRACT_VERSION = 9
+_MOE_CANDIDATE_CONTRACT_VERSION = 10
 _MOE_CHECKPOINT_SCHEMA_VERSION = 2
 
 
@@ -363,8 +365,11 @@ def _has_tunable_backend(geometry: MoePhysicalGeometry) -> bool:
 
 def _measurement_cases(
     cases: Sequence[MoeSweepCase],
+    *, full_corpus: bool = False,
 ) -> tuple[MoeSweepCase, ...]:
     cases = tuple(cases)
+    if full_corpus:
+        return cases
     if not cases:
         return ()
     if _has_tunable_backend(cases[0].geometry):
@@ -512,6 +517,46 @@ class MoeDecodeGenerator:
     query_schema_version = 4
     config_schema_version = 3
 
+    @classmethod
+    def validate_region_decision(cls, inputs, device, decision):
+        from .moe_gpu_worker import _candidates_for_geometry, _eligible_candidates_for_case
+
+        if device is None:
+            raise ValueError("MoE candidate legality requires an explicit device identity")
+        case = next(iter(cls.cases_for_tuning_queries((inputs,))))
+        candidates = _candidates_for_geometry(case.geometry, sm_count=device.sm_count)
+        eligible = _eligible_candidates_for_case(case.geometry, case, candidates)
+        if FrozenMapping(decision) not in {candidate.config for candidate in eligible}:
+            raise ValueError("MoE region selects a candidate outside the production eligibility contract")
+
+    @staticmethod
+    def cases_for_tuning_queries(queries):
+        from b12x.moe.fused_moe._policy import TUNING_PROBLEM
+        from b12x.policy.generation.moe_corpus import (
+            COMMON_ROUTE_PATTERNS, MOE_RECIPES, MoePhysicalGeometry, MoeSweepCase,
+        )
+        from b12x.policy.problem import stable_identity
+
+        geometries = {}
+        for values in queries:
+            query = TUNING_PROBLEM.query_from_inputs(values)
+            recipes = [recipe for recipe in MOE_RECIPES
+                       if (recipe.quant_mode, recipe.source_format) == (query.quant_mode, query.source_format)]
+            if len(recipes) != 1:
+                raise ValueError("MoE tuning inputs must identify one unambiguous weight recipe")
+            recipe = recipes[0]
+            if (query.activation not in recipe.compatible_activations or query.hidden_size <= 0
+                    or query.hidden_size % 128 or query.intermediate_size != recipe.physical_intermediate_size(query.intermediate_size)
+                    or query.num_tokens <= 0 or not 0 < query.top_k <= query.num_experts):
+                raise ValueError("MoE tuning query violates its production geometry or recipe contract")
+            geometry = MoePhysicalGeometry(recipe=recipe, activation=query.activation, num_experts=query.num_experts,
+                                           hidden_size=query.hidden_size, intermediate_size=query.intermediate_size, aliases=())
+            geometry = geometries.setdefault(geometry.key, geometry)
+            for pattern in COMMON_ROUTE_PATTERNS:
+                identity = stable_identity({"query": dict(values), "route_pattern": pattern})
+                yield MoeSweepCase(case_id=f"shape-{identity[:24]}", geometry=geometry,
+                                   top_k=query.top_k, num_tokens=query.num_tokens, route_pattern=pattern)
+
     def __init__(
         self,
         *,
@@ -527,12 +572,14 @@ class MoeDecodeGenerator:
             benchmark_factory = MoeGpuBenchmarkFactory()
         self._benchmark_factory = benchmark_factory
         self._precision_identity = None
+        self._fresh_cases = 0
+        self._measurement_seconds = 0.0
+        self._storage_seconds = 0.0
         known_keys = {geometry.key for geometry in self._geometries}
         if any(case.geometry.key not in known_keys for case in self._cases):
             raise ValueError("MoE sweep cases reference unknown geometries")
 
     def estimate(self, context: GenerationContext) -> WorkEstimate:
-        del context
         cases_by_geometry: dict[tuple[object, ...], list[MoeSweepCase]] = defaultdict(
             list
         )
@@ -547,7 +594,7 @@ class MoeDecodeGenerator:
         measured = tuple(
             case
             for geometry in self._geometries
-            for case in _measurement_cases(cases_by_geometry[geometry.key])
+            for case in _measurement_cases(cases_by_geometry[geometry.key], full_corpus=context.settings.full_corpus)
         )
         query_count = len({_query_key(case) for case in self._cases})
         work_units = len(self._geometries) + len(coarse) + len(measured) + query_count
@@ -565,6 +612,7 @@ class MoeDecodeGenerator:
                 "runtime_route_cases": len(self._cases),
                 "runtime_queries": query_count,
                 "coarse_cases": len(coarse),
+                "full_corpus": context.settings.full_corpus,
             },
         )
 
@@ -572,7 +620,6 @@ class MoeDecodeGenerator:
         self,
         context: GenerationContext,
     ) -> tuple[MeasurementPartition, ...]:
-        del context
         cases_by_geometry: dict[tuple[object, ...], list[MoeSweepCase]] = defaultdict(
             list
         )
@@ -581,7 +628,7 @@ class MoeDecodeGenerator:
         partitions = []
         for geometry in self._geometries:
             cases = tuple(cases_by_geometry[geometry.key])
-            measured = _measurement_cases(cases)
+            measured = _measurement_cases(cases, full_corpus=context.settings.full_corpus)
             coarse = _coarse_cases(cases) if _has_tunable_backend(geometry) else ()
             query_count = len({_query_key(case) for case in cases})
             partitions.append(
@@ -645,6 +692,47 @@ class MoeDecodeGenerator:
             precision_identity = self._precision_identity
         cached = checkpoints.load(self.component_id, key)
         expected_ids = [candidate.candidate_id for candidate in candidates]
+        correctness = context.settings.full_corpus or stage in {"screen", "search", "qualification"}
+        if context.provenance:
+            reference = None
+            if (cached is not None and cached.get("schema_version") == 3
+                    and context.checkpoint_metadata_matches(cached.get("generation"))
+                    and cached.get("candidate_contract_version") == _MOE_CANDIDATE_CONTRACT_VERSION
+                    and cached.get("candidate_ids") == expected_ids
+                    and cached.get("independent_oracle") == correctness):
+                reference = cached.get("observation_key")
+                if not isinstance(reference, str):
+                    raise ValueError("MoE checkpoint requires an observation reference")
+
+            def measure():
+                measurements = session.measure(case, candidates, correctness=correctness)
+                if [item.candidate.candidate_id for item in measurements] != expected_ids:
+                    raise ValueError("MoE measurement session must preserve the requested candidate order")
+                return {"measurements": [item.to_dict() for item in measurements]}
+
+            observed = measure_observation(
+                context=context, component_id=self.component_id,
+                inputs=FrozenMapping({"query": case.query(), "route_pattern": case.route_pattern,
+                                      "precision_source_toolchain_sha256": precision_identity}),
+                candidates=tuple(candidate.config for candidate in candidates),
+                oracle_contract=f"{self.component_id}:{_MOE_CANDIDATE_CONTRACT_VERSION}:independent={correctness}",
+                store=ObservationStore(checkpoints.observations_path),
+                measure=measure, reference=reference,
+            )
+            measurements = tuple(MoeMeasurement.from_dict(item) for item in observed.result["measurements"])
+            if tuple(item.candidate.config for item in measurements) != tuple(candidate.config for candidate in candidates):
+                raise ValueError("MoE observations differ from their production candidate cohort")
+            self._fresh_cases += observed.fresh
+            self._measurement_seconds += observed.measurement_seconds
+            self._storage_seconds += observed.storage_seconds
+            checkpoints.save(self.component_id, key, {
+                "schema_version": 3,
+                "candidate_contract_version": _MOE_CANDIDATE_CONTRACT_VERSION,
+                "generation": observed.identity.generation.to_dict(),
+                "case_id": case.case_id, "candidate_ids": expected_ids,
+                "independent_oracle": correctness, "observation_key": observed.identity.key,
+            })
+            return measurements
         if (
             cached is not None
             and cached.get("schema_version") == _MOE_CHECKPOINT_SCHEMA_VERSION
@@ -687,8 +775,9 @@ class MoeDecodeGenerator:
         measurements = session.measure(
             case,
             candidates,
-            correctness=stage == "screen",
+            correctness=correctness,
         )
+        self._fresh_cases += 1
         measured_ids = [item.candidate.candidate_id for item in measurements]
         if measured_ids != expected_ids:
             raise ValueError(
@@ -823,6 +912,14 @@ class MoeDecodeGenerator:
             minimum_cosine=context.settings.minimum_cosine,
         )
 
+    def reduce_measurements(self, grouped, context):
+        scenarios = tuple(measurements for _, measurements in grouped)
+        if grouped[0][0].geometry.recipe.quant_mode == "nvfp4_auto":
+            from .moe_precision import reduce_precision
+
+            return reduce_precision(scenarios, context.settings.minimum_cosine)
+        return reduce_scenarios(scenarios, qualified=lambda item: item.passes(context.settings.minimum_cosine))
+
     def generate(
         self,
         context: GenerationContext,
@@ -842,7 +939,7 @@ class MoeDecodeGenerator:
         coarse_measurement_cases = 0
         for geometry_index, geometry in enumerate(self._geometries, start=1):
             geometry_cases = tuple(cases_by_geometry[geometry.key])
-            measurement_cases = _measurement_cases(geometry_cases)
+            measurement_cases = _measurement_cases(geometry_cases, full_corpus=context.settings.full_corpus)
             progress.start_stage(
                 self.component_id,
                 stage=(
@@ -927,12 +1024,23 @@ class MoeDecodeGenerator:
                         context=context,
                         checkpoints=checkpoints,
                     )
+                    if context.settings.full_corpus:
+                        failures = [item.to_dict() for item in measurements
+                                    if not item.passes(context.settings.minimum_cosine)]
+                        if failures:
+                            raise RuntimeError(f"full-corpus MoE qualification failed for {case.case_id}: {failures}")
                     full_results.append((case, measurements))
                     progress.advance(
                         self.component_id,
                         detail=f"full {case.case_id}",
                     )
 
+        measured_case_ids = [case.case_id for case, _ in full_results]
+        if context.settings.full_corpus and (
+            len(measured_case_ids) != len(self._cases)
+            or set(measured_case_ids) != {case.case_id for case in self._cases}
+        ):
+            raise RuntimeError("full-corpus MoE qualification did not measure every registered case exactly once")
         results_by_query: dict[
             tuple[object, ...],
             list[tuple[MoeSweepCase, tuple[MoeMeasurement, ...]]],
@@ -947,35 +1055,13 @@ class MoeDecodeGenerator:
             total=len(results_by_query),
         )
         for grouped in results_by_query.values():
-            by_candidate: dict[str, list[MoeMeasurement]] = defaultdict(list)
-            for _case, measurements in grouped:
-                for measurement in measurements:
-                    if measurement.passes(context.settings.minimum_cosine):
-                        by_candidate[measurement.candidate.candidate_id].append(
-                            measurement
-                        )
-            required_patterns = {case.route_pattern for case, _ in grouped}
-            robust: list[tuple[float, MoeCandidate]] = []
-            for measurements in by_candidate.values():
-                if len(measurements) != len(required_patterns):
-                    continue
-                score = math.exp(
-                    sum(math.log(float(item.latency_us)) for item in measurements)
-                    / len(measurements)
-                )
-                robust.append((score, measurements[0].candidate))
-            if not robust:
+            scores = self.reduce_measurements(grouped, context)
+            if not scores.eligible_candidates:
                 case = grouped[0][0]
                 raise RuntimeError(
                     f"no route-robust MoE candidate for {_query_dict(case)}"
                 )
-            _, winner = min(robust, key=lambda item: (
-                item[0], item[1].config["backend"] != "w4a16", item[1].candidate_id,
-            ))
-            if grouped[0][0].geometry.recipe.quant_mode == "nvfp4_auto":
-                from .moe_precision import select_winner
-
-                winner = select_winner(grouped, context.settings.minimum_cosine)
+            winner = scores.select(lambda candidate: candidate.config["backend"] != "w4a16")
             representative = grouped[0][0]
             records.append(
                 DecisionRecord.create(
@@ -1042,7 +1128,7 @@ class MoeDecodeGenerator:
                 "qualified_fixed_query_points": qualified_fixed_query_points,
                 "runtime_query_points": len(records),
             },
-            "planner": decision_node_to_dict(planner),
+            "planner": decision_node_to_dict(planner, compact=True),
         }
         estimate = self.estimate(context)
         return ComponentGenerationResult(
@@ -1052,6 +1138,11 @@ class MoeDecodeGenerator:
                 "measurement_process_scope": "one_cuda_process_per_physical_geometry",
                 "winner_query_counts": dict(sorted(winner_counts.items())),
                 "route_measurements": len(full_results),
+                "full_corpus": context.settings.full_corpus,
+                "registered_route_cases": len(self._cases),
+                "registered_case_ids_sha256": hashlib.sha256(json.dumps(
+                    [case.case_id for case in self._cases], separators=(",", ":")
+                ).encode()).hexdigest(),
                 "single_candidate_route_cases": single_candidate_route_cases,
                 "gpu_measurement_cases": (
                     len(self._geometries) + coarse_measurement_cases + len(full_results)

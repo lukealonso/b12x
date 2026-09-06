@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+from b12x.policy.generation.replay import PreparedCandidate, capture_warmed_graph, measure_prepared_candidates
+
 import gc
 import statistics
 from collections.abc import Sequence
 from contextlib import AbstractContextManager
+from dataclasses import replace
+
 
 from b12x.policy.components import BF16_VOCAB_PROJECTION, BLOCK_FP8_LINEAR
 from b12x.policy.generation.contracts import GenerationContext
@@ -21,9 +25,7 @@ from b12x.policy.generation.sweep import (
 )
 
 from .gpu_workers import (
-    _cuda_event_samples_us,
     _l2_flush_fn,
-    _median_of_group_medians,
 )
 
 
@@ -94,6 +96,9 @@ class _Bf16VocabProjectionSession(
         return None
 
     def candidates(self, case: SweepCase) -> tuple[SweepCandidate, ...]:
+        from b12x.gemm.bf16_vocab_projection._policy import TUNING_PROBLEM
+
+        query = TUNING_PROBLEM.query_from_inputs(case.query)
         in_features = int(case.query["in_features"])
         direct_block = 1 << (in_features - 1).bit_length()
         configs = [
@@ -123,7 +128,14 @@ class _Bf16VocabProjectionSession(
             for block_k in (256, 512, 1_024)
             for num_warps in (4, 8)
         )
-        return tuple(SweepCandidate.create(config) for config in configs)
+        candidates = []
+        for config in configs:
+            try:
+                TUNING_PROBLEM.lower(query, self._context.device, config)
+            except ValueError:
+                continue
+            candidates.append(SweepCandidate.create(config))
+        return tuple(candidates)
 
     def measure(
         self,
@@ -194,9 +206,7 @@ class _Bf16VocabProjectionSession(
                     for _ in range(settings.warmup):
                         run()
                     torch.cuda.synchronize(device)
-                    graph = torch.cuda.CUDAGraph()
-                    with torch.cuda.graph(graph):
-                        actual = run()
+                    graph, actual = capture_warmed_graph(run, device=device)
                     actual.fill_(float("nan"))
                     graph.replay()
                     torch.cuda.synchronize(device)
@@ -207,43 +217,11 @@ class _Bf16VocabProjectionSession(
                         ).item()
                     )
                     finite = bool(torch.isfinite(actual).all().item())
-                    allocated_before = torch.cuda.memory_allocated(device)
-                    samples = _cuda_event_samples_us(
-                        graph.replay,
-                        count=settings.groups * settings.repetitions,
-                        device=device,
-                        flush=flush,
-                    )
-                    allocated_after = torch.cuda.memory_allocated(device)
-                    latency_us = _median_of_group_medians(
-                        samples,
-                        groups=settings.groups,
-                        repetitions=settings.repetitions,
-                    )
-                    transferred_bytes = 2 * (
-                        out_features * in_features + in_features + out_features
-                    )
-                    measurements.append(
-                        SweepMeasurement(
-                            candidate=candidate,
-                            latency_us=latency_us,
-                            correct=(
-                                finite
-                                and cosine >= settings.minimum_cosine
-                                and allocated_after <= allocated_before
-                            ),
-                            metrics={
-                                "cosine": cosine,
-                                "finite": finite,
-                                "replay_allocation_bytes": (
-                                    allocated_after - allocated_before
-                                ),
-                                "effective_bandwidth_gbps": (
-                                    transferred_bytes / latency_us / 1_000.0
-                                ),
-                            },
-                        )
-                    )
+                    measurements.append(PreparedCandidate(
+                        candidate=candidate, graph=graph, owners=(planned, binding, actual),
+                        correct=finite and cosine >= settings.minimum_cosine,
+                        metrics={"frozen_resolution_capture": True, "cosine": cosine, "finite": finite},
+                    ))
                 except Exception as exc:  # noqa: BLE001 - failed configs survive
                     measurements.append(
                         SweepMeasurement(
@@ -253,7 +231,11 @@ class _Bf16VocabProjectionSession(
                             error=f"{type(exc).__name__}: {exc}",
                         )
                     )
-            return tuple(measurements)
+            timed = measure_prepared_candidates(measurements, settings=settings, device=device, flush=flush)
+            transferred_bytes = 2 * (out_features * in_features + in_features + out_features)
+            return tuple(replace(item, metrics={**item.metrics.to_dict(),
+                "effective_bandwidth_gbps": transferred_bytes / item.latency_us / 1_000.})
+                if item.latency_us is not None else item for item in timed)
 
 
 class _Bf16VocabProjectionFactory:
@@ -266,6 +248,24 @@ class _Bf16VocabProjectionFactory:
 
 class Bf16VocabProjectionGenerator(DiscreteSweepGenerator):
     """Race production BF16 vocabulary projection paths over common models."""
+
+    @staticmethod
+    def validate_region_decision(inputs, device, decision):
+        from b12x.gemm.bf16_vocab_projection._policy import TUNING_PROBLEM
+
+        query = TUNING_PROBLEM.query_from_inputs(inputs)
+        if query.max_tokens != 1:
+            raise ValueError("vocabulary projection races require a one-token GEMV query")
+        TUNING_PROBLEM.lower(query, device, decision)
+
+    @staticmethod
+    def cases_for_tuning_queries(queries):
+        from b12x.policy.problem import stable_identity
+
+        for query in queries:
+            Bf16VocabProjectionGenerator.validate_region_decision(
+                query, None, {"backend": "torch", "algorithm": "torch", "block_k": 0, "num_warps": 0})
+            yield SweepCase.create(group_id=f"shape-{stable_identity(query)[:24]}", query=query)
 
     def __init__(self, *, cases: Sequence[SweepCase] | None = None) -> None:
         super().__init__(
@@ -282,7 +282,7 @@ class Bf16VocabProjectionGenerator(DiscreteSweepGenerator):
             cases=(_bf16_vocab_projection_cases() if cases is None else cases),
             benchmark_factory=_Bf16VocabProjectionFactory(),
             coverage={},
-            candidate_contract_version=1,
+            candidate_contract_version=2,
             nearest_range_bounds={"out_features": (1, 248_320)},
         )
 
@@ -429,9 +429,7 @@ class _BlockFp8Session(AbstractContextManager["_BlockFp8Session"]):
                     for _ in range(settings.warmup):
                         run()
                     torch.cuda.synchronize(device)
-                    graph = torch.cuda.CUDAGraph()
-                    with torch.cuda.graph(graph):
-                        run()
+                    graph, _ = capture_warmed_graph(run, device=device)
                     binding.output.fill_(float("nan"))
                     graph.replay()
                     torch.cuda.synchronize(device)
@@ -443,36 +441,11 @@ class _BlockFp8Session(AbstractContextManager["_BlockFp8Session"]):
                         ).item()
                     )
                     finite = bool(torch.isfinite(actual).all().item())
-                    allocated_before = torch.cuda.memory_allocated(device)
-                    samples = _cuda_event_samples_us(
-                        graph.replay,
-                        count=settings.groups * settings.repetitions,
-                        device=device,
-                        flush=flush,
-                    )
-                    allocated_after = torch.cuda.memory_allocated(device)
-                    measurements.append(
-                        SweepMeasurement(
-                            candidate=candidate,
-                            latency_us=_median_of_group_medians(
-                                samples,
-                                groups=settings.groups,
-                                repetitions=settings.repetitions,
-                            ),
-                            correct=(
-                                finite
-                                and cosine >= settings.minimum_cosine
-                                and allocated_after <= allocated_before
-                            ),
-                            metrics={
-                                "cosine": cosine,
-                                "finite": finite,
-                                "replay_allocation_bytes": (
-                                    allocated_after - allocated_before
-                                ),
-                            },
-                        )
-                    )
+                    measurements.append(PreparedCandidate(
+                        candidate=candidate, graph=graph, owners=(plan, scratch, binding, output),
+                        correct=finite and cosine >= settings.minimum_cosine,
+                        metrics={"frozen_resolution_capture": True, "cosine": cosine, "finite": finite},
+                    ))
                 except Exception as exc:  # noqa: BLE001 - failed tiles survive
                     measurements.append(
                         SweepMeasurement(
@@ -482,7 +455,7 @@ class _BlockFp8Session(AbstractContextManager["_BlockFp8Session"]):
                             error=f"{type(exc).__name__}: {exc}",
                         )
                     )
-            return tuple(measurements)
+            return measure_prepared_candidates(measurements, settings=settings, device=device, flush=flush)
 
 
 class _BlockFp8Factory:
@@ -495,6 +468,24 @@ class _BlockFp8Factory:
 
 class BlockFp8LinearGenerator(DiscreteSweepGenerator):
     """Race the production block-FP8 linear MMA tiles."""
+
+    @staticmethod
+    def validate_region_decision(inputs, device, decision):
+        from b12x.gemm.block_fp8_linear._policy import TUNING_PROBLEM
+
+        query = TUNING_PROBLEM.query_from_inputs(inputs)
+        if (query.output_dtype != "bfloat16" or min(query.max_tokens, query.in_features, query.out_features) <= 0
+                or query.out_features % 128):
+            raise ValueError("block-FP8 search requires positive BF16 output shapes with complete 128-row weight blocks")
+        TUNING_PROBLEM.lower(query, device, decision)
+
+    @staticmethod
+    def cases_for_tuning_queries(queries):
+        from b12x.policy.problem import stable_identity
+
+        for query in queries:
+            BlockFp8LinearGenerator.validate_region_decision(query, None, _BlockFp8Session._CANDIDATES[0].config)
+            yield SweepCase.create(group_id=f"shape-{stable_identity(query)[:24]}", query=query)
 
     def __init__(self, *, cases: Sequence[SweepCase] | None = None) -> None:
         super().__init__(

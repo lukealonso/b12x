@@ -347,7 +347,8 @@ def test_sparse_gqa_implementation_modules_are_imported_lazily() -> None:
 
 
 def test_graph_contract_poison_precedes_replay_and_replay_validation() -> None:
-    source = inspect.getsource(benchmark_qsa._run_case)
+    source = inspect.getsource(benchmark_qsa._qualify_prepared_graph)
+    assert "_qualify_prepared_graph(" in inspect.getsource(benchmark_qsa._run_case)
 
     output_poison = source.index('output[: case.rows].fill_(float("nan"))')
     selector_poison = source.index(
@@ -366,9 +367,9 @@ def test_graph_contract_poison_precedes_replay_and_replay_validation() -> None:
         < validation
         < persistent_validation
     )
-    assert '"replay_after_output_selector_scratch_poison": True' in source
+    assert 'correctness["graph_replay_after_output_selector_scratch_poison"] = True' in source
     assert 'correctness["graph_persistent_state_exact"] = True' in source
     assert 'correctness["graph_main_kv_read_only"] = True' in source
     assert "main_k_cache=prepared.binding.main_k_cache" in source
     assert "main_v_cache=prepared.binding.main_v_cache" in source
-    assert "replay_allocation_delta_bytes" in source
+    assert "replay_allocation_delta" in source

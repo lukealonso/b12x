@@ -14,6 +14,7 @@ from .api import (
 )
 from .compressed_config import (
     compressed_sparse_mla_split_chunks_for_contract,
+    compressed_sparse_mla_uses_single_pass_decode,
 )
 from .compressed_reference import (
     COMPRESSED_SPARSE_MLA_BYTES_PER_TOKEN,
@@ -42,14 +43,11 @@ def _should_use_sm121_single_pass_decode(
         if not torch.cuda.is_available():
             return False
         compute_capability = tuple(torch.cuda.get_device_capability())
-    if compute_capability != (12, 1):
-        return False
-    if rows < 16 or heads != 32 or int(swa_page_size) != 64:
-        return False
-    if indexed_width and int(indexed_page_size or 0) != 64:
-        return False
-    chunks = (int(swa_width) + 63) // 64 + (int(indexed_width) + 63) // 64
-    return chunks <= 10
+    return compressed_sparse_mla_uses_single_pass_decode(
+        rows=rows, heads=heads, swa_width=int(swa_width), indexed_width=int(indexed_width),
+        swa_page_size=int(swa_page_size), indexed_page_size=int(indexed_page_size or 0),
+        compute_capability=compute_capability,
+    )
 
 
 def compressed_sparse_mla_decode_forward(
@@ -374,6 +372,7 @@ def _run_sm120_compressed_prefill(
         topk_length=swa_topk_lengths,
         attn_sink=attn_sink,
         output=output,
+        lse_out=workspace.final_lse[: int(q3.shape[0]), : int(q3.shape[1])],
         **extra_kwargs,
     )
     if not return_lse:

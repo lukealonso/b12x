@@ -1247,8 +1247,10 @@ def test_large_prefill_direct_path_does_not_touch_split_scratch() -> None:
     [torch.bfloat16, torch.float8_e4m3fn],
     ids=["bf16", "fp8_e4m3"],
 )
+@pytest.mark.parametrize("direct_kv_warps", (1, 2, 4))
 def test_sparse_gqa_uses_int64_for_high_physical_page_offsets(
     kv_dtype: torch.dtype,
+    direct_kv_warps: int,
 ) -> None:
     device = require_sm120()
     rows, q_heads, kv_heads, head_dim = 65, 24, 2, 256
@@ -1321,7 +1323,7 @@ def test_sparse_gqa_uses_int64_for_high_physical_page_offsets(
         softmax_scale=1.0 / math.sqrt(head_dim),
         block_n=16,
         splits=1,
-        direct_kv_warps=4,
+        direct_kv_warps=direct_kv_warps,
     )
     expected = (
         torch.stack(

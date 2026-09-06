@@ -18,6 +18,7 @@ from .contracts import (
     WorkEstimate,
 )
 from .store import CheckpointStore
+from .observations import ObservationStore, measure_observation
 
 QueryT = TypeVar("QueryT")
 ConfigT = TypeVar("ConfigT")
@@ -164,6 +165,38 @@ class MeasuredPolicyGenerator(Generic[QueryT, ConfigT]):
     ) -> tuple[GpuProbeMeasurement, ...]:
         checkpoint_id = "production-qualification"
         cached = checkpoints.load(self.component_id, checkpoint_id)
+        if context.provenance:
+            reference = None
+            if (cached is not None and cached.get("schema_version") == 3
+                    and context.checkpoint_metadata_matches(cached.get("generation"))
+                    and cached.get("case_ids") == list(self._case_ids)
+                    and cached.get("config") == encoded_config.to_dict()):
+                reference = cached.get("observation_key")
+                if not isinstance(reference, str):
+                    raise ValueError("GPU qualification checkpoint requires an observation reference")
+
+            def measure():
+                measurements = self._probe(context)
+                if tuple(item.label for item in measurements) != self._case_ids:
+                    raise ValueError(f"{self.component_id} GPU probe returned unexpected case IDs")
+                return {"measurements": [item.to_dict() for item in measurements]}
+
+            observed = measure_observation(
+                context=context, component_id=self.component_id,
+                inputs=FrozenMapping({"case_ids": list(self._case_ids)}),
+                candidates=(encoded_config,), oracle_contract=f"{self.component_id}:production-probe:1",
+                store=ObservationStore(checkpoints.observations_path),
+                measure=measure, reference=reference,
+            )
+            measurements = tuple(GpuProbeMeasurement.from_dict(item) for item in observed.result["measurements"])
+            if tuple(item.label for item in measurements) != self._case_ids:
+                raise ValueError("GPU observations differ from their declared probe cases")
+            checkpoints.save(self.component_id, checkpoint_id, {
+                "schema_version": 3, "generation": observed.identity.generation.to_dict(),
+                "case_count": self._probe.case_count, "case_ids": list(self._case_ids),
+                "config": encoded_config.to_dict(), "observation_key": observed.identity.key,
+            })
+            return measurements
         if (
             cached is not None
             and cached.get("schema_version") in (1, 2)
@@ -283,7 +316,7 @@ class MeasuredPolicyGenerator(Generic[QueryT, ConfigT]):
             total=len(self._queries),
         )
         for index, query in enumerate(self._queries):
-            decoded = self._policy.decode_profile(encoded_config)
+            decoded = self._policy.decode_profile(query, context.device, encoded_config)
             self._policy.validate_config(query, decoded, context.device)
             progress.advance(self.component_id, detail=f"query-{index + 1}")
 

@@ -24,7 +24,7 @@ from b12x.gemm import blockscaled
 from b12x.gemm.blockscaled import _a16
 from b12x._lib.dense_gemm import dense_gemm, dense_gemm_fused_quant_a
 from b12x._lib.intrinsics import quantize_grouped_nvfp4_torch
-from b12x._lib.runtime_control import freeze_kernel_resolution, unfreeze_kernel_resolution
+from b12x.policy.generation.replay import capture_warmed_graph
 from b12x.gemm._shared.wo_mxfp8 import quantize_mxfp8_rows_torch, dequantize_mxfp8_rows_torch
 from benchmarks.common import make_l2_flush_fn
 
@@ -87,42 +87,28 @@ def _capture(fn):
     for _ in range(3):
         fn()
     torch.cuda.synchronize()
-    graph = torch.cuda.CUDAGraph()
-    freeze_kernel_resolution("precision benchmark capture")
-    try:
-        with torch.cuda.graph(graph):
-            fn()
-    finally:
-        unfreeze_kernel_resolution()
+    graph, _ = capture_warmed_graph(fn, device=torch.cuda.current_device())
     return graph
 
 
-def _paired(graphs, warmup, iters, flush):
+def _paired(graphs, warmup, iters, flush, *, timing_clock="cuda_event"):
+    from b12x.policy.generation.timing import balanced_race_samples_us
+
     for _ in range(warmup):
         for graph in graphs.values():
             if flush is not None:
                 flush()
             graph.replay()
     torch.cuda.synchronize()
-    pairs = []
-    names = list(graphs)
-    events = []
-    for trial in range(iters):
-        order = names if trial % 2 == 0 else names[::-1]
-        batch = []
-        for name in order:
-            if flush is not None:
-                flush()
-            start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-            start.record()
-            graphs[name].replay()
-            end.record()
-            batch.append((name, start, end))
-        events.append(batch)
-    torch.cuda.synchronize()
-    for batch in events:
-        pairs.append({name: start.elapsed_time(end) * 1000 for name, start, end in batch})
-    return pairs
+    if timing_clock == "globaltimer":
+        from b12x.policy.generation.timestamps import globaltimer_race_samples_us
+        samples = globaltimer_race_samples_us(graphs, count=iters, device=torch.cuda.current_device(), flush=flush)
+    elif timing_clock == "cuda_event":
+        samples = balanced_race_samples_us({name: graph.replay for name, graph in graphs.items()},
+            count=iters, device=torch.cuda.current_device(), flush=flush)
+    else:
+        raise ValueError(f"unsupported timing clock {timing_clock!r}")
+    return [{name: values[index] for name, values in samples.items()} for index in range(iters)]
 
 
 def _ratio_interval(pairs, candidate, baseline):

@@ -49,6 +49,13 @@ runtime-policy and generator registrations. Package loading rejects an embedded
 profile that omits a registered component. The component schema is validated
 before a matching config is returned; invalid matching data fails closed.
 
+The embedded assets have two logical IDs: `nvidia.gb10.48sm` and
+`nvidia.rtx.pro.6000.blackwell`. The RTX asset owns exact normalized Workstation,
+Server, and Max-Q product aliases with matching capability and SM count.
+Qualification metadata names Max-Q as the measured representative; accepting
+an alias does not imply that SKU was measured. Unknown identities use the
+component heuristic in AUTO mode.
+
 One-shot `gemm.blockscaled` participates through the separate catalog inventory
 `ONESHOT_COMPONENTS`. Its `gemm.blockscaled_precision` policy resolves static
 weight geometry during prewarm; live M selects a precision route from
@@ -92,6 +99,14 @@ preplanned = PolicyContext.for_device(
 `B12X_POLICY_MODE=auto|heuristic-only|preplanned-only` selects the default
 context used when an integration omits an explicit policy. Explicit contexts and
 component config overrides still take precedence.
+
+For paged decode graphs, pass the same KV layout to `decode_graph_capacity`
+and `paged.Caps(kv_cache_layout=...)`. The default is `separate`; views into an
+interleaved K/V pool use `combined`. Feed the selected work-item and partial-row
+capacities into the scratch caps before graph preparation. Nonbinding limits
+reuse the profile's identical schedule, and the prepared scratch plan retains
+`policy_resolution`. Limits that exclude that schedule require a separately
+covered query or the AUTO heuristic. Graph binding and replay perform no lookup.
 
 ## Inspecting model selections
 
@@ -139,10 +154,45 @@ contracts. Shape-only and historical benchmark spellings remain accepted
 aliases, while `--list-models` prints one canonical name for each deduplicated
 model.
 
+## Planner encoding
+
+Implemented: component planners use a lossless decision DAG with shared configs
+and subtrees. Single-config components retain an unconditional leaf. Planning
+still performs exact scalar tests and disjoint inclusive range tests; missing
+coverage remains a miss. Binding and replay do not traverse the diagram.
+
+The serialized DAG has its own format version, independent of component query
+and config versions:
+
+```json
+{
+  "kind": "dag",
+  "schema_version": 1,
+  "configs": [{"backend": "cutedsl"}],
+  "nodes": [
+    {"kind": "leaf", "name": "qualified", "config": 0},
+    {"kind": "exact", "field": "dtype",
+     "branches": [{"value": "bfloat16", "node": 0}]}
+  ],
+  "root": 1
+}
+```
+
+Node references must point backward in the node table. Leaf config references
+index the config table. A default is an optional node index. The decoder rejects
+cycles, invalid references, unreachable entries, and paths deeper than 64 edges.
+Nested tree artifacts remain readable. Equal configs and nodes share immutable
+runtime objects; validation traverses each shared node once.
+
+Generation also hoists identical equality guards when every accepted path
+requires them and none of their occurrences has a default. It preserves scalar
+types, leaf names, evidence, and uncovered queries. This is exact compression;
+it does not infer coverage from neighboring geometries.
+
 ## Generation boundary
 
 One top-level command discovers every registered component, prints the complete
-work estimate, runs every provider, reduces measured races into decision trees,
+work estimate, runs every provider, reduces measured races into decision diagrams,
 validates the serialized profile, and optionally embeds the compact runtime
 payload:
 
@@ -150,6 +200,27 @@ payload:
 ./scripts/generate_gpu_profile.py --dry-run
 ./scripts/generate_gpu_profile.py --overwrite --embed
 ```
+
+`--full-corpus` requires every registered MoE routing case to be measured with
+an independent correctness check. Its complete estimate is available before
+execution:
+
+```bash
+./scripts/generate_gpu_profile.py --full-corpus --dry-run
+./scripts/generate_gpu_profile.py --full-corpus --work-dir /tmp/b12x-profile-work
+```
+
+The MoE corpus contains 421 geometries and 230,724 routing cases per target.
+The staged default measures 196,794 cases and checks additional routes only at
+selected capacities. These modes have distinct checkpoint identities. A failed
+candidate correctness gate blocks full-corpus profile emission; resume retains
+the evidence for inspection.
+
+`--timing-clock cuda_event` is the default. The explicit `globaltimer` option
+places device timestamp kernels around the same production graphs. Both clocks
+use balanced candidate ordering and preserve raw groups. Clock selection is
+part of observation and checkpoint identity: durations from different clocks
+are not interchangeable, and timestamp kernels can affect scheduling.
 
 Identical GPUs can measure one profile concurrently. CUDA ordinals are relative
 to `CUDA_VISIBLE_DEVICES`; `all` selects every visible GPU:
@@ -172,8 +243,29 @@ write competing profile files.
 Every selected GPU must report the same product name, compute capability, and SM
 count. Completed cases use the same shared checkpoint directory as a single-GPU
 run. After an interruption, rerun the command with the same `--work-dir`; the
-number or ordinals of identical GPUs may change without invalidating completed
-measurements.
+CUDA ordinals may change; physical GPU UUIDs remain part of measurement
+identity. Parallel reduction accepts records only from the assigned GPUs.
+
+Discrete sweeps store paired candidate observations once in
+`observations.sqlite3`, using compressed, content-addressed records and SQLite
+transactions for concurrent GPU workers. Compact JSON case checkpoints retain
+observation references. The observation identity binds source contents,
+toolchain, physical GPU, query and scenario inputs, ordered candidates, timing
+protocol, oracle contract, and measurement cohort. Search stages may reuse an
+identical observation; independent confirmation uses a separate cohort.
+Historical JSON remains readable, but missing or mismatched provenance prevents
+qualification reuse. Embedded profiles contain the decision DAG and selected
+configurations, without the measurement corpus.
+See [representation and generation measurements](gpu-policy-efficiency.md).
+
+`scripts/inspect_kernel_specializations.py --output /tmp/kernel-census.json`
+enumerates CuTe entry points, Triton JIT functions and launches, compile specs,
+explicit cache-key methods, memoized functions, and persistent host state.
+State access records retain key expressions and shared scope bindings. Possible
+receiver-name matches do not prove alias resolution or kernel ownership.
+Optional `--manifest`, `--observations`, and `--trace-sqlite` inputs add cached
+object integrity, requested specialization, and executed-launch evidence;
+these are distinct coverage claims.
 
 No `--components` argument is needed for a full device profile; the default is
 all registered components. `--components` exists only for targeted development
@@ -189,20 +281,28 @@ Completed MoE geometries resume entirely from checkpoint metadata. Candidate
 enumeration and eligibility run on the host; a CUDA worker and expert weights
 are created lazily only when a race checkpoint is missing.
 
-Checkpoint compatibility is based on checkpoint schema, device identity,
-measurement case and candidate IDs, and timing settings. `source_revision` is
-provenance rather than a measurement input, so committing an identical source
-tree or extending a corpus does not discard unrelated measurements. A cached
-sampling protocol may satisfy a weaker requested protocol, but not the reverse.
-Discrete sweep checkpoints also carry a component-owned candidate-contract
-version. A fully compatible allocation group skips session setup and candidate
-enumeration even after unrelated source changes or a commit. Providers must
-bump that version when candidate enumeration or eligibility changes; case IDs
-independently invalidate corpus changes. Legacy checkpoints receive one
-candidate-ID comparison before being upgraded to this contract.
-Fixed-backend qualifications similarly persist the ordered probe case IDs and
-the qualified config, so changing either invalidates only that component's
-checkpoint.
+Checkpoint compatibility requires identical source revision, source contents,
+toolchain, device identity, measurement cohort, and timing settings. A source or
+protocol change invalidates qualification reuse. Case IDs independently bind
+the measured corpus, and candidate-contract versions bind enumeration and
+eligibility. A fully compatible allocation group skips session preparation.
+Fixed-backend probes also bind their ordered case IDs and serialized config.
+MoE precision races retain their component-owned paired-sample and independent
+confirmation contracts.
+
+GQA candidate contract 2 races distinct decode schedules and workspace layouts.
+CTA budgets that produce identical tile geometry, chunk-page tables, chunk
+limits, work-item capacity, and partial-row capacity share one representative.
+The first enumerated representative retains the heuristic's preference. This
+equivalence applies only to single-token decode; verifier kernels can consume
+the CTA budget directly.
+
+GQA explicitly permits migration from candidate contract 1. Migration enumerates
+the retained candidates, requires each exact candidate ID in the compatible
+checkpoint, and retains that candidate's recorded measurement and provenance.
+It never assigns one candidate's timing to a different config. Other contract
+changes invalidate checkpoints unless the provider explicitly declares a
+compatible subset migration. Migrated checkpoints resume without enumeration.
 
 The built-in measured corpus covers common model geometries and TP sizes 1
 through 16,

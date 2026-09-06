@@ -169,6 +169,8 @@ def test_wo_projection_inv_rope_binding_supplies_runtime_tensors(monkeypatch) ->
     calls = {}
 
     def fake_fused(
+        scratch_arg,
+        capacity_m,
         o_arg,
         positions_arg,
         cos_sin_cache_arg,
@@ -191,6 +193,8 @@ def test_wo_projection_inv_rope_binding_supplies_runtime_tensors(monkeypatch) ->
         sfb_k_replicated,
         stream_int,
     ):
+        calls["scratch"] = scratch_arg
+        calls["capacity_m"] = capacity_m
         calls["o"] = o_arg
         calls["positions"] = positions_arg
         calls["cos_sin_cache"] = cos_sin_cache_arg
@@ -210,11 +214,11 @@ def test_wo_projection_inv_rope_binding_supplies_runtime_tensors(monkeypatch) ->
         calls["expected_m"] = expected_m
         calls["sfb_k_replicated"] = sfb_k_replicated
         calls["stream_int"] = stream_int
-        return torch.empty((o_arg.shape[0], hidden, 1), dtype=o_arg.dtype)
+        binding.output.zero_()
 
     monkeypatch.setattr(
         wo_impl.torch.ops.b12x,
-        "wo_projection_inv_rope_mxfp8_fused",
+        "wo_projection_inv_rope_mxfp8_scratch",
         fake_fused,
     )
 
@@ -238,7 +242,10 @@ def test_wo_projection_inv_rope_binding_supplies_runtime_tensors(monkeypatch) ->
     assert calls["heads_per_group"] == 1
     assert calls["nope_dim"] == 96
     assert calls["rope_dim"] == 32
-    assert calls["expected_m"] == 3
+    assert calls["expected_m"] == 4
+    assert calls["capacity_m"] == 4
+    assert calls["scratch"].data_ptr() == scratch.data_ptr()
+    assert out is binding.output
     assert calls["sfb_k_replicated"] == weights.sfb_k_replicated
     assert calls["stream_int"] == 123
     assert out.shape == (3, 256, 1)

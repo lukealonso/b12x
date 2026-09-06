@@ -78,7 +78,7 @@ NVFP4_QUANTIZATION_POLICY = ComponentPolicy(
     query_fields=frozenset(Nvfp4QuantizationQuery.__dataclass_fields__),
     config_fields=frozenset(Nvfp4QuantizationConfig.__dataclass_fields__),
     encode_query=_encode,
-    decode_profile=Nvfp4QuantizationConfig.from_profile,
+    decode_profile=lambda query, device, payload: Nvfp4QuantizationConfig.from_profile(payload),
     heuristic=_heuristic,
     validate_config=_validate,
 )
@@ -89,3 +89,18 @@ __all__ = [
     "Nvfp4QuantizationConfig",
     "Nvfp4QuantizationQuery",
 ]
+
+
+from b12x.policy.problem import define_problem
+
+TUNING_PROBLEM = define_problem(
+    policy=NVFP4_QUANTIZATION_POLICY, query_type=Nvfp4QuantizationQuery, config_type=Nvfp4QuantizationConfig,
+    axes=('rows', 'columns'),
+    family=('dtype',),
+    constraints=(),
+    environment=(),
+    model_fields=('columns',),
+    decisions={'backend': ('cutedsl',), 'liveness_strategy': ('retain', 'packed')},
+    axis_domains={'rows': (128, 128), 'columns': (128, 128)},
+    derived_config_fields=(),
+)

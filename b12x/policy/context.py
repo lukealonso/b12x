@@ -85,12 +85,13 @@ class ComponentPolicy(Generic[QueryT, ConfigT]):
     query_fields: frozenset[str]
     config_fields: frozenset[str]
     encode_query: Callable[[QueryT], Mapping[str, object]]
-    decode_profile: Callable[[FrozenMapping], ConfigT]
+    decode_profile: Callable[[QueryT, DeviceIdentity | None, FrozenMapping], ConfigT]
     heuristic: Callable[[QueryT, DeviceIdentity | None], ConfigT]
     validate_config: Callable[
         [QueryT, ConfigT, DeviceIdentity | None],
         None,
     ]
+    encode_cache_query: Callable[[QueryT], Mapping[str, object]] | None = None
 
     def __post_init__(self) -> None:
         if not _COMPONENT_ID_RE.fullmatch(self.component_id):
@@ -306,7 +307,8 @@ class PolicyContext:
 
         cache_key = (
             cast(ComponentPolicy[object, object], component),
-            FrozenMapping(fields),
+            FrozenMapping(fields if component.encode_cache_query is None
+                          else component.encode_cache_query(query)),
         )
         cached = self._cached_resolution(cache_key)
         if cached is not None:
@@ -348,7 +350,7 @@ class PolicyContext:
                         query=fields,
                     )
                     if hit is not None:
-                        config = component.decode_profile(hit.config)
+                        config = component.decode_profile(query, self.device, hit.config)
                         component.validate_config(query, config, self.device)
                         resolution = PolicyResolution(
                             config=config,

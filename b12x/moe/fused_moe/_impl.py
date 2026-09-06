@@ -1430,6 +1430,8 @@ def _w4a16_weight_layout_for_source(
     source_format = _normalize_fp4_source_format(source_format)
     if source_format in _TRELLIS_SOURCE_FORMATS:
         return "trellis_t256"
+    if source_format == "modelopt_nvfp4":
+        return "modelopt"
     if (
         source_format == "fp4_e8m0_k32"
         and intermediate_size is not None
@@ -2442,13 +2444,14 @@ def _w4a16_direct_routing_supported(query: MoeDecodeQuery) -> bool:
             query.source_format, intermediate_size=query.intermediate_size,
         )
     )
-    if weight_layout == "trellis_t256":
-        return False
     from b12x.moe._shared.kernels.w4a16.kernel import (
         _MAX_DIRECT_TOPK_ROUTE_M,
         _TC_DECODE_MAX_M,
         _small_m_direct_supported,
     )
+
+    if weight_layout == "trellis_t256":
+        return query.num_tokens <= _MAX_DIRECT_TOPK_ROUTE_M
 
     if weight_layout == "modelopt":
         source_format = _normalize_fp4_source_format(query.source_format)
@@ -2482,6 +2485,8 @@ def _heuristic_w4a16_route_mode(
     query: MoeDecodeQuery,
     device: DeviceIdentity | None,
 ) -> str:
+    if query.source_format in _TRELLIS_SOURCE_FORMATS:
+        return "packed"
     if not _w4a16_direct_routing_supported(query):
         return "packed"
     if (
@@ -7409,6 +7414,7 @@ def _plan_full_rotation_w4a16_launches(
     caps: TPMoEScratchCaps,
     core_plan: _TPCoreWorkspacePlan,
     capacity_tokens: int,
+    route_mode: str,
 ) -> tuple[
     tuple[tuple[int, object], ...],
     tuple[tuple[torch.dtype, bool, object], ...],
@@ -7484,17 +7490,9 @@ def _plan_full_rotation_w4a16_launches(
                 _DEFAULT_MAX_SHARED_MEM,
             )
         )
-        # Decode plans are deliberately exact-M: the unified API's measured
-        # speedup over the retired Trellis wrapper comes from specializing the
-        # small live shapes instead of always launching its M=32 capacity
-        # kernel.  Large prefill plans retain one capacity launch.
-        fused_token_counts = (
-            tuple(range(1, capacity_tokens + 1))
-            if capacity_tokens <= 32
-            else (capacity_tokens,)
-        )
+        fused_token_counts = (capacity_tokens,)
 
-        def compile_fused(token_count: int) -> object:
+        def compile_fused(token_count: int, *, mapped: bool = False) -> object:
             return compile_w4a16_fused_moe(
                 size_m=token_count,
                 hidden_size=core_plan.k,
@@ -7505,9 +7503,9 @@ def _plan_full_rotation_w4a16_launches(
                 apply_router_weight_on_input=caps.apply_router_weight_on_input,
                 zero_fc2_output=False,
                 moe_block_size=block_size_m,
-                # Match the lazy unified path: specialize the live M while
-                # retaining the caller-owned route arena's full grid capacity.
-                max_m_blocks=capacity_m_blocks,
+                # The fused kernel and route arena share the declared capacity.
+                max_m_blocks=(token_count * core_plan.num_topk
+                              if route_mode == "direct" else capacity_m_blocks),
                 element_dtype="fp16",
                 fast_math=caps.w4a16_fast_math,
                 sms=sms,
@@ -7523,13 +7521,16 @@ def _plan_full_rotation_w4a16_launches(
                 force_tile_config=core_plan.trellis_tile_config,
                 intermediate_rotation=True,
                 full_rotation=True,
+                direct_topk_routes=route_mode == "direct",
+                use_expert_map=mapped and route_mode == "direct",
                 coupled_hadamard=core_plan.coupled_hadamard,
                 rotation_input_dtype=rotation_input_dtype,
             )
 
         fused_launches = tuple(
-            (token_count, compile_fused(token_count))
+            (token_count, compile_fused(token_count, mapped=mapped))
             for token_count in fused_token_counts
+            for mapped in ((False, True) if route_mode == "direct" else (False,))
         )
         topk_sum_launches = tuple(
             (
@@ -7597,8 +7598,6 @@ def _plan_full_rotation_w4a16_launches(
                         core_plan.device.type,
                         int(torch.cuda.current_device()),
                         route_ids_dtype,
-                        token_count,
-                        core_plan.num_topk,
                         capacity_route_slots,
                         capacity_m_blocks,
                         int(block_size_m),
@@ -8110,6 +8109,7 @@ def plan_tp_moe_scratch(
             caps=caps,
             core_plan=core_workspace_plan,
             capacity_tokens=capacity_tokens,
+            route_mode=launch_plan.policy_resolution.config.w4a16_route_mode,
         )
         mixed_trellis_launches = _plan_projection_mixed_trellis_launches(
             caps=caps,
@@ -8342,8 +8342,6 @@ def _prewarm_w4a16_planned_launches(
                 workspace.device.type,
                 int(torch.cuda.current_device()),
                 torch.int32,
-                token_count,
-                workspace.num_topk,
                 workspace.packed_route_indices.numel(),
                 workspace.block_expert_ids.numel(),
                 int(block_size_m),
@@ -9373,11 +9371,11 @@ def _get_micro_kernel(
     n: int,
     num_topk: int,
     *,
+    capacity_m: int,
     topk_ids_dtype: torch.dtype,
     fast_math: bool,
     share_input_across_experts: bool = False,
     share_expert_scales: bool = False,
-    single_token: bool = False,
     mac_override: int | None = None,
     activation: str = "silu",
     device: torch.device | None = None,
@@ -9390,6 +9388,8 @@ def _get_micro_kernel(
     trellis_bits: int = 0,
     trellis_coupled: bool = False,
 ):
+    if not 0 < m <= capacity_m:
+        raise ValueError(f"micro live rows {m} exceed planned capacity {capacity_m}")
     quant_mode = _normalize_quant_mode(quant_mode)
     activation_spec = _get_activation_kernel_spec(activation, quant_mode=quant_mode)
     mac = mac_override if mac_override is not None else _get_impl_mac("micro")
@@ -9403,9 +9403,9 @@ def _get_micro_kernel(
         mma_tiler_mn=(64, 128),
         output_tile_count_n=1,
         fast_math=fast_math,
-        share_input_across_experts=share_input_across_experts and not is_w4a8,
+        share_input_across_experts=share_input_across_experts and capacity_m == 1 and not is_w4a8,
         share_expert_scales=share_expert_scales,
-        single_token=single_token,
+        single_token=capacity_m == 1,
         dynamic_down_scale=dynamic_down_scale,
         a8_mx_mode=is_w4a8,
         scale_format=scale_format,
@@ -9424,25 +9424,44 @@ def _get_micro_kernel(
     if compile_time_phase:
         micro_kwargs["compile_time_phase"] = int(compile_time_phase)
     kernel = activation_spec.make_micro_kernel(**micro_kwargs)
-    kernel.configure(m, k, n, num_topk, weight_E, max_active_ctas=mac, device=device)
+    kernel.configure(capacity_m, k, n, num_topk, weight_E, max_active_ctas=mac, device=device)
     kernel_key = kernel.__cache_key__
+    cfg = kernel._cfg
+    fc1_tasks = m * cfg.num_topk * cfg.fc1_chunks * kernel.trellis_ksplit
+    if kernel.weight_layout_trellis256:
+        fc2_tasks = m * cfg.k_dim // 16
+    elif capacity_m == 1:
+        fc2_tasks = cfg.k_dim // kernel.m1_fc2_rows_per_cta
+    elif kernel.w4a16_mode and cfg.fc2_n_chunks == 1:
+        fc2_tasks = m * cfg.k_dim // 32
+    else:
+        fc2_tasks = m * cfg.k_dim // 64
+    if compile_time_phase == 1:
+        grid_x = max(1, fc1_tasks)
+    elif compile_time_phase == 2:
+        grid_x = max(1, fc2_tasks)
+    else:
+        tasks = (max(fc1_tasks, fc2_tasks) if capacity_m <= 2
+                 else fc2_tasks if cfg.fc1_chunks < 16 else min(fc1_tasks, fc2_tasks))
+        grid_x = max(1, min(kernel.grid_x, tasks))
 
     global _LAST_KERNEL
     cache_key = (
         quant_mode,
         "micro_direct",
+        torch.cuda.current_device() if device is None or device.index is None else device.index,
         kernel_key,
         topk_ids_dtype,
     )
     last_kkey, last_kval = _LAST_KERNEL
     if last_kkey == cache_key:
-        return last_kval, kernel.grid_x
+        return last_kval, grid_x
     reuse_compiled = os.environ.get("B12X_MICRO_REUSE_COMPILED", "1") != "0"
     if reuse_compiled:
         cached = _MICRO_KERNEL_CACHE.get(cache_key)
         if cached is not None:
             _LAST_KERNEL = (cache_key, cached)
-            return cached, kernel.grid_x
+            return cached, grid_x
 
     def dummy(dt):
         return make_ptr(dt, 16, cute.AddressSpace.gmem, assumed_align=16)
@@ -9492,7 +9511,7 @@ def _get_micro_kernel(
         ),
         compile_spec=KernelCompileSpec.from_key(
             "integration.tp_moe.micro_direct",
-            1,
+            2,
             cache_key,
         ),
         **compile_kwargs,
@@ -9507,7 +9526,7 @@ def _get_micro_kernel(
     if reuse_compiled:
         _MICRO_KERNEL_CACHE[cache_key] = compiled
     _LAST_KERNEL = (cache_key, compiled)
-    return compiled, kernel.grid_x
+    return compiled, grid_x
 
 
 def _direct_micro_shape_accepts_block_dim(compiled, block_dim: int) -> bool:
@@ -11415,6 +11434,7 @@ def _launch_compact_micro_flat(
     swiglu_alpha: float,
     swiglu_beta: float,
     volatile_launch_state: bool,
+    capacity_m: int,
 ) -> None:
     quant_mode = _normalize_quant_mode(quant_mode)
     activation_spec = _get_activation_kernel_spec(activation, quant_mode=quant_mode)
@@ -11477,7 +11497,7 @@ def _launch_compact_micro_flat(
                 fast_math=fast_math,
                 share_input_across_experts=share_input_across_experts,
                 share_expert_scales=share_expert_scales,
-                single_token=True,
+                capacity_m=capacity_m,
                 activation=activation,
                 device=a.device,
                 quant_mode=quant_mode,
@@ -11488,7 +11508,7 @@ def _launch_compact_micro_flat(
             )
             split_block_dim = (
                 _DIRECT_MICRO_BLOCK_DIM // 2
-                if phase == 2 and m == 1
+                if phase == 2 and capacity_m == 1
                 else _DIRECT_MICRO_BLOCK_DIM
             )
             if not _compiled_direct_micro_accepts_block_dim(compiled, split_block_dim):
@@ -11526,7 +11546,7 @@ def _launch_compact_micro_flat(
         fast_math=fast_math,
         share_input_across_experts=share_input_across_experts,
         share_expert_scales=share_expert_scales,
-        single_token=(m == 1),
+        capacity_m=capacity_m,
         activation=activation,
         device=a.device,
         quant_mode=quant_mode,
@@ -11611,7 +11631,9 @@ def _get_tiny_decode_kernel(
     ):
         kernel = kernel_cls()
         kernel.configure(m, k, n, num_topk, weight_E, device=device)
-        cache_key = ("tiny_decode",) + kernel.__cache_key__
+        device_index = (torch.cuda.current_device() if device is None or device.index is None
+                        else device.index)
+        cache_key = ("tiny_decode", device_index) + kernel.__cache_key__
         cached = _TINY_DECODE_KERNEL_CACHE.get(cache_key)
         if cached is not None:
             compiled_phases.append(cached)
@@ -11634,10 +11656,11 @@ def _get_tiny_decode_kernel(
             dummy(cutlass.Int32),
             dummy(cutlass.Float32),
             dummy(cutlass.BFloat16),
+            Int32(4),
             current_cuda_stream(),
             compile_spec=KernelCompileSpec.from_key(
                 "integration.tp_moe.tiny_decode",
-                1,
+                3,
                 cache_key,
             ),
         )
@@ -11687,6 +11710,7 @@ def _launch_tiny_decode_flat(
         topk_ids=launch_ids,
         topk_weights=flat_weights,
         out=scatter_output.reshape(-1),
+        m=m,
     )
 
 
@@ -11791,6 +11815,7 @@ def _tp_moe_compact_micro_launch_op(
     swiglu_alpha: float,
     swiglu_beta: float,
     volatile_launch_state: bool,
+    capacity_m: int,
 ) -> None:
     _launch_compact_micro_flat(
         barrier_count=barrier_count,
@@ -11822,6 +11847,7 @@ def _tp_moe_compact_micro_launch_op(
         swiglu_alpha=swiglu_alpha,
         swiglu_beta=swiglu_beta,
         volatile_launch_state=volatile_launch_state,
+        capacity_m=capacity_m,
     )
 
 
@@ -11856,6 +11882,7 @@ def _tp_moe_compact_micro_launch_fake(
     swiglu_alpha: float,
     swiglu_beta: float,
     volatile_launch_state: bool,
+    capacity_m: int,
 ) -> None:
     return None
 
@@ -11981,6 +12008,7 @@ def _launch_micro(
         float(swiglu_alpha),
         float(swiglu_beta),
         workspace.volatile_launch_state,
+        workspace.routed_rows_capacity // num_topk,
     )
 
 
@@ -12329,6 +12357,8 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
             swiglu_alpha=swiglu_alpha,
             swiglu_beta=swiglu_beta,
             fused_launch=fused_launch,
+            planned_token_capacity=(binding.execution_plan.max_tokens_per_launch
+                                    if binding.execution_plan is not None else None),
             topk_sum_launch=topk_sum_launch,
             route_block_size_m=binding.route_block_size_m,
             intermediate_rotation_scales=(

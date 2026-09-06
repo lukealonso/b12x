@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import re
+from bisect import bisect_right
 from collections.abc import Iterator, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field as dataclass_field
 from enum import Enum
 from typing import Generic, TypeVar
+from types import MappingProxyType
 
 _COMPONENT_ID_RE = re.compile(r"^[a-z][a-z0-9_.-]*$")
 _PROFILE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]*$")
@@ -277,6 +279,7 @@ class ExactDecisionNode:
     field: str
     branches: tuple[tuple[object, "DecisionNode"], ...]
     default: "DecisionNode | None" = None
+    _index: Mapping | None = dataclass_field(default=None, init=False, repr=False, compare=False, hash=False)
 
     def __post_init__(self) -> None:
         if not self.field:
@@ -294,6 +297,8 @@ class ExactDecisionNode:
             keys.append((type(value), value))
         if len(keys) != len(set(keys)):
             raise ValueError("exact decision nodes cannot repeat branch values")
+        if len(keys) >= 4:
+            object.__setattr__(self, "_index", MappingProxyType(dict(zip(keys, (node for _, node in self.branches), strict=True))))
         if self.default is not None and not isinstance(
             self.default,
             (ProfileLeaf, ExactDecisionNode, RangeDecisionNode),
@@ -302,25 +307,22 @@ class ExactDecisionNode:
 
     @property
     def query_fields(self) -> frozenset[str]:
-        fields = {self.field}
-        for _, node in self.branches:
-            fields.update(node.query_fields)
-        if self.default is not None:
-            fields.update(self.default.query_fields)
-        return frozenset(fields)
+        return _decision_query_fields(self)
 
     def lookup(self, query: Mapping[str, object]) -> ProfileLeaf | None:
         value = query.get(self.field, _MISSING)
+        if self._index is not None:
+            node = (self._index.get((type(value), value))
+                    if isinstance(value, _SCALAR_TYPES) and value == value else None)
+            node = self.default if node is None else node
+            return None if node is None else node.lookup(query)
         for expected, node in self.branches:
             if type(value) is type(expected) and value == expected:
                 return node.lookup(query)
         return None if self.default is None else self.default.lookup(query)
 
     def iter_leaves(self) -> Iterator[ProfileLeaf]:
-        for _, node in self.branches:
-            yield from node.iter_leaves()
-        if self.default is not None:
-            yield from self.default.iter_leaves()
+        yield from _decision_leaves(self)
 
 
 @dataclass(frozen=True)
@@ -330,22 +332,27 @@ class RangeDecisionNode:
     field: str
     branches: tuple[tuple[MatchRange, "DecisionNode"], ...]
     default: "DecisionNode | None" = None
+    _minimums: tuple[int, ...] = dataclass_field(default=(), init=False, repr=False, compare=False, hash=False)
+    _ordered: tuple = dataclass_field(default=(), init=False, repr=False, compare=False, hash=False)
 
     def __post_init__(self) -> None:
         if not self.field:
             raise ValueError("decision fields must be non-empty")
         if not self.branches:
             raise ValueError("range decision nodes must contain branches")
-        for index, (bounds, node) in enumerate(self.branches):
+        for bounds, node in self.branches:
             if not isinstance(bounds, MatchRange):
                 raise TypeError("range decision bounds must be MatchRange values")
             if not isinstance(
                 node, (ProfileLeaf, ExactDecisionNode, RangeDecisionNode)
             ):
                 raise TypeError("range decision branches must contain decision nodes")
-            for other, _ in self.branches[index + 1 :]:
-                if bounds.overlaps(other):
-                    raise ValueError("range decision branches cannot overlap")
+        ordered = tuple(sorted(self.branches, key=lambda branch: branch[0].minimum))
+        if any(left[0].overlaps(right[0]) for left, right in zip(ordered, ordered[1:], strict=False)):
+            raise ValueError("range decision branches cannot overlap")
+        if len(ordered) >= 4:
+            object.__setattr__(self, "_minimums", tuple(bounds.minimum for bounds, _ in ordered))
+            object.__setattr__(self, "_ordered", ordered)
         if self.default is not None and not isinstance(
             self.default,
             (ProfileLeaf, ExactDecisionNode, RangeDecisionNode),
@@ -354,28 +361,55 @@ class RangeDecisionNode:
 
     @property
     def query_fields(self) -> frozenset[str]:
-        fields = {self.field}
-        for _, node in self.branches:
-            fields.update(node.query_fields)
-        if self.default is not None:
-            fields.update(self.default.query_fields)
-        return frozenset(fields)
+        return _decision_query_fields(self)
 
     def lookup(self, query: Mapping[str, object]) -> ProfileLeaf | None:
         value = query.get(self.field, _MISSING)
+        if self._minimums:
+            if isinstance(value, int) and not isinstance(value, bool):
+                index = bisect_right(self._minimums, value) - 1
+                if index >= 0:
+                    bounds, node = self._ordered[index]
+                    if value <= bounds.maximum:
+                        return node.lookup(query)
+            return None if self.default is None else self.default.lookup(query)
         for bounds, node in self.branches:
             if bounds.contains(value):
                 return node.lookup(query)
         return None if self.default is None else self.default.lookup(query)
 
     def iter_leaves(self) -> Iterator[ProfileLeaf]:
-        for _, node in self.branches:
-            yield from node.iter_leaves()
-        if self.default is not None:
-            yield from self.default.iter_leaves()
+        yield from _decision_leaves(self)
 
 
 DecisionNode = ProfileLeaf | ExactDecisionNode | RangeDecisionNode
+
+
+def _decision_nodes(root: DecisionNode) -> Iterator[DecisionNode]:
+    """Visit shared decision nodes once, preserving branch order."""
+    pending = [root]
+    visited: set[int] = set()
+    while pending:
+        node = pending.pop()
+        if id(node) in visited:
+            continue
+        visited.add(id(node))
+        yield node
+        if not isinstance(node, ProfileLeaf):
+            if node.default is not None:
+                pending.append(node.default)
+            pending.extend(child for _, child in reversed(node.branches))
+
+
+def _decision_query_fields(root: DecisionNode) -> frozenset[str]:
+    return frozenset(
+        node.field for node in _decision_nodes(root)
+        if not isinstance(node, ProfileLeaf)
+    )
+
+
+def _decision_leaves(root: DecisionNode) -> Iterator[ProfileLeaf]:
+    return (node for node in _decision_nodes(root) if isinstance(node, ProfileLeaf))
 
 
 @dataclass(frozen=True)

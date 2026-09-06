@@ -89,7 +89,12 @@ def run(
     _moe_block_size: int = 64,
     _force_tile_config: tuple[int, int] | None = None,
 ) -> torch.Tensor:
-    """Execute Trellis GEMM, optionally reusing all capture-time storage."""
+    """Execute Trellis GEMM with CuTe rotations and optional caller-owned storage.
+
+    The default tile depends only on weight geometry. Explicit tile choices
+    must remain fixed while changing live rows under frozen kernel resolution.
+    An explicit ``hadamard_128`` callback overrides the built-in rotation.
+    """
     return run_trellis256_dense(
         x,
         weight,
@@ -113,7 +118,10 @@ def is_supported(device=None) -> bool:
 
 
 def clear_caches() -> None:
-    """Clear compiled W4A16 specializations."""
+    """Clear compiled GEMM and dense rotation specializations."""
+    from ._rotation import _KERNEL_CACHE
+
+    _KERNEL_CACHE.clear()
     clear_w4a16_kernel_cache()
 
 
