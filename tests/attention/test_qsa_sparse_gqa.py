@@ -76,9 +76,17 @@ def test_cooperative_merge_preserves_order_bitwise_under_changed_graph_inputs(
 
     device = require_sm120()
     torch.manual_seed(20260905)
-    partials = torch.randn(64, 64, heads, 256, device=device)
-    lse = torch.randn(64, 64, heads, device=device) * 8
-    output = torch.empty(64, heads, 256, device=device, dtype=torch.bfloat16)
+    geometries = ((1, 64), (4, 32), (16, 16), (4, 1), (64, 16))
+    # Each graph consumes these caller-owned contiguous buffers directly.
+    # Capturing a contiguous() adapter would also capture its staging copies.
+    buffers = {
+        (rows, splits): (
+            torch.randn(rows, splits, heads, 256, device=device),
+            torch.randn(rows, splits, heads, device=device) * 8,
+            torch.empty(rows, heads, 256, device=device, dtype=torch.bfloat16),
+        )
+        for rows, splits in geometries
+    }
     original = implementation._SparseGqaMergeKernel
     candidate = implementation._ShapeAdaptiveSparseGqaMergeKernel
     graphs = {}
@@ -88,32 +96,34 @@ def test_cooperative_merge_preserves_order_bitwise_under_changed_graph_inputs(
             implementation.clear_caches()
 
             def launch(rows, splits):
+                partials, lse, output = buffers[rows, splits]
                 implementation.launch_sparse_gqa_merge(
-                    partial_output=partials[:rows, :splits].contiguous(),
-                    partial_lse=lse[:rows, :splits].contiguous(),
-                    output=output[:rows],
+                    partial_output=partials,
+                    partial_lse=lse,
+                    output=output,
                     rows=rows,
                     splits=splits,
                 )
 
             launch(1, 64)
             freeze_kernel_resolution("cooperative QSA merge live rows/splits")
-            for rows, splits in ((1, 64), (4, 32), (16, 16), (4, 1), (64, 16)):
+            for rows, splits in geometries:
                 graph = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(graph):
                     launch(rows, splits)
                 graphs[label, rows, splits] = graph
             unfreeze_kernel_resolution()
-        for rows, splits in ((1, 64), (4, 32), (16, 16), (4, 1), (64, 16)):
+        for rows, splits in geometries:
+            partials, lse, output = buffers[rows, splits]
             for _ in range(3):
                 partials.normal_()
                 lse.normal_()
                 lse[:, 1::3] = -torch.inf
                 lse[0, :, 0] = -torch.inf
                 graphs["serial", rows, splits].replay()
-                expected = output[:rows].clone()
+                expected = output.clone()
                 graphs["cooperative", rows, splits].replay()
-                torch.testing.assert_close(output[:rows], expected, rtol=0, atol=0)
+                torch.testing.assert_close(output, expected, rtol=0, atol=0)
                 assert torch.count_nonzero(output[0, 0]) == 0
                 assert torch.count_nonzero(output[:rows, -1]) > 0
     finally:

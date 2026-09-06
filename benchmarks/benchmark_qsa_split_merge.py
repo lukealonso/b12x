@@ -30,6 +30,7 @@ def main():
     source = Path(implementation.__file__)
     result = {
         "status": "research-only",
+        "measurement_scope": "proxy: isolated merge kernel; end-to-end serving is not measured",
         "command": sys.argv,
         "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
         "gpu_before": nvidia_smi_gpu_mode_snapshot(),
