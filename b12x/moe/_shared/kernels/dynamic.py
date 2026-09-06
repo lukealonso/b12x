@@ -950,11 +950,12 @@ class MoEDynamicKernelBackend:
         if self.external_route_plan and not (
             quant_recipe == "nvfp4"
             and not self.direct_routing
-            and work_source == _WORK_SOURCE_MATERIALIZED_QUEUE
+            and work_source
+            in {_WORK_SOURCE_MATERIALIZED_QUEUE, _WORK_SOURCE_PERSISTENT_GRID}
         ):
             raise ValueError(
                 "external route planning requires grouped NVFP4 with the "
-                "materialized work source"
+                "materialized or persistent work source"
             )
         if self.is_w4a8 and swap_ab:
             raise ValueError("w4a8 recipes do not support swap_ab yet")

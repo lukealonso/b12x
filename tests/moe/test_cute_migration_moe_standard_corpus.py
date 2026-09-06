@@ -8,7 +8,7 @@ IDs for direct micro, dynamic prefill, and both tiny-decode phases.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import pytest
 import torch
@@ -891,9 +891,11 @@ def test_standard_moe_nvfp4_n16_tail_dynamic_live_graph_oracle(
 
 
 @pytest.mark.parametrize("m", [4, 7])
+@pytest.mark.parametrize("work_source", ["materialized_queue", "persistent_grid"])
 def test_standard_moe_external_route_plan_live_graph_oracle(
     monkeypatch: pytest.MonkeyPatch,
     m: int,
+    work_source: str,
 ) -> None:
     """Consume a Triton-planned grouped route layout under live replay."""
 
@@ -905,6 +907,7 @@ def test_standard_moe_external_route_plan_live_graph_oracle(
     _reset_dispatch_environment(monkeypatch)
     monkeypatch.setenv("B12X_MICRO_DYNAMIC_CUTOVER_PAIRS", "0")
     monkeypatch.setenv("B12X_DYNAMIC_EXTERNAL_ROUTE_PLAN", "1")
+    monkeypatch.setenv("B12X_DYNAMIC_WORK_SOURCE", work_source)
     weights = _make_nvfp4_weights(
         device,
         seed=211,
@@ -976,6 +979,86 @@ def test_standard_moe_external_route_plan_live_graph_oracle(
     torch.testing.assert_close(case.binding.row_counts, expected_counts)
     expected_tiles = int(((expected_counts + 15) // 16).sum().item())
     assert int(case.binding.expert_tile_base[-1].item()) == expected_tiles
+
+
+@pytest.mark.parametrize("layout", ["vector", "scalar", "strided"])
+def test_standard_moe_dynamic_scale_graph_reads_canonical_owner_updates(
+    monkeypatch: pytest.MonkeyPatch,
+    layout: str,
+) -> None:
+    from b12x.moe.fused_moe import run
+
+    device = require_b12x()
+    _reset_dispatch_environment(monkeypatch)
+    monkeypatch.setenv("B12X_MICRO_DYNAMIC_CUTOVER_PAIRS", "0")
+    monkeypatch.setenv("B12X_DYNAMIC_EXTERNAL_ROUTE_PLAN", "1")
+    monkeypatch.setenv("B12X_DYNAMIC_WORK_SOURCE", "persistent_grid")
+    geometry = dict(num_experts=32, hidden_size=512, intermediate_size=128)
+    weights = _make_nvfp4_weights(device, seed=241, **geometry)
+    if layout == "vector":
+        weights = replace(
+            weights,
+            a1_scale=weights.a1_scale.expand(32).contiguous(),
+            a2_scale=weights.a2_scale.expand(32).contiguous(),
+        )
+    elif layout == "strided":
+        weights = replace(
+            weights,
+            a1_scale=weights.a1_scale.expand(64).contiguous()[::2],
+            a2_scale=weights.a2_scale.expand(64).contiguous()[::2],
+        )
+    inputs = _make_inputs(
+        device,
+        m=4,
+        seed=242,
+        route_shift=0,
+        num_experts=32,
+        hidden_size=512,
+        topk=10,
+    )
+    changed_weights = replace(
+        weights,
+        a1_scale=weights.a1_scale * 2,
+        a2_scale=weights.a2_scale * 0.5,
+    )
+    references = [
+        _nvfp4_oracle(source, inputs, **geometry)
+        for source in (weights, changed_weights)
+    ]
+    case = _prepare_and_bind(
+        weights,
+        inputs,
+        quant_mode="nvfp4",
+        source_format="modelopt_nvfp4",
+        num_topk=10,
+    )
+    binding = case.binding
+    assert (binding.input_gs.data_ptr() == case.experts.a1_gscale.data_ptr()) == (
+        layout == "vector"
+    )
+    assert (
+        binding.down_input_scale.data_ptr() == case.experts.a2_gscale.data_ptr()
+    ) == (layout == "vector")
+    run(binding=binding)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run(binding=binding)
+    for index, reference in enumerate(references):
+        if index:
+            case.experts.a1_gscale.copy_(changed_weights.a1_scale)
+            case.experts.a2_gscale.copy_(changed_weights.a2_scale)
+        allocation_count = torch.cuda.memory_stats()["allocation.all.allocated"]
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocation_count
+        _assert_oracle(
+            binding.output,
+            reference,
+            context=f"canonical-scale-values-{index}",
+            min_cos=0.999,
+            max_normalized_rmse=0.03,
+        )
+    assert not torch.equal(references[0], references[1])
 
 
 def test_standard_moe_glm53_tp4_nvfp4_live_graph_replay(
