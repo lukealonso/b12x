@@ -171,6 +171,15 @@ Set `B12X_PRINT_COMPILE_PROGRESS=1` to log each compiler invocation with its
 cache-key parameters and duration — useful for figuring out what warmup
 actually covered. `B12X_TIMING=1` enables per-kernel timing logs.
 
+## Reserving SMs next to the persistent fused MoE grid
+
+`B12X_W4A16_RESERVE_SMS=N` sizes the W4A16 fused FC1+FC2 persistent grid to
+`(sms - N) x blocks_per_sm` CTAs. The prefill plan pins every SM's register
+file for the whole launch, so without a reservation no other kernel gets an
+SM until the MoE CTAs retire; with a small reservation the one-block kernels
+of a concurrently issued communication stream run alongside the MoE. Costs
+about `N / sms` of MoE throughput; default `0` (unchanged grid).
+
 ## Where to look next
 
 - `tests/` is the executable spec — per-group API and numerical-reference

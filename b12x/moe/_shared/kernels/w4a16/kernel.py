@@ -10566,6 +10566,10 @@ def _w4a16_fused_moe_launch_flat(
     )
 
 
+def _w4a16_reserved_sms() -> int:
+    return max(0, int(os.getenv("B12X_W4A16_RESERVE_SMS", "0") or 0))
+
+
 def _w4a16_fused_persistent_grid_x(
     *,
     fused: W4A16FusedMoeCompileResult,
@@ -10590,7 +10594,12 @@ def _w4a16_fused_persistent_grid_x(
     barrier never deadlocks. Falls back to the default for the route-pack path
     where the host cannot know route_blocks ahead of the launch.
     """
-    cap = int(sms) * int(fused.blocks_per_sm)
+    # B12X_W4A16_RESERVE_SMS keeps that many SMs out of the persistent grid
+    # so one-block kernels of a concurrently issued stream (for example the
+    # PCIe ring's flag waits and adds under a compute/communication overlap)
+    # can run while the MoE executes; the prefill plan otherwise pins every
+    # SM's register file for the whole launch. Costs ~N/sms of MoE throughput.
+    cap = max(1, int(sms) - _w4a16_reserved_sms()) * int(fused.blocks_per_sm)
     if _w4a16_small_m_splitk_enabled():
         # Stripe split-K wants the full persistent grid: each small-M FC1
         # column's K range is fanned across many CTAs, so right-sizing the
