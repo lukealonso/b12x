@@ -176,6 +176,22 @@ class MixedTrellisTier(Protocol):
     w2_global_scale: torch.Tensor
 
 
+def _require_modal_t12_table(*kernels: W4A16FusedMoeKernel) -> None:
+    """Mixed-rate launches stage the 4 KiB modal SQG-XOR-Cheb-T12 table only.
+
+    The fused kernel can decode from a 64 KiB single-rate direct table
+    instead; a tier compiled that way would read the modal bytes as the
+    direct table and produce wrong weights, so composition refuses it.
+    """
+    for kernel in kernels:
+        if getattr(kernel, "sqg_xor_cheb_t12_direct_smem", False):
+            raise ValueError(
+                "mixed Trellis tiers must be compiled with "
+                "sqg_xor_cheb_t12_direct_smem=False; the mixed kernel stages "
+                "the modal table only"
+            )
+
+
 class W4A16MixedTrellisKernel:
     """One cooperative grid over two native Trellis bitrates."""
 
@@ -268,6 +284,7 @@ class W4A16MixedTrellisKernel:
             tier0.sqg_xor_cheb_t12_smem_off,
             tier1.sqg_xor_cheb_t12_smem_off,
         )
+        _require_modal_t12_table(driver, tier0, tier1)
 
     @property
     def __cache_key__(self) -> tuple[object, ...]:
@@ -1021,6 +1038,7 @@ class W4A16MixedTrellis3Kernel(W4A16MixedTrellisKernel):
         self.sqg_xor_cheb_t12_smem_off = max(
             tier.sqg_xor_cheb_t12_smem_off for tier in kernels
         )
+        _require_modal_t12_table(*kernels)
 
     @property
     def __cache_key__(self) -> tuple[object, ...]:
@@ -1798,6 +1816,10 @@ def compile_mixed_trellis(
             rotation_input_dtype=rotation_input_dtype,
             broadcast_suh=broadcast_suh,
             schedule_whole_tiles=True,
+            # The mixed kernel stages one 4 KiB modal table shared by every
+            # rate; the 64 KiB direct table is a single-rate slice and is
+            # never staged here, so the tiers must keep the modal decode.
+            sqg_xor_cheb_t12_direct_smem=False,
         )
 
     kernel = W4A16MixedTrellisKernel(
@@ -2060,6 +2082,10 @@ def compile_mixed_trellis3(
             rotation_input_dtype=rotation_input_dtype,
             broadcast_suh=broadcast_suh,
             schedule_whole_tiles=True,
+            # The mixed kernel stages one 4 KiB modal table shared by every
+            # rate; the 64 KiB direct table is a single-rate slice and is
+            # never staged here, so the tiers must keep the modal decode.
+            sqg_xor_cheb_t12_direct_smem=False,
         )
 
     kernel = W4A16MixedTrellis3Kernel(

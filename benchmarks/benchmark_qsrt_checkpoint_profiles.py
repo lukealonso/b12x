@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
-"""Benchmark two real Kimi-K3 QSRT checkpoint profiles on one TP12 rank.
+"""Benchmark real Kimi-K3 QSRT checkpoint profiles on one tensor-parallel rank.
 
 The benchmark compares the complete fused W4A16 MoE path for:
 
 * uniform K2 with coupled activation-boundary Hadamard transforms; and
 * 3.08-bpw K3/K4 coding with ordinary per-matrix Hadamard transforms.
 
-Both profiles are loaded from their canonical tensor-parallel-independent
-atom slabs.  The same input activations, expert routes, route weights, layer,
-TP rank, warmup, and interleaved CUDA-graph timing protocol are used for both
-profiles.  Checkpoint loading and rank-local preparation are outside the
-timed region.
+The default run loads both profiles from their canonical tensor-parallel-
+independent atom slabs. ``--profiles`` can select either profile alone so two
+clean source revisions can be measured independently with the same input,
+routes, weights, layer, TP rank, warmup, and CUDA-graph timing protocol.
+Checkpoint loading and rank-local preparation are outside the timed region.
 """
 
 from __future__ import annotations
@@ -48,7 +48,7 @@ from b12x.moe._shared.kernels.w4a16.btx_compat import (
 
 
 _RESULT_KIND = "b12x_qsrt_real_checkpoint_profile_benchmark"
-_RESULT_SCHEMA_VERSION = 1
+_RESULT_SCHEMA_VERSION = 2
 
 _DEFAULT_K2_ROOT = Path("/data/models/Kimi-K3-QSRT-SQG-XOR-CHEB-T12-K2-v1")
 _DEFAULT_H308_ROOT = Path("/data/models/Kimi-K3-QSRT-SQG-XOR-CHEB-T12-3p08-v2")
@@ -85,7 +85,8 @@ _SHARED_SCALE_BYTES = 3 * _HIDDEN_SIZE * torch.float16.itemsize
 _ROTATION_DRAW_OFFSET = _EXPERTS
 _TOPK = 16
 _ACTIVATION = "situ"
-_TP_SIZE = 12
+_SUPPORTED_TP_SIZES = (8, 12)
+_DEFAULT_TP_SIZE = 12
 
 
 @dataclass(frozen=True)
@@ -99,6 +100,7 @@ class ProfileContract:
     format_code: int
     tile_config: tuple[int, int, int, int]
     coupled_hadamard: bool
+    supported_tp_sizes: tuple[int, ...]
 
 
 _K2 = ProfileContract(
@@ -111,6 +113,7 @@ _K2 = ProfileContract(
     format_code=0x44,
     tile_config=(128, 128, 128, 128),
     coupled_hadamard=True,
+    supported_tp_sizes=(8, 12),
 )
 _H308 = ProfileContract(
     label="legacy_3p08_k34",
@@ -125,8 +128,10 @@ _H308 = ProfileContract(
     format_code=0x33,
     tile_config=(64, 256, 64, 256),
     coupled_hadamard=False,
+    supported_tp_sizes=(12,),
 )
 _CONTRACTS = (_K2, _H308)
+_CONTRACT_BY_LABEL = {contract.label: contract for contract in _CONTRACTS}
 
 
 @dataclass(frozen=True)
@@ -157,6 +162,11 @@ def _sha256(path: Path) -> str:
         for chunk in iter(lambda: handle.read(8 << 20), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _tensor_sha256(tensor: torch.Tensor) -> str:
+    payload = tensor.detach().contiguous().view(torch.uint8).cpu().numpy().tobytes()
+    return hashlib.sha256(payload).hexdigest()
 
 
 def _source_sha256() -> str:
@@ -206,6 +216,22 @@ def _parse_positive_list(value: str) -> tuple[int, ...]:
     ):
         raise argparse.ArgumentTypeError("batch sizes must be unique positive integers")
     return result
+
+
+def _validate_profile_tp_size(
+    contracts: Sequence[ProfileContract], tp_size: int
+) -> None:
+    incompatible = [
+        contract
+        for contract in contracts
+        if tp_size not in contract.supported_tp_sizes
+    ]
+    if incompatible:
+        details = ", ".join(
+            f"{contract.label} supports {contract.supported_tp_sizes}"
+            for contract in incompatible
+        )
+        raise ValueError(f"tensor-parallel size {tp_size} is incompatible: {details}")
 
 
 def _balanced_atom_partition(shard_count: int, shard_index: int) -> tuple[int, int]:
@@ -402,10 +428,12 @@ def _read_layer_source(
     )
 
 
-def _read_atom_extent(source: LayerSource, *, tp_rank: int) -> tuple[int, torch.Tensor]:
-    first, rows = _balanced_atom_partition(_TP_SIZE, tp_rank)
-    if rows != 8 or first % 8:
-        raise AssertionError("TP12 must own one aligned eight-atom extent")
+def _read_atom_extent(
+    source: LayerSource, *, tp_size: int, tp_rank: int
+) -> tuple[int, torch.Tensor]:
+    first, rows = _balanced_atom_partition(tp_size, tp_rank)
+    if _ATOM_SLOTS % tp_size or first % rows:
+        raise AssertionError("tensor-parallel ranks must own equal atom extents")
     with safe_open(source.path, framework="pt", device="cpu") as handle:
         atoms = handle.get_slice(_ATOM_TENSOR)[first : first + rows].contiguous()
     if atoms.dtype != torch.uint8 or tuple(atoms.shape) != (
@@ -416,14 +444,23 @@ def _read_atom_extent(source: LayerSource, *, tp_rank: int) -> tuple[int, torch.
     return first, atoms
 
 
-def _prepare_profile(source: LayerSource, *, tp_rank: int, device: torch.device):
+def _prepare_profile(
+    source: LayerSource,
+    *,
+    tp_size: int,
+    tp_rank: int,
+    device: torch.device,
+):
     started = time.perf_counter()
-    first_atom_slot, atoms = _read_atom_extent(source, tp_rank=tp_rank)
+    first_atom_slot, atoms = _read_atom_extent(
+        source, tp_size=tp_size, tp_rank=tp_rank
+    )
+    atom_slots = int(atoms.shape[0])
     read_seconds = time.perf_counter() - started
     extent_bytes = atoms.numel() * atoms.element_size()
     print(
         f"loaded {source.contract.label}: layer={source.layer} "
-        f"atoms={first_atom_slot}:{first_atom_slot + atoms.shape[0]} "
+        f"atoms={first_atom_slot}:{first_atom_slot + atom_slots} "
         f"bytes={extent_bytes / (1 << 20):.1f} MiB "
         f"read={read_seconds:.2f}s"
     )
@@ -464,7 +501,7 @@ def _prepare_profile(source: LayerSource, *, tp_rank: int, device: torch.device)
     )
     return prepared, {
         "first_atom_slot": first_atom_slot,
-        "atom_slots": 8,
+        "atom_slots": atom_slots,
         "extent_bytes": extent_bytes,
         "read_seconds": read_seconds,
         "prepare_seconds": prepare_seconds,
@@ -673,7 +710,20 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--k2-checkpoint", type=Path, default=_DEFAULT_K2_ROOT)
     parser.add_argument("--legacy-checkpoint", type=Path, default=_DEFAULT_H308_ROOT)
+    parser.add_argument(
+        "--profiles",
+        choices=tuple(_CONTRACT_BY_LABEL),
+        nargs="+",
+        default=[contract.label for contract in _CONTRACTS],
+        help="checkpoint profiles to measure; select one for implementation A/B runs",
+    )
     parser.add_argument("--layer", type=int, default=24)
+    parser.add_argument(
+        "--tp-size",
+        type=int,
+        choices=_SUPPORTED_TP_SIZES,
+        default=_DEFAULT_TP_SIZE,
+    )
     parser.add_argument("--tp-rank", type=int, default=0)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument(
@@ -699,12 +749,19 @@ def _parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = _parse_args()
+    if len(set(args.profiles)) != len(args.profiles):
+        raise SystemExit("--profiles entries must be unique")
+    contracts = tuple(_CONTRACT_BY_LABEL[label] for label in args.profiles)
+    try:
+        _validate_profile_tp_size(contracts, args.tp_size)
+    except ValueError as error:
+        raise SystemExit(str(error)) from error
     if args.output is not None and args.output.expanduser().exists():
         raise SystemExit(f"refusing to overwrite benchmark result: {args.output}")
     if not 1 <= args.layer <= 92:
         raise SystemExit("--layer must lie in 1..92")
-    if not 0 <= args.tp_rank < _TP_SIZE:
-        raise SystemExit("--tp-rank must lie in 0..11")
+    if not 0 <= args.tp_rank < args.tp_size:
+        raise SystemExit(f"--tp-rank must lie in 0..{args.tp_size - 1}")
     if (
         args.warmup < 1
         or args.replays < 1
@@ -731,7 +788,7 @@ def main() -> None:
     }
     layer_sources: dict[str, LayerSource] = {}
     artifact_provenance: dict[str, object] = {}
-    for contract in _CONTRACTS:
+    for contract in contracts:
         source, provenance = _read_layer_source(
             profile_roots[contract.label], contract, args.layer
         )
@@ -740,9 +797,12 @@ def main() -> None:
 
     prepared_profiles: dict[str, object] = {}
     preparation: dict[str, object] = {}
-    for contract in _CONTRACTS:
+    for contract in contracts:
         prepared, details = _prepare_profile(
-            layer_sources[contract.label], tp_rank=args.tp_rank, device=device
+            layer_sources[contract.label],
+            tp_size=args.tp_size,
+            tp_rank=args.tp_rank,
+            device=device,
         )
         prepared_profiles[contract.label] = prepared
         preparation[contract.label] = details
@@ -760,16 +820,22 @@ def main() -> None:
             "source_sha256": _source_sha256(),
             "worktree": str(Path(__file__).resolve().parents[1]),
             "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+            "environment": {
+                "B12X_SQG_XOR_CHEB_T12_DIRECT_SMEM": os.environ.get(
+                    "B12X_SQG_XOR_CHEB_T12_DIRECT_SMEM"
+                ),
+                "CUDA_VISIBLE_DEVICES": os.environ.get("CUDA_VISIBLE_DEVICES"),
+            },
             "artifacts": artifact_provenance,
         },
         "contract": {
             "model": "Kimi-K3",
             "layer": args.layer,
-            "tp_size": _TP_SIZE,
+            "tp_size": args.tp_size,
             "tp_rank": args.tp_rank,
             "hidden_size": _HIDDEN_SIZE,
             "global_intermediate_size": _GLOBAL_INTERMEDIATE_SIZE,
-            "local_intermediate_size": _GLOBAL_INTERMEDIATE_SIZE // _TP_SIZE,
+            "local_intermediate_size": _GLOBAL_INTERMEDIATE_SIZE // args.tp_size,
             "num_experts": _EXPERTS,
             "top_k": _TOPK,
             "activation": _ACTIVATION,
@@ -785,8 +851,9 @@ def main() -> None:
                     "trellis_bits": contract.trellis_bits,
                     "tile_config": list(contract.tile_config),
                     "coupled_hadamard": contract.coupled_hadamard,
+                    "supported_tp_sizes": list(contract.supported_tp_sizes),
                 }
-                for contract in _CONTRACTS
+                for contract in contracts
             },
         },
         "hardware": {
@@ -798,6 +865,7 @@ def main() -> None:
         },
         "parameters": {
             "tokens": list(args.tokens),
+            "profiles": [contract.label for contract in contracts],
             "warmup": args.warmup,
             "hot_replays": args.replays,
             "cold_replays": args.cold_replays,
@@ -814,21 +882,26 @@ def main() -> None:
         resolve_l2_flush_bytes(args.l2_flush_bytes) if args.cold_replays else 0
     )
     print(
-        f"device={properties.name} layer={args.layer} tp={_TP_SIZE} "
+        f"device={properties.name} layer={args.layer} tp={args.tp_size} "
         f"rank={args.tp_rank} H={_HIDDEN_SIZE} "
-        f"I_local={_GLOBAL_INTERMEDIATE_SIZE // _TP_SIZE} "
+        f"I_local={_GLOBAL_INTERMEDIATE_SIZE // args.tp_size} "
         f"E={_EXPERTS} topk={_TOPK}"
     )
-    print(
-        "tokens  cache  uniform-K2 coupled   legacy 3.08 K3/K4   K2/legacy   legacy/K2"
-    )
+    compare_profiles = len(contracts) == 2
+    if compare_profiles:
+        print(
+            "tokens  cache  uniform-K2 coupled   legacy 3.08 K3/K4   "
+            "K2/legacy   legacy/K2"
+        )
+    else:
+        print(f"tokens  cache  {contracts[0].label}")
 
     for case_index, tokens in enumerate(args.tokens):
         source, topk_ids, topk_weights = _make_inputs(
             tokens, seed=args.seed + 1009 * tokens, device=device
         )
         captured: dict[str, CapturedCase] = {}
-        for contract in _CONTRACTS:
+        for contract in contracts:
             captured[contract.label] = _capture_case(
                 prepared_profiles[contract.label],
                 source=source,
@@ -850,11 +923,15 @@ def main() -> None:
             if args.cold_replays
             else None
         )
-        hot_ratio = _paired_ratio_bootstrap(
-            hot[_K2.label],
-            hot[_H308.label],
-            replicates=args.bootstrap_replicates,
-            seed=args.seed + case_index,
+        hot_ratio = (
+            _paired_ratio_bootstrap(
+                hot[_K2.label],
+                hot[_H308.label],
+                replicates=args.bootstrap_replicates,
+                seed=args.seed + case_index,
+            )
+            if compare_profiles
+            else None
         )
         cold_ratio = (
             _paired_ratio_bootstrap(
@@ -863,26 +940,37 @@ def main() -> None:
                 replicates=args.bootstrap_replicates,
                 seed=args.seed + 100 + case_index,
             )
-            if cold is not None
+            if compare_profiles and cold is not None
             else None
         )
-        k2_median = statistics.median(hot[_K2.label])
-        h308_median = statistics.median(hot[_H308.label])
-        print(
-            f"{tokens:>6}  hot   {k2_median:>13.3f} us   "
-            f"{h308_median:>13.3f} us   "
-            f"{k2_median / h308_median:>8.4f}x   "
-            f"{h308_median / k2_median:>8.4f}x"
-        )
-        if cold is not None:
-            k2_cold_median = statistics.median(cold[_K2.label])
-            h308_cold_median = statistics.median(cold[_H308.label])
+        if compare_profiles:
+            k2_median = statistics.median(hot[_K2.label])
+            h308_median = statistics.median(hot[_H308.label])
             print(
-                f"{tokens:>6}  cold  {k2_cold_median:>13.3f} us   "
-                f"{h308_cold_median:>13.3f} us   "
-                f"{k2_cold_median / h308_cold_median:>8.4f}x   "
-                f"{h308_cold_median / k2_cold_median:>8.4f}x"
+                f"{tokens:>6}  hot   {k2_median:>13.3f} us   "
+                f"{h308_median:>13.3f} us   "
+                f"{k2_median / h308_median:>8.4f}x   "
+                f"{h308_median / k2_median:>8.4f}x"
             )
+            if cold is not None:
+                k2_cold_median = statistics.median(cold[_K2.label])
+                h308_cold_median = statistics.median(cold[_H308.label])
+                print(
+                    f"{tokens:>6}  cold  {k2_cold_median:>13.3f} us   "
+                    f"{h308_cold_median:>13.3f} us   "
+                    f"{k2_cold_median / h308_cold_median:>8.4f}x   "
+                    f"{h308_cold_median / k2_cold_median:>8.4f}x"
+                )
+        else:
+            label = contracts[0].label
+            print(
+                f"{tokens:>6}  hot   {statistics.median(hot[label]):>13.3f} us"
+            )
+            if cold is not None:
+                print(
+                    f"{tokens:>6}  cold  "
+                    f"{statistics.median(cold[label]):>13.3f} us"
+                )
 
         case: dict[str, object] = {
             "tokens": tokens,
@@ -898,34 +986,47 @@ def main() -> None:
                         torch.count_nonzero(captured[contract.label].eager_output)
                     ),
                     "eager_graph_exact": True,
+                    "output_sha256": _tensor_sha256(
+                        captured[contract.label].eager_output
+                    ),
                 }
-                for contract in _CONTRACTS
+                for contract in contracts
             },
-            "output_comparison": _output_comparison(
-                captured[_K2.label].eager_output,
-                captured[_H308.label].eager_output,
+            "output_comparison": (
+                _output_comparison(
+                    captured[_K2.label].eager_output,
+                    captured[_H308.label].eager_output,
+                )
+                if compare_profiles
+                else None
             ),
             "hot": {
                 "samples_us": hot,
                 "summary": {name: _summary(values) for name, values in hot.items()},
                 "uniform_k2_to_legacy_time_ratio": hot_ratio,
-                "legacy_over_uniform_k2_speedup": 1.0
-                / float(hot_ratio["point_estimate"]),
+                "legacy_over_uniform_k2_speedup": (
+                    1.0 / float(hot_ratio["point_estimate"])
+                    if hot_ratio is not None
+                    else None
+                ),
             },
             "cold": None,
         }
-        if cold is not None and cold_ratio is not None:
+        if cold is not None:
             case["cold"] = {
                 "samples_us": cold,
                 "summary": {name: _summary(values) for name, values in cold.items()},
                 "uniform_k2_to_legacy_time_ratio": cold_ratio,
-                "legacy_over_uniform_k2_speedup": 1.0
-                / float(cold_ratio["point_estimate"]),
+                "legacy_over_uniform_k2_speedup": (
+                    1.0 / float(cold_ratio["point_estimate"])
+                    if cold_ratio is not None
+                    else None
+                ),
             }
         result["cases"].append(case)
 
         if args.profile_kernels and case_index == 0:
-            for contract in _CONTRACTS:
+            for contract in contracts:
                 with torch.profiler.profile(
                     activities=[torch.profiler.ProfilerActivity.CUDA]
                 ) as profile:
