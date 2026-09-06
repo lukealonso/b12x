@@ -106,12 +106,14 @@ def test_cooperative_merge_preserves_order_bitwise_under_changed_graph_inputs(
                 )
 
             launch(1, 64)
+            warmed = tuple(implementation._MERGE_CACHE.items())
             freeze_kernel_resolution("cooperative QSA merge live rows/splits")
             for rows, splits in geometries:
                 graph = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(graph):
                     launch(rows, splits)
                 graphs[label, rows, splits] = graph
+            assert tuple(implementation._MERGE_CACHE.items()) == warmed
             unfreeze_kernel_resolution()
         for rows, splits in geometries:
             partials, lse, output = buffers[rows, splits]
@@ -120,9 +122,22 @@ def test_cooperative_merge_preserves_order_bitwise_under_changed_graph_inputs(
                 lse.normal_()
                 lse[:, 1::3] = -torch.inf
                 lse[0, :, 0] = -torch.inf
-                graphs["serial", rows, splits].replay()
+                pointers = tuple(t.data_ptr() for t in (partials, lse, output))
+
+                def replay(label):
+                    output.fill_(float("nan"))
+                    torch.cuda.synchronize()
+                    before = torch.cuda.memory_stats()
+                    graphs[label, rows, splits].replay()
+                    torch.cuda.synchronize()
+                    after = torch.cuda.memory_stats()
+                    for key in ("allocation.all.allocated", "allocated_bytes.all.allocated"):
+                        assert after[key] == before[key]
+                    assert tuple(t.data_ptr() for t in (partials, lse, output)) == pointers
+
+                replay("serial")
                 expected = output.clone()
-                graphs["cooperative", rows, splits].replay()
+                replay("cooperative")
                 torch.testing.assert_close(output, expected, rtol=0, atol=0)
                 assert torch.count_nonzero(output[0, 0]) == 0
                 assert torch.count_nonzero(output[:rows, -1]) > 0
@@ -205,6 +220,72 @@ def test_split_prewarm_matches_planned_selection_capacity(selection_width: int) 
     finally:
         unfreeze_kernel_resolution()
         implementation.clear_caches()
+
+
+@pytest.mark.parametrize("kv_dtype", [torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.parametrize("live_counts", [(1, 4), (65, 66)])
+def test_planned_selection_capacity_consumes_tail_with_frozen_graph_replay(
+    kv_dtype: torch.dtype,
+    live_counts: tuple[int, int],
+) -> None:
+    from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
+    from b12x.attention.paged import _selected_forward as implementation
+
+    device = require_sm120()
+    capacity, heads, width, splits = max(live_counts), 6, 2055, 64
+    query = torch.zeros((capacity, heads, 256), device=device, dtype=torch.bfloat16)
+    cache = torch.zeros((1, 16, 1, 256), device=device).to(kv_dtype)
+    cache[0, 0].copy_(torch.full((1, 256), 0.5, device=device).to(kv_dtype))
+    cache[0, 1].copy_(torch.full((1, 256), 1.0, device=device).to(kv_dtype))
+    selected = torch.full((capacity, width), -1, device=device, dtype=torch.int32)
+    selected[:, -1] = 0
+    block_table = torch.zeros((1, 1), device=device, dtype=torch.int32)
+    request_ids = torch.zeros(capacity, device=device, dtype=torch.int64)
+    positions = torch.ones(capacity, device=device, dtype=torch.int64)
+    output = torch.empty_like(query)
+    partials = torch.empty((capacity, splits, heads, 256), device=device)
+    lse = torch.empty((capacity, splits, heads), device=device)
+    descale = torch.ones(1, device=device) if kv_dtype == torch.float8_e4m3fn else None
+    buffers = (query, cache, selected, output, partials, lse)
+    pointers = tuple(t.data_ptr() for t in buffers)
+
+    def launch(rows):
+        return launch_sparse_paged_gqa(
+            query=query[:rows], key_cache=cache, value_cache=cache,
+            k_descale=descale, v_descale=descale, block_table=block_table,
+            request_ids=request_ids[:rows], selected_positions=selected[:rows],
+            query_positions=positions[:rows], output=output[:rows],
+            partial_output=partials[:rows], partial_lse=lse[:rows],
+            softmax_scale=1 / 16, block_n=16, splits=splits,
+        )
+
+    launch(live_counts[0])
+    warmed = tuple(implementation._KERNEL_CACHE.items())
+    warmed_merge = tuple(implementation._MERGE_CACHE.items())
+    freeze_kernel_resolution("QSA fixed selected-position capacity across live rows")
+    try:
+        for rows in live_counts:
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                launch(rows)
+            for position, value in ((0, 0.5), (1, 1.0)):
+                selected[:, -1] = position
+                output.fill_(float("nan"))
+                partials.fill_(float("nan"))
+                lse.fill_(float("nan"))
+                torch.cuda.synchronize()
+                before = torch.cuda.memory_stats()
+                graph.replay()
+                torch.cuda.synchronize()
+                after = torch.cuda.memory_stats()
+                for key in ("allocation.all.allocated", "allocated_bytes.all.allocated"):
+                    assert after[key] == before[key]
+                assert tuple(t.data_ptr() for t in buffers) == pointers
+                assert torch.all(output[:rows] == value)
+                assert tuple(implementation._KERNEL_CACHE.items()) == warmed
+                assert tuple(implementation._MERGE_CACHE.items()) == warmed_merge
+    finally:
+        unfreeze_kernel_resolution()
 
 
 def test_qsa_caps_do_not_gate_architecture_or_tensor_parallel_layout() -> None:

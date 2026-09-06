@@ -414,6 +414,9 @@ def _dense_gemm_policy_for(
     generalize_mxfp8_split_k: bool = False,
     generalize_block_fp8_split_k: bool = False,
 ) -> _DenseGemmPolicy:
+    # A declared row bound owns scheduling as well as tile and unroll tuning.
+    if expected_m is not None:
+        m = expected_m
     max_active_clusters = _max_active_clusters_for(cluster_shape_mn, sm_count)
     tile_m, tile_n = mma_tiler_mn
     one_work_tile_per_cta = ((m + tile_m - 1) // tile_m) * (
@@ -6203,7 +6206,7 @@ def dense_gemm_fused_quant_a_grouped(
         int(head_dim),
         int(nope_dim),
         int(rope_dim),
-        m == 1,
+        (expected_m if expected_m is not None else m) == 1,
         positions_dtype,
         cos_sin_dtype,
     )
@@ -7659,7 +7662,7 @@ def dense_gemm_fused_quant_a(
         rhs_values_tiled is not None,
         a_inner_span,
         kernel_c_l,
-        m == 1,
+        (expected_m if expected_m is not None else m) == 1,
     )
     compiled(
         source,

@@ -1279,7 +1279,7 @@ def precompile_sparse_gqa_split(
     key_cache: torch.Tensor,
     value_cache: torch.Tensor,
     request_ids: torch.Tensor,
-    selection_width: int,
+    selection_width: int = _SELECTION_WIDTH,
 ) -> None:
     """Compile the caller's planned selection capacity without storage writes."""
     with torch.cuda.device(query.device):
