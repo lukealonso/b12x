@@ -905,9 +905,19 @@ def test_standard_moe_external_route_plan_live_graph_oracle(
 
 def test_standard_moe_glm53_tp4_nvfp4_live_graph_replay(
     monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
 ) -> None:
-    """Replay the GLM-5.3 TP4 NVFP4 expert geometry in a CUDA graph."""
+    """Replay 42 bindings with GLM-5.3 TP4-local NVFP4 expert dimensions.
 
+    One synthetic weight set with 288 experts, hidden width 4096, and local
+    intermediate width 512 backs independent inputs and outputs. All bindings
+    share scratch and run sequentially in one captured graph.
+    """
+
+    from b12x._lib.runtime_control import (
+        freeze_kernel_resolution,
+        unfreeze_kernel_resolution,
+    )
     from b12x.moe.fused_moe._impl import b12x_moe_fp4
 
     num_experts = 288
@@ -993,6 +1003,8 @@ def test_standard_moe_glm53_tp4_nvfp4_live_graph_replay(
     assert all(
         bool(binding.output.float().isfinite().all().item()) for binding in bindings
     )
+    request.addfinalizer(unfreeze_kernel_resolution)
+    freeze_kernel_resolution("GLM-shaped MoE capture and live replay")
 
     graph = torch.cuda.CUDAGraph()
     capture_stream = torch.cuda.Stream()
@@ -1071,14 +1083,21 @@ def test_standard_moe_glm53_tp4_nvfp4_live_graph_replay(
 
 def test_standard_moe_glm53_tp4_nvfp4_multishape_graph_replay(
     monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
 ) -> None:
     """Replay token widths 8 through 128 against one shared CUDA workspace.
 
     Each eight-token increment has an independent captured graph. One uint8
-    allocation sized for the widest shape backs every graph's scratch plan at
-    a 256-byte-aligned offset after the caller-owned output reservation.
+    allocation backs every graph's scratch after a 256-byte-aligned reservation
+    of tokens * hidden_size * sizeof(BF16) bytes. Outputs have separate storage.
+    Full and half-active route sets reuse the prewarmed plans with kernel
+    resolution frozen.
     """
 
+    from b12x._lib.runtime_control import (
+        freeze_kernel_resolution,
+        unfreeze_kernel_resolution,
+    )
     from b12x.moe.fused_moe._impl import (
         TPMoEScratchCaps,
         b12x_moe_fp4,
@@ -1217,6 +1236,8 @@ def test_standard_moe_glm53_tp4_nvfp4_multishape_graph_replay(
             (inputs.a, inputs.topk_ids, inputs.topk_weights, output, scratch)
         )
     live_addresses = tuple(tensor.data_ptr() for tensor in live_tensors)
+    request.addfinalizer(unfreeze_kernel_resolution)
+    freeze_kernel_resolution("GLM-shaped MoE replay with full and inactive routes")
 
     for replay_idx in range(3):
         graph_order = (
@@ -1279,8 +1300,6 @@ def test_standard_moe_glm53_tp4_nvfp4_multishape_graph_replay(
                     torch.count_nonzero(inputs.topk_ids[live_tokens:] + 1).item() == 0
                 )
                 assert torch.count_nonzero(output[live_tokens:]).item() == 0
-
-
 
 
 @pytest.mark.parametrize("m", [80, 96])
