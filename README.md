@@ -55,7 +55,9 @@ parallel).
 quantized lookup, and short-convolution state), `sequence.gdn_decode` (packed
 recurrent decode),
 `sequence.mtp_feedback` (MTP token/multi-stream feedback fusion),
-`quantization.{nvfp4,mxfp8}` (row quantizers), and `comm.pcie` (IPC-backed PCIe
+`quantization.{nvfp4,mxfp8}` (row quantizers), `comm.roce` (RoCEnante: one-shot
+RDMA all-reduce/all-gather for multi-node DGX Spark TP, see `docs/rocenante.md`),
+and `comm.pcie` (IPC-backed PCIe
 collectives). The Qwen3.8-Flash-Next QSA, HyperConnection, PLE, GDN decode,
 and MTP feedback Triton implementations are correctness references and are
 not throughput-qualified production kernels.

@@ -3,6 +3,8 @@
 - ``pcie``: collectives for consumer PCIe fabrics (no NVLink) — one-shot and
   DMA/CE-ring all-reduce, FP8-transport two-shot reduce-scatter, and the DCP
   attention all-to-all with fused LSE merge.
+- ``roce`` (RoCEnante): one-shot RDMA all-reduce and all-gather for tensor
+  parallelism across DGX Spark nodes over their ConnectX-7 RoCE ports.
 """
 
 from __future__ import annotations
@@ -10,7 +12,7 @@ from __future__ import annotations
 import importlib
 from typing import Any
 
-_OP_MODULES = ("pcie",)
+_OP_MODULES = ("pcie", "roce")
 
 
 def __getattr__(name: str) -> Any:

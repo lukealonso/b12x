@@ -1,8 +1,4 @@
-"""CuTeDSL Qwen3.8 Flash Next HyperConnection kernels.
-
-The packed combine+norm implementation is the production SM120 path. The
-remaining kernels are direct implementation references for migration work.
-"""
+"""CuTeDSL Qwen3.8 Flash Next HyperConnection kernels."""
 
 from __future__ import annotations
 

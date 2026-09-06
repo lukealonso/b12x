@@ -3252,6 +3252,11 @@ class PagedForwardKernel:
         bf16_minimax_head128_decode = (
             decode_only
             and not self.has_relative_attention_bias
+            and self.page_size == 64
+            and os.environ.get(
+                "B12X_PAGED_BF16_MINIMAX_ROLE_SPECIALIZED", "0"
+            )
+            == "1"
             and dtype_q == cutlass.BFloat16
             and dtype_kv == cutlass.BFloat16
             and dtype_o == cutlass.BFloat16

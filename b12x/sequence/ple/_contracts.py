@@ -15,6 +15,9 @@ from b12x._lib.scratch_layout import (
     dtype_nbytes,
     materialize_scratch_view,
 )
+from b12x.policy import PolicyContext, get_auto_policy
+
+from ._policy import PLE_POLICY, PleQuery
 
 
 def _canonical_device(device: torch.device | str) -> torch.device:
@@ -228,6 +231,7 @@ class LayerPlan:
     caps: LayerCaps
     layout: _LayerScratchLayout
     _scratch_specs: tuple[ScratchBufferSpec, ...]
+    policy_resolution: object | None = None
 
     @property
     def state_length(self) -> int:
@@ -247,8 +251,32 @@ class LayerPlan:
         return bind_layer(self, **kwargs)
 
 
-def plan_layer(caps: LayerCaps) -> LayerPlan:
+def plan_layer(
+    caps: LayerCaps,
+    *,
+    policy: PolicyContext | None = None,
+) -> LayerPlan:
     """Plan fixed-capacity PLE math and state-gather scratch."""
+    if not isinstance(caps, LayerCaps):
+        raise TypeError("caps must be LayerCaps")
+    policy = policy or get_auto_policy(caps.device)
+    if not isinstance(policy, PolicyContext):
+        raise TypeError("policy must be a PolicyContext")
+    policy.require_device(caps.device)
+    resolution = policy.resolve(
+        PLE_POLICY,
+        PleQuery(
+            mode=caps.mode,
+            dtype=str(caps.dtype).removeprefix("torch."),
+            max_tokens=caps.max_tokens,
+            max_seqs=caps.max_seqs,
+            max_speculative_tokens=caps.max_speculative_tokens,
+            streams=caps.streams,
+            hidden_size=caps.hidden_size,
+            kernel_size=caps.kernel_size,
+            dilation=caps.dilation,
+        ),
+    )
     normalized_u_offset_bytes = align_up(0, SCRATCH_ALIGN_BYTES)
     cursor = normalized_u_offset_bytes
     cursor += caps.max_tokens * caps.channels * dtype_nbytes(caps.dtype)
@@ -269,7 +297,12 @@ def plan_layer(caps: LayerCaps) -> LayerPlan:
         error_code_offset_bytes=error_code_offset_bytes,
     )
     spec = scratch_buffer_spec("ple_layer", nbytes=cursor, device=caps.device)
-    return LayerPlan(caps=caps, layout=layout, _scratch_specs=(spec,))
+    return LayerPlan(
+        caps=caps,
+        layout=layout,
+        _scratch_specs=(spec,),
+        policy_resolution=resolution,
+    )
 
 
 def bind_layer(
@@ -491,8 +524,20 @@ def run_prefill(binding: LayerBinding, *, eps: float) -> torch.Tensor:
     return binding.out
 
 
-def run_mixed(binding: LayerBinding, *, eps: float) -> torch.Tensor:
-    """Run packed prefill and decode requests without reordering rows."""
+def run_mixed(
+    binding: LayerBinding, *, eps: float, token_count: int | None = None
+) -> torch.Tensor:
+    """Run packed prefill and decode requests without reordering rows.
+
+    Args:
+        binding: Fixed-capacity inputs, output, and recurrent state.
+        eps: Positive normalization epsilon.
+        token_count: Host launch bound, defaulting to the planned capacity.
+            Device metadata may select fewer tokens during graph replay.
+
+    Returns:
+        The output prefix of length token_count. Rows beyond it are untouched.
+    """
     if binding.plan.caps.mode != "mixed":
         raise ValueError("run_mixed requires a mixed LayerPlan")
     if binding.plan.caps.device.type != "cuda":
@@ -500,10 +545,14 @@ def run_mixed(binding: LayerBinding, *, eps: float) -> torch.Tensor:
     eps_value = float(eps)
     if not math.isfinite(eps_value) or eps_value <= 0:
         raise ValueError(f"eps must be finite and positive, got {eps_value}")
+    if token_count is None:
+        token_count = binding.plan.caps.max_tokens
+    if not 0 <= token_count <= binding.plan.caps.max_tokens:
+        raise ValueError("token_count must fit the planned token capacity")
     from ._kernels import run_layer_mixed_kernels
 
-    run_layer_mixed_kernels(binding, eps=eps_value)
-    return binding.out
+    run_layer_mixed_kernels(binding, eps=eps_value, token_count=token_count)
+    return binding.out[:token_count]
 
 
 __all__ = [

@@ -33,6 +33,8 @@ META = OpMeta(
         "BatchedScratchPlan",
         "BatchedBinding",
         "VarlenPlan",
+        "VarlenAttentionConfig",
+        "VarlenAttentionQuery",
         "VarlenScratchPlan",
         "VarlenBinding",
         "create_plan_batched",

@@ -417,6 +417,56 @@ def test_index_topk_fp8_graph_matches_reference(
     )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("route", ["paged_fused", "paged_tiled"])
+def test_index_topk_fp8_overwrites_every_output_slot(route: str) -> None:
+    device = torch.device("cuda")
+    generator = torch.Generator(device="cpu").manual_seed(91_010)
+    rows, num_heads, width_blocks, topk = 2, 32, 16, 512
+    seqlens = torch.tensor([0, 321], dtype=torch.int32, device=device)
+    page_table = _make_real_page_table(
+        page_starts=[0, 2],
+        seqlens=seqlens.cpu().tolist(),
+        width_blocks=width_blocks,
+        device=device,
+    )
+    q_fp8 = _rand_fp8_q((rows, num_heads, 128), gen=generator, device=device)
+    weights = torch.randn(
+        (rows, num_heads), generator=generator, dtype=torch.float32
+    ).to(device)
+    index_k_cache = pack_paged_index_k_cache_reference(
+        torch.randn((32 * 64, 128), generator=generator, dtype=torch.float32).to(device)
+        / 3
+    )
+    sentinel = 0x5A5A5A5A
+    output = torch.full((rows, topk), sentinel, dtype=torch.int32, device=device)
+    binding = _bind_paged_indexer(
+        device=device,
+        num_heads=num_heads,
+        rows=rows,
+        width_blocks=width_blocks,
+        topk=topk,
+        real_page_table=page_table,
+        seqlens=seqlens,
+        route=route,
+    )
+
+    index_topk_fp8(
+        q_fp8=q_fp8,
+        weights=weights.unsqueeze(-1),
+        index_k_cache=index_k_cache,
+        topk=topk,
+        expected_num_q_heads=num_heads,
+        binding=binding,
+        out_indices=output,
+        supertile_k=512,
+    )
+    torch.cuda.synchronize(device)
+
+    assert not torch.any(output == sentinel)
+    assert torch.all(output[0] == -1)
+
+
 @pytest.mark.skipif(
     not torch.cuda.is_available(), reason="CUDA required for graph capture"
 )

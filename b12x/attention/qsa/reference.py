@@ -142,6 +142,7 @@ def packed_stream_compress_reference(
     *,
     prior_interval_start_position: int,
     num_accepted_tokens: int,
+    is_prefilling: bool = False,
     compress_ratio: int,
     key_norm_weight: torch.Tensor,
     eps: float,
@@ -241,9 +242,9 @@ def packed_stream_compress_reference(
         representatives.append(rope(normalized, first_rope_position))
         group_ids.append(position // int(compress_ratio))
 
-    # Persistent mutation follows all compression reads so a long replacement
-    # interval cannot wrap the ring over accepted history needed by this call.
-    for row in range(rows):
+    # Persistent mutation follows all compression reads. Only the final ring
+    # suffix survives a prefill transaction, and every destination is unique.
+    for row in range(max(0, rows - capacity), rows):
         position = int(logical_positions[row].item())
         slot = position % capacity
         raw_ring[slot].copy_(raw_keys[row])
@@ -258,7 +259,8 @@ def packed_stream_compress_reference(
     else:
         representative_tensor = raw_keys.new_empty((0, head_dim))
         group_id_tensor = logical_positions.new_empty((0,), dtype=torch.int64)
-    return group_id_tensor, representative_tensor, current_first
+    anchor = int(logical_positions[-1].item()) if is_prefilling else current_first
+    return group_id_tensor, representative_tensor, anchor
 
 
 def paged_store_compressed_reference(

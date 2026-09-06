@@ -9,7 +9,6 @@ import b12x.attention.dsa_indexer._impl as indexer_impl
 import b12x.attention._shared.mla.api as sparse_mla_impl
 import b12x.attention._shared.mla.compressed_api as compressed_sparse_mla_impl
 import b12x.attention._shared.mla.kernel as compressed_sparse_mla_kernel
-import b12x.attention.dsa_indexer.paged as paged_indexer_impl
 from b12x.attention._shared.mla.compressed_reference import (
     COMPRESSED_SPARSE_MLA_DSV4_PAGE_SIZE,
     compressed_sparse_mla_page_nbytes,
@@ -260,7 +259,12 @@ def test_indexer_common_plan_selects_sm12x_c4_decode_routes(
     props = type(
         "Props",
         (),
-        {"major": 12, "minor": minor, "multi_processor_count": sm_count},
+        {
+            "major": 12,
+            "minor": minor,
+            "multi_processor_count": sm_count,
+            "name": "test SM12x device",
+        },
     )()
     monkeypatch.setattr(torch.cuda, "get_device_properties", lambda _: props)
 
@@ -531,6 +535,7 @@ def test_indexer_contiguous_scratch_bind_does_not_call_workspace_factory(
 def test_sparse_mla_scratch_plan_exposes_one_opaque_arena_spec() -> None:
     plan = plan_sparse_mla_scratch(
         B12XSparseMLAScratchCaps(
+            softmax_scale=1.0,
             device="cpu",
             num_q_heads=2,
             max_q_rows=4,
@@ -554,6 +559,7 @@ def test_sparse_mla_scratch_plan_exposes_one_opaque_arena_spec() -> None:
 @pytest.mark.parametrize("mode", ["decode", "extend"])
 def test_sparse_mla_scratch_can_expose_head_major_output(mode: str) -> None:
     caps = B12XSparseMLAScratchCaps(
+        softmax_scale=1.0,
         device="cpu",
         num_q_heads=8,
         max_q_rows=6,
@@ -591,6 +597,7 @@ def test_sparse_mla_scratch_bind_does_not_call_workspace_factory(
 ) -> None:
     plan = plan_sparse_mla_scratch(
         B12XSparseMLAScratchCaps(
+            softmax_scale=1.0,
             device="cpu",
             num_q_heads=2,
             max_q_rows=4,

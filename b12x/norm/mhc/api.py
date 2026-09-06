@@ -6,6 +6,7 @@ from ..._lib.gating import default_is_supported
 from ._impl import (
     MHC_DEFAULT_BLOCK_H as DEFAULT_BLOCK_H,
 )
+from ._policy import MhcConfig, MhcQuery
 from ._impl import (
     MHC_DEFAULT_BLOCK_K as DEFAULT_BLOCK_K,
 )
@@ -63,6 +64,8 @@ __all__ = [
     "Caps",
     "Plan",
     "Binding",
+    "MhcConfig",
+    "MhcQuery",
     "plan",
     "bind",
     "run_pre",

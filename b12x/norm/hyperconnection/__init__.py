@@ -26,6 +26,8 @@ META = OpMeta(
         "Caps",
         "Plan",
         "Binding",
+        "HyperConnectionConfig",
+        "HyperConnectionQuery",
         "plan",
         "bind",
         "run_grouped_rmsnorm",
@@ -58,6 +60,8 @@ if TYPE_CHECKING:  # static analysis only; runtime resolution is lazy
     from .api import (  # noqa: F401
         Binding,
         Caps,
+        HyperConnectionConfig,
+        HyperConnectionQuery,
         Plan,
         bind,
         is_supported,

@@ -28,6 +28,8 @@ META = OpMeta(
     entry_points=(
         "Outputs",
         "Plan",
+        "Nvfp4QuantizationConfig",
+        "Nvfp4QuantizationQuery",
         "plan",
         "allocate_outputs",
         "run",
@@ -51,6 +53,8 @@ META = OpMeta(
 
 if TYPE_CHECKING:  # static analysis only; runtime resolution is lazy
     from .api import (  # noqa: F401
+        Nvfp4QuantizationConfig,
+        Nvfp4QuantizationQuery,
         Outputs,
         Plan,
         allocate_outputs,

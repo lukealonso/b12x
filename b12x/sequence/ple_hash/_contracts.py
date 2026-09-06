@@ -14,9 +14,10 @@ from b12x._lib.scratch_layout import (
     dtype_nbytes,
     materialize_scratch_view,
 )
+from b12x.policy import PolicyContext, get_auto_policy
 
+from ._policy import PLE_HASH_POLICY, PleHashQuery
 from .reference import is_prime_64, ple_multipliers, ple_table_geometry
-
 
 _SIGNED_INT64_MAX = (1 << 63) - 1
 
@@ -176,6 +177,7 @@ class Plan:
     padded_vocab_size: int
     layout: _ScratchLayout
     _scratch_specs: tuple[ScratchBufferSpec, ...]
+    policy_resolution: object | None = None
 
     @property
     def head_count(self) -> int:
@@ -265,8 +267,26 @@ def plan(
     prime_sizes: torch.Tensor | None = None,
     table_offsets: torch.Tensor | None = None,
     multipliers: torch.Tensor | None = None,
+    policy: PolicyContext | None = None,
 ) -> Plan:
     """Plan persistent hash geometry and caller-owned runtime scratch."""
+    if not isinstance(caps, Caps):
+        raise TypeError("caps must be Caps")
+    policy = policy or get_auto_policy(caps.device)
+    if not isinstance(policy, PolicyContext):
+        raise TypeError("policy must be a PolicyContext")
+    policy.require_device(caps.device)
+    resolution = policy.resolve(
+        PLE_HASH_POLICY,
+        PleHashQuery(
+            max_tokens=caps.max_tokens,
+            max_seqs=caps.max_seqs,
+            vocab_size=caps.vocab_size,
+            max_order=caps.max_order,
+            heads_per_order=caps.heads_per_order,
+            base_table_size=caps.base_table_size,
+        ),
+    )
     if (prime_sizes is None) != (table_offsets is None):
         raise ValueError("prime_sizes and table_offsets must be provided together")
     if prime_sizes is None:
@@ -307,6 +327,7 @@ def plan(
         padded_vocab_size=padded_vocab_size,
         layout=layout,
         _scratch_specs=(spec,),
+        policy_resolution=resolution,
     )
 
 

@@ -1,5 +1,9 @@
 # b12x Guidance
 
+- Follow the repository's existing CuTe DSL patterns for core compute kernels,
+  including GEMM, attention, and MoE. Use Triton only for minor supporting
+  metadata or packing kernels; do not use it for core compute kernels or their
+  prototypes.
 - Benchmark the real target path before making performance claims. Capture the
   command, commit, worktree, GPU mode, correctness state, raw timings, and
   ratio direction.
@@ -30,6 +34,66 @@
 - Verify the current hardware and skill docs before choosing architecture env
   values. Do not reuse stale arch strings or benchmark leaders without current
   evidence.
+
+## GPU component policy system
+
+The policy layer selects plan-time backends and launch configuration. It does
+not participate in binding or replay. See `docs/gpu-profiles.md` for the
+integrator-facing sequence and `b12x/policy/` for the contracts.
+
+- `b12x/policy/catalog.py` is the authoritative inventory of planned ops. Every
+  built-in op with `api_style="planned"` must have exactly one `PROFILED`
+  registration containing its component ID, runtime policy, and offline
+  generator. Do not introduce an unregistered component-local device heuristic.
+- Each component owns a typed `Query`, typed `Config`, and `ComponentPolicy` in
+  its `_policy.py`. Queries describe immutable model geometry, dtype/layout,
+  recipe, and planned capacity. They must not contain live request values.
+  Configs contain the selected backend and any real launch or planner knobs.
+- A component policy owns `encode_query`, `decode_profile`, `heuristic`, and
+  `validate_config`. Both preplanned and heuristic configs must pass the same
+  validation before a plan may use them. Bump `query_schema_version` when query
+  fields or semantics change; bump `config_schema_version` when serialized
+  config fields or semantics change.
+- Public planning entry points accept `policy: PolicyContext | None`. When it is
+  omitted, synthesize the cached AUTO context with `get_auto_policy()` for the
+  plan's device, verify the context/device match, resolve exactly once during
+  planning, use the typed config, and retain `PolicyResolution` on the plan for
+  provenance. Bind and run paths must not perform policy lookup.
+- Resolution precedence is call override, context override, matching embedded
+  profile entry, then the component heuristic. Unknown devices, missing
+  components, and uncovered queries use the heuristic in AUTO mode. A matching
+  but malformed or invalid embedded entry fails closed; never disguise bad
+  profile data as a heuristic miss. Preserve `HEURISTIC_ONLY` and
+  `PREPLANNED_ONLY` qualification modes.
+- Device profiles match exact normalized `vendor`, `product_name`, compute
+  capability, and SM count. A component entry carries independent query/config
+  schema versions and exactly one planner tree or rule set. Planner nodes are
+  unconditional `leaf`, scalar `exact`, or disjoint inclusive `range` nodes,
+  each with an optional default. The tree determines dispatch coverage;
+  `coverage`, `evidence`, and `source_revision` are audit metadata only.
+- The embedded registry is immutable and must contain exactly the component set
+  registered in the catalog. Provider IDs and schema versions must match their
+  runtime policies. Keep package-embedded profiles compact and validated.
+  Generator checkpoints, full evidence artifacts, probes, and service A/B logs
+  are local working data unless a reviewed change explicitly requires them; do
+  not leave large untracked validation directories in the repository.
+- The top-level generator must discover every registered provider, show the
+  complete work estimate before execution, support component subsets and resume,
+  and run every registered component by default from
+  `scripts/generate_gpu_profile.py`. Multi-candidate components race real
+  production plans; single-implementation components must qualify that path on
+  the GPU before emitting a profile. A completed profile may not contain a
+  zero-measurement or precomputed provider.
+- Resumable discrete sweeps own a positive `candidate_contract_version`. Bump
+  it whenever candidate enumeration or eligibility changes; corpus changes are
+  independently invalidated by case IDs. Fixed-backend probes must expose
+  stable, ordered case IDs, and their checkpoints must bind those IDs to the
+  qualified serialized config.
+- Tests must keep planned-op metadata, catalog registrations, generators, and
+  every embedded profile in lockstep. Cover a recognized GPU resolving to
+  `PREPLANNED`, an unknown synthetic GPU resolving to `HEURISTIC`, invalid
+  matching data failing closed, override precedence, and representative public
+  plan construction for every component.
 
 ## 64-bit addressing for pool-scaled offsets
 

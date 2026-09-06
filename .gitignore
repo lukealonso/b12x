@@ -24,6 +24,7 @@ probe.*.json
 
 .sm120port/
 .sm120port_prefill/
+.b12x-profile-work/
 
 # Internal FP6 rebase validation runbook — kept locally, not for the PR.
 Test_Rebase_FP6.md

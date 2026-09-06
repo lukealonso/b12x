@@ -4,7 +4,10 @@ from b12x.moe._shared.kernels.w4a16.kernel import (
     _TC_DECODE_PACK_SM_COVERAGE_CAP,
     _TC_DECODE_PACK_SM_COVERAGE_DENOMINATOR,
     _TC_DECODE_PACK_SM_COVERAGE_NUMERATOR,
+    _LARGE_BATCH_TILE_CONFIGS,
+    _SMALL_BATCH_TILE_CONFIGS,
     _candidate_tile_fits,
+    _w4a16_num_regs,
     _w4a16_tc_decode_preferred,
 )
 
@@ -47,6 +50,51 @@ def test_wave_balanced_fc2_tile_is_rejected_for_fc1() -> None:
 def test_other_sub64_k_tiles_remain_unsupported() -> None:
     assert not _fits(tile_k=32, tile_n=256, cta_threads=128)
     assert not _fits(tile_k=16, tile_n=512, cta_threads=128)
+
+
+def test_block_48_route_tile_has_a_resource_model() -> None:
+    assert (
+        _w4a16_num_regs(
+            cta_threads=256,
+            cta_m_blocks=3,
+            cta_n_blocks=8,
+            cta_k_blocks=8,
+            uses_m_block_8=False,
+            weight_layout="trellis_t256",
+        )
+        == 255
+    )
+
+
+def test_wide_n_single_route_tile_has_a_resource_model() -> None:
+    assert (
+        _w4a16_num_regs(
+            cta_threads=256,
+            cta_m_blocks=1,
+            cta_n_blocks=16,
+            cta_k_blocks=4,
+            uses_m_block_8=False,
+        )
+        == 255
+    )
+
+
+def test_every_generic_route_tile_has_a_resource_model() -> None:
+    for route_block_size in (8, 16, 32, 48, 64):
+        cta_m_blocks = (route_block_size + 15) // 16
+        configs = (
+            _LARGE_BATCH_TILE_CONFIGS
+            if cta_m_blocks > 1
+            else _SMALL_BATCH_TILE_CONFIGS
+        )
+        for tile_k, tile_n, cta_threads in configs:
+            assert _w4a16_num_regs(
+                cta_threads=cta_threads,
+                cta_m_blocks=cta_m_blocks,
+                cta_n_blocks=tile_n // 16,
+                cta_k_blocks=tile_k // 16,
+                uses_m_block_8=route_block_size == 8,
+            ) > 0
 
 
 def test_tc_decode_planner_keeps_underfilled_direct_route() -> None:

@@ -715,3 +715,299 @@ def test_fused_indexer_paged_direct_k_high_page_id_i64_offsets():
         # to ties at the top-k boundary.
         paired = gold_scores[row].index_select(0, idx[row].long())
         assert torch.allclose(val[row].float(), paired.float(), atol=1e-2, rtol=0)
+
+
+# --- fused_merge policy knob -------------------------------------------------
+
+
+def test_dsa_indexer_config_decodes_legacy_and_knob_profiles() -> None:
+    from b12x.attention.dsa_indexer._policy import (
+        DSA_INDEXER_POLICY,
+        FUSED_MERGE_AUTO,
+        FUSED_MERGE_SERIAL,
+        DsaIndexerConfig,
+        DsaIndexerQuery,
+    )
+    from b12x.policy.types import FrozenMapping
+
+    legacy = DsaIndexerConfig.from_profile(FrozenMapping({"backend": "native"}))
+    assert legacy.fused_merge == FUSED_MERGE_AUTO
+    pinned = DsaIndexerConfig.from_profile(
+        FrozenMapping({"backend": "native", "fused_merge": FUSED_MERGE_SERIAL})
+    )
+    assert pinned.to_dict() == {"backend": "native", "fused_merge": FUSED_MERGE_SERIAL}
+    with pytest.raises(ValueError):
+        DsaIndexerConfig.from_profile(FrozenMapping({"backend": "native", "x": 1}))
+    query = DsaIndexerQuery(
+        source_layout="paged",
+        mode="decode",
+        dtype="bfloat16",
+        kv_dtype="uint8",
+        num_q_heads=32,
+        num_idx_heads=1,
+        max_q_rows=4,
+        max_k_rows=0,
+        top_k=2048,
+        page_size=64,
+        score_mode="dsa",
+        shared_page_table=False,
+    )
+    DSA_INDEXER_POLICY.validate_config(query, pinned, None)
+    with pytest.raises(ValueError):
+        DSA_INDEXER_POLICY.validate_config(
+            query, DsaIndexerConfig(backend="native", fused_merge="fastest"), None
+        )
+    assert DSA_INDEXER_POLICY.heuristic(query, None).fused_merge == FUSED_MERGE_AUTO
+
+
+def test_resolve_fused_merge_threshold_maps_each_choice() -> None:
+    from b12x.attention.dsa_indexer._policy import (
+        FUSED_MERGE_AUTO,
+        FUSED_MERGE_COOPERATIVE,
+        FUSED_MERGE_SERIAL,
+    )
+    from b12x.attention.dsa_indexer.fused_indexer import (
+        _FORCE_LAST_CTA,
+        _resolve_default_merge_threshold,
+        resolve_fused_merge_threshold,
+    )
+
+    common = dict(ctas_per_group=47, num_heads=32, topk=2048)
+    assert resolve_fused_merge_threshold(FUSED_MERGE_COOPERATIVE, **common) == 0
+    assert resolve_fused_merge_threshold(FUSED_MERGE_SERIAL, **common) == _FORCE_LAST_CTA
+    assert resolve_fused_merge_threshold(
+        FUSED_MERGE_AUTO, **common
+    ) == _resolve_default_merge_threshold(**common)
+    assert (
+        resolve_fused_merge_threshold(
+            FUSED_MERGE_COOPERATIVE, ctas_per_group=1, num_heads=32, topk=2048
+        )
+        == _FORCE_LAST_CTA
+    )
+    with pytest.raises(ValueError):
+        resolve_fused_merge_threshold("fastest", **common)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="CUDA required for indexer planning"
+)
+def test_plan_indexer_scratch_applies_policy_fused_merge() -> None:
+    from b12x.attention.dsa_indexer._policy import (
+        DSA_INDEXER,
+        FUSED_MERGE_COOPERATIVE,
+        FUSED_MERGE_SERIAL,
+        DsaIndexerConfig,
+    )
+    from b12x.attention.dsa_indexer.fused_indexer import _FORCE_LAST_CTA
+    from b12x.attention.dsa_indexer.scratch import (
+        INDEXER_PAGED_ROUTE_FUSED,
+        B12XIndexerScratchCaps,
+        plan_indexer_scratch,
+    )
+    from b12x.policy import PolicyContext, PolicyMode
+
+    device = torch.device("cuda")
+    caps = B12XIndexerScratchCaps(
+        device=device,
+        source_layout="paged",
+        num_q_heads=32,
+        max_q_rows=4,
+        topk=2048,
+        max_page_table_width=512,
+        route=INDEXER_PAGED_ROUTE_FUSED,
+    )
+    base = PolicyContext.for_device(device, mode=PolicyMode.HEURISTIC_ONLY)
+    thresholds = {}
+    for choice in (FUSED_MERGE_COOPERATIVE, FUSED_MERGE_SERIAL):
+        policy = base.with_override(
+            DSA_INDEXER, DsaIndexerConfig(backend="native", fused_merge=choice)
+        )
+        plan = plan_indexer_scratch(caps, policy=policy)
+        thresholds[choice] = int(plan.inner.layout.fused_merge_threshold)
+    assert thresholds[FUSED_MERGE_COOPERATIVE] == 0
+    assert thresholds[FUSED_MERGE_SERIAL] == _FORCE_LAST_CTA
+    auto_plan = plan_indexer_scratch(caps, policy=base)
+    assert int(auto_plan.inner.layout.fused_merge_threshold) == 0
+
+
+def test_dsa_indexer_merge_generator_races_both_arms() -> None:
+    from b12x.policy.generation.providers.tunable import (
+        DsaIndexerMergeGenerator,
+        DsaIndexerProfileGenerator,
+        _DsaIndexerMergeSession,
+    )
+
+    generator = DsaIndexerMergeGenerator()
+    cases = generator._cases
+    assert cases and len({case.case_id for case in cases}) == len(cases)
+    scenarios = {case.scenario for case in cases}
+    assert scenarios == {"ctx4k", "ctx32k"}
+    session = _DsaIndexerMergeSession(context=None)
+    candidates = session.candidates(cases[0])
+    assert sorted(dict(c.config)["fused_merge"] for c in candidates) == [
+        "cooperative",
+        "serial",
+    ]
+    composite = DsaIndexerProfileGenerator()
+    assert composite.component_id == generator.component_id
+    assert composite.reviewed_queries()
+
+
+# --- cooperative merge across repeated launches ------------------------------
+
+_SLOT_SENTINEL = 0x5A5A5A5A
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="CUDA required for fused indexer"
+)
+@pytest.mark.parametrize(
+    "rows,heads,topk,seqlen",
+    [(2, 32, 2048, 4096), (3, 64, 512, 8192), (4, 32, 512, 6000)],
+)
+def test_fused_indexer_cooperative_merge_repeated_launches_cover_every_slot(
+    rows, heads, topk, seqlen
+):
+    """Every output slot is written and the group state is restored per launch."""
+    device = torch.device("cuda")
+    q_fp8, weights, k_fp8, k_scales, page_table, seqlens = _build_case(
+        rows, heads, seqlen, topk, seed=77 + rows, device=device
+    )
+    num_sms = torch.cuda.get_device_properties(device).multi_processor_count
+    pack_capacity, state_words = fused_indexer_scratch_capacity(rows, topk, num_sms)
+    pack_values = torch.empty(pack_capacity, dtype=torch.float32, device=device)
+    pack_indices = torch.empty(pack_capacity, dtype=torch.int32, device=device)
+    merge_state = torch.zeros(state_words, dtype=torch.int32, device=device)
+    out_indices = torch.empty((rows, topk), dtype=torch.int32, device=device)
+    out_values = torch.empty((rows, topk), dtype=torch.float32, device=device)
+    gold_values, gold_index_sets = _golden_topk(
+        q_fp8, weights, k_fp8, k_scales, page_table, seqlens, topk
+    )
+    for _launch in range(4):
+        out_indices.fill_(_SLOT_SENTINEL)
+        run_fused_paged_indexer(
+            q_bytes=q_fp8.view(torch.uint8),
+            weights=weights,
+            k_quant_bytes=k_fp8.view(torch.uint8).contiguous(),
+            k_scales=k_scales,
+            real_page_table=page_table,
+            seqlens=seqlens,
+            num_heads=heads,
+            topk=topk,
+            out_indices=out_indices,
+            out_values=out_values,
+            merge_threshold=0,
+            pack_values=pack_values,
+            pack_indices=pack_indices,
+            merge_state=merge_state,
+            merge_state_preinitialized=True,
+        )
+        torch.cuda.synchronize(device)
+        assert not torch.any(out_indices == _SLOT_SENTINEL)
+        fused_sorted = torch.sort(out_values, dim=1, descending=True).values
+        assert torch.allclose(fused_sorted, gold_values, atol=1e-2, rtol=0)
+        for row in range(rows):
+            assert set(out_indices[row].tolist()) == gold_index_sets[row]
+        assert int(merge_state.abs().sum()) == 0
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="CUDA required for fused indexer"
+)
+def test_fused_indexer_cooperative_pack_path_pads_absent_slots_across_launches():
+    """Rows with fewer candidates than top-k pack every candidate and pad the rest."""
+    device = torch.device("cuda")
+    rows, heads, topk, seqlen = 2, 32, 2048, 1500
+    q_fp8, weights, k_fp8, k_scales, page_table, seqlens = _build_case(
+        rows, heads, seqlen, topk, seed=91, device=device
+    )
+    seqlens[1] = 700
+    num_sms = torch.cuda.get_device_properties(device).multi_processor_count
+    pack_capacity, state_words = fused_indexer_scratch_capacity(rows, topk, num_sms)
+    pack_values = torch.empty(pack_capacity, dtype=torch.float32, device=device)
+    pack_indices = torch.empty(pack_capacity, dtype=torch.int32, device=device)
+    merge_state = torch.zeros(state_words, dtype=torch.int32, device=device)
+    out_indices = torch.empty((rows, topk), dtype=torch.int32, device=device)
+    out_values = torch.empty((rows, topk), dtype=torch.float32, device=device)
+    for _launch in range(4):
+        out_indices.fill_(_SLOT_SENTINEL)
+        run_fused_paged_indexer(
+            q_bytes=q_fp8.view(torch.uint8),
+            weights=weights,
+            k_quant_bytes=k_fp8.view(torch.uint8).contiguous(),
+            k_scales=k_scales,
+            real_page_table=page_table,
+            seqlens=seqlens,
+            num_heads=heads,
+            topk=topk,
+            out_indices=out_indices,
+            out_values=out_values,
+            merge_threshold=0,
+            pack_values=pack_values,
+            pack_indices=pack_indices,
+            merge_state=merge_state,
+            merge_state_preinitialized=True,
+        )
+        torch.cuda.synchronize(device)
+        assert not torch.any(out_indices == _SLOT_SENTINEL)
+        for row, live in enumerate(seqlens.tolist()):
+            valid = out_indices[row][out_indices[row] >= 0]
+            assert int(valid.numel()) == live
+            assert set(valid.tolist()) == set(range(live))
+            assert int((out_indices[row] == -1).sum()) == topk - live
+            assert torch.isinf(out_values[row][out_indices[row] == -1]).all()
+        assert int(merge_state.abs().sum()) == 0
+
+
+def test_dsa_indexer_profile_generator_merges_qualification_and_race(monkeypatch) -> None:
+    """The composite pins raced winners and keeps the qualified config elsewhere."""
+    from types import SimpleNamespace
+
+    from b12x.attention.dsa_indexer._policy import DSA_INDEXER_POLICY
+    from b12x.policy.generation.reducer import DecisionRecord
+    from b12x.policy.generation.providers.tunable import DsaIndexerProfileGenerator
+    from b12x.policy.serialization import _planner_node
+    from b12x.policy.types import FrozenMapping
+
+    generator = DsaIndexerProfileGenerator()
+    queries = generator.reviewed_queries()
+    raced_query = DSA_INDEXER_POLICY.encode_query(queries[0])
+    race_config = FrozenMapping({"backend": "native", "fused_merge": "serial"})
+    qualified = FrozenMapping({"backend": "native", "fused_merge": "auto"})
+    monkeypatch.setattr(
+        generator._qualification,
+        "qualify",
+        lambda context, *, progress, checkpoints: SimpleNamespace(
+            encoded_config=qualified,
+            evidence={"gpu_measurement_cases": 3},
+            completed_work_units=5,
+        ),
+    )
+    monkeypatch.setattr(
+        generator._race,
+        "race",
+        lambda context, *, progress, checkpoints: SimpleNamespace(
+            records=(DecisionRecord.create(query=raced_query, config=race_config),),
+            coverage={"fused_merge_candidates": ["cooperative", "serial"]},
+            evidence={"gpu_measurement_cases": 2},
+            completed_work_units=7,
+        ),
+    )
+    result = generator.generate(context=None, progress=None, checkpoints=None)
+    assert result.evidence["gpu_measurement_cases"] == 5
+    assert result.completed_work_units == 12
+    coverage = result.component["coverage"]
+    assert coverage["qualified_runtime_queries"] == len(queries)
+    assert coverage["raced_query_points"] == 1
+    planner = _planner_node(result.component["planner"], name="planner")
+    assert planner.lookup(raced_query).config.to_dict() == dict(race_config)
+    # Row counts between raced anchors and unraced layouts take the default
+    # leaf at whichever depth the lookup misses.
+    unraced_rows = dict(raced_query)
+    unraced_rows["max_q_rows"] = int(raced_query["max_q_rows"]) + 1
+    contiguous = dict(raced_query)
+    contiguous["source_layout"] = "contiguous"
+    for query in (unraced_rows, contiguous):
+        leaf = planner.lookup(query)
+        assert leaf is not None and leaf.name == "measured-production-implementation"
+        assert leaf.config.to_dict() == dict(qualified)

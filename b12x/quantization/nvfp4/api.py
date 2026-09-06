@@ -7,7 +7,10 @@ from typing import Callable
 
 import torch
 
+from b12x.policy import PolicyContext, get_auto_policy
+
 from ..._lib.gating import default_is_supported
+from . import META
 from ._impl import (
     BF16ToFP4TMAOutputs as Outputs,
 )
@@ -17,7 +20,11 @@ from ._impl import (
 from ._impl import (
     compile_bf16_to_fp4_tma as _compile,
 )
-from . import META
+from ._policy import (
+    NVFP4_QUANTIZATION_POLICY,
+    Nvfp4QuantizationConfig,
+    Nvfp4QuantizationQuery,
+)
 
 
 @dataclass(frozen=True)
@@ -27,11 +34,39 @@ class Plan:
     m: int
     k: int
     launch: Callable[..., None]
+    policy_resolution: object | None = None
 
 
-def plan(m: int, k: int) -> Plan:
+def plan(
+    m: int,
+    k: int,
+    *,
+    policy: PolicyContext | None = None,
+) -> Plan:
     """Compile the quantizer for (m, k); host-side, cached per shape."""
-    return Plan(m=int(m), k=int(k), launch=_compile(int(m), int(k)))
+    policy = policy or get_auto_policy()
+    if not isinstance(policy, PolicyContext):
+        raise TypeError("policy must be a PolicyContext")
+    if torch.cuda.is_available():
+        policy.require_device(torch.device("cuda", torch.cuda.current_device()))
+    resolution = policy.resolve(
+        NVFP4_QUANTIZATION_POLICY,
+        Nvfp4QuantizationQuery(
+            dtype="bfloat16",
+            rows=int(m),
+            columns=int(k),
+        ),
+    )
+    return Plan(
+        m=int(m),
+        k=int(k),
+        launch=_compile(
+            int(m),
+            int(k),
+            liveness_strategy=resolution.config.liveness_strategy,
+        ),
+        policy_resolution=resolution,
+    )
 
 
 def allocate_outputs(plan: Plan, *, device: torch.device | str = "cuda") -> Outputs:
@@ -55,4 +90,13 @@ def is_supported(device=None) -> bool:
     return default_is_supported(device, requires=META.requires)
 
 
-__all__ = ["Outputs", "Plan", "plan", "allocate_outputs", "run", "is_supported"]
+__all__ = [
+    "Outputs",
+    "Plan",
+    "Nvfp4QuantizationConfig",
+    "Nvfp4QuantizationQuery",
+    "plan",
+    "allocate_outputs",
+    "run",
+    "is_supported",
+]

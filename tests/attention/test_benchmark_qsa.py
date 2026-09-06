@@ -33,7 +33,7 @@ def test_qwen38_profiles_preserve_selector_and_rank_local_gqa_geometry() -> None
     }
 
 
-def test_default_corpus_is_tp2_and_bounds_synthetic_cache_capacity() -> None:
+def test_default_cases_use_tp2_and_bound_synthetic_cache_capacity() -> None:
     args = benchmark_qsa._parse_args([])
     cases = benchmark_qsa._resolve_cases(args)
 
@@ -76,7 +76,31 @@ def test_cli_filters_tp_profiles_rows_and_full_context() -> None:
     }
 
 
-def test_all_profile_alias_and_full_context_corpus_are_explicit() -> None:
+def test_cli_builds_actual_packed_qwen_prefill_geometry() -> None:
+    args = benchmark_qsa._parse_args(
+        [
+            "--profiles",
+            "tp2",
+            "--rows",
+            "1",
+            "--prefill-rows",
+            "3008",
+            "--contexts",
+            "2048,8192",
+        ]
+    )
+    cases = benchmark_qsa._resolve_cases(args)
+    (prefill,) = [case for case in cases if case.kind == "prefill"]
+
+    assert prefill.name == "tp2-prefill-r3008-c8192"
+    assert prefill.request_count == 1
+    assert prefill.positions[0] == 5184
+    assert prefill.positions[-1] == 8191
+    assert prefill.active_sequence_length == 8192
+    assert prefill.rank_prefix_groups == 1296
+
+
+def test_all_profile_alias_and_full_context_cases_are_explicit() -> None:
     args = benchmark_qsa._parse_args(
         ["--profiles", "all", "--contexts", "2048,8192,32768,131072,full"]
     )
@@ -112,6 +136,28 @@ def test_cache_estimate_uses_disjoint_main_kv_and_scales_state_by_request() -> N
     assert fp8_bytes["raw_state"] == one_bytes["raw_state"]
     assert many.compressed_page_size == 4
     assert many.compressed_pages_per_request == 512
+
+
+def test_planned_capacity_is_independent_of_live_prefill_shape() -> None:
+    case = benchmark_qsa.BenchmarkCase(
+        benchmark_qsa.PROFILES["tp1"],
+        6_016,
+        32_768,
+        kind="prefill",
+        main_page_size=3_008,
+        planned_max_batch=4,
+        planned_max_q_rows=6_019,
+        planned_max_speculative_tokens=3,
+    )
+
+    assert case.request_count == 1
+    assert case.planned_batch == 4
+    assert case.planned_q_rows == 6_019
+    assert case.max_speculative_tokens == 0
+    assert case.planned_speculative_tokens == 3
+    assert case.main_pages_total == 11
+    assert case.main_pages_capacity == 44
+    assert case.compressed_pages_capacity == 44
 
 
 def test_disjoint_main_page_tables_have_unique_request_ranges() -> None:
@@ -268,7 +314,7 @@ def test_benchmark_calls_only_the_public_qsa_lifecycle() -> None:
     )
 
 
-def test_sparse_gqa_has_no_triton_alternate() -> None:
+def test_sparse_gqa_implementation_modules_are_imported_lazily() -> None:
     repository = Path(benchmark_qsa.__file__).resolve().parents[1]
     source = textwrap.dedent(
         """
@@ -278,12 +324,15 @@ def test_sparse_gqa_has_no_triton_alternate() -> None:
         from b12x.attention.qsa import _sparse_gqa
 
         cute_module = "b12x.attention.qsa._sparse_gqa_cute"
+        selected_paged_module = "b12x.attention.paged._selected_forward"
         assert cute_module not in sys.modules
+        assert selected_paged_module not in sys.modules
         source = inspect.getsource(_sparse_gqa).lower()
-        assert "triton" not in source
         assert "_cute_is_candidate" in source
+        assert "launch_selected_paged_gqa_direct" in source
         assert "notimplementederror" in source
         assert cute_module not in sys.modules
+        assert selected_paged_module not in sys.modules
         """
     )
 

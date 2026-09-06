@@ -19,12 +19,14 @@ from b12x._lib.scratch_layout import (
     dtype_nbytes,
     materialize_scratch_view,
 )
+from b12x.policy import PolicyContext, get_auto_policy
 
 from ._cute_prefill_config import (
     QWEN_HIDDEN_SIZE,
     QWEN_STREAMS,
     projection_capacity_rows,
 )
+from ._policy import MTP_FEEDBACK_POLICY, MtpFeedbackQuery
 
 
 def _canonical_device(device: torch.device | str) -> torch.device:
@@ -39,10 +41,6 @@ def _positive(name: str, value: int) -> int:
     if result <= 0:
         raise ValueError(f"{name} must be positive, got {result}")
     return result
-
-
-def _next_power_of_two(value: int) -> int:
-    return 1 << (int(value) - 1).bit_length()
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -91,6 +89,7 @@ class Plan:
     norm_block_h: int
     norm_block_s: int
     norm_num_warps: int
+    policy_resolution: object | None = None
 
     def scratch_specs(self) -> tuple[ScratchBufferSpec, ...]:
         return self._scratch_specs
@@ -142,16 +141,28 @@ class Binding:
     output: torch.Tensor
 
 
-def plan(caps: Caps) -> Plan:
+def plan(caps: Caps, *, policy: PolicyContext | None = None) -> Plan:
     """Plan MTP feedback fusion for a fixed token capacity."""
 
     if not isinstance(caps, Caps):
         raise TypeError(f"caps must be Caps, got {type(caps)!r}")
+    policy = policy or get_auto_policy(caps.device)
+    if not isinstance(policy, PolicyContext):
+        raise TypeError("policy must be a PolicyContext")
+    policy.require_device(caps.device)
+    resolution = policy.resolve(
+        MTP_FEEDBACK_POLICY,
+        MtpFeedbackQuery(
+            dtype=str(caps.dtype).removeprefix("torch."),
+            max_tokens=caps.max_tokens,
+            hidden_size=caps.hidden_size,
+            streams=caps.streams,
+        ),
+    )
     token_projection_rows, state_projection_rows = projection_capacity_rows(
         max_tokens=caps.max_tokens,
         streams=caps.streams,
         hidden_size=caps.hidden_size,
-        device=caps.device,
     )
     h = caps.hidden_size
     s = caps.streams
@@ -172,7 +183,7 @@ def plan(caps: Caps) -> Plan:
         token_projection_rows * h * dtype_nbytes(caps.dtype)
     )
     spec = scratch_buffer_spec("mtp_feedback", nbytes=cursor, device=caps.device)
-    norm_block_h = _next_power_of_two(h)
+    config = resolution.config
     result = Plan(
         caps=caps,
         token_normalized_offset_bytes=token_normalized_offset_bytes,
@@ -182,9 +193,10 @@ def plan(caps: Caps) -> Plan:
         _scratch_specs=(spec,),
         token_projection_rows=token_projection_rows,
         state_projection_rows=state_projection_rows,
-        norm_block_h=norm_block_h,
-        norm_block_s=_next_power_of_two(s),
-        norm_num_warps=8 if norm_block_h >= 2048 else 4,
+        norm_block_h=config.norm_block_h,
+        norm_block_s=config.norm_block_s,
+        norm_num_warps=config.norm_num_warps,
+        policy_resolution=resolution,
     )
     from ._cute_prefill import precompile_mtp_prefill_capacity
 

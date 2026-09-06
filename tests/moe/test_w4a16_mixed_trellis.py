@@ -576,17 +576,45 @@ def test_mixed_k3_k4_matches_serial_and_captures(
 
 
 @pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")
+@pytest.mark.parametrize(
+    (
+        "hidden",
+        "intermediate",
+        "m",
+        "topk",
+        "experts_per_tier",
+        "route_num_experts",
+    ),
+    [
+        pytest.param(128, 128, 2, 3, 2, 6, id="small-single-k-fc2"),
+        pytest.param(128, 256, 2, 3, 2, 6, id="small-multi-k-fc2"),
+        pytest.param(
+            6144,
+            256,
+            4,
+            8,
+            3,
+            256,
+            id="qwen38-flash-next-decode",
+        ),
+    ],
+)
 def test_mixed_k3_k4_k5_matches_serial_and_captures(
+    hidden: int,
+    intermediate: int,
+    m: int,
+    topk: int,
+    experts_per_tier: int,
+    route_num_experts: int,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Validate MCG K5 dispatch and graph replay in the shared mixed grid."""
+    """Validate MCG K5 dispatch, multi-K FC2, and graph replay."""
 
     torch.manual_seed(20260809)
     device = torch.device("cuda", torch.cuda.current_device())
-    m, hidden, intermediate, topk = 2, 128, 128, 3
     tiers = tuple(
         _prepared(
-            experts=2,
+            experts=experts_per_tier,
             hidden=hidden,
             intermediate=intermediate,
             bits=bits,
@@ -596,19 +624,37 @@ def test_mixed_k3_k4_k5_matches_serial_and_captures(
         )
         for bits in (3, 4, 5)
     )
+    total_experts = 3 * experts_per_tier
     x = (torch.randn((m, hidden), device=device) * 1.0e-3).to(torch.bfloat16)
-    topk_ids = torch.tensor(
-        [[0, 2, 4], [5, 3, 1]], dtype=torch.int32, device=device
+    topk_ids = (
+        torch.arange(m * topk, dtype=torch.int32, device=device)
+        .remainder(total_experts)
+        .reshape(m, topk)
     )
-    topk_weights = torch.tensor(
-        [[0.5, 0.3, 0.2], [0.25, 0.25, 0.5]],
-        dtype=torch.float32,
-        device=device,
+    topk_weights = torch.softmax(
+        torch.randn((m, topk), dtype=torch.float32, device=device), dim=-1
     )
-    tier_maps = (
-        torch.tensor([0, 1, -1, -1, -1, -1], dtype=torch.int32, device=device),
-        torch.tensor([-1, -1, 0, 1, -1, -1], dtype=torch.int32, device=device),
-        torch.tensor([-1, -1, -1, -1, 0, 1], dtype=torch.int32, device=device),
+    tier_maps = tuple(
+        torch.cat(
+            (
+                torch.full(
+                    (tier * experts_per_tier,),
+                    -1,
+                    dtype=torch.int32,
+                    device=device,
+                ),
+                torch.arange(
+                    experts_per_tier, dtype=torch.int32, device=device
+                ),
+                torch.full(
+                    ((2 - tier) * experts_per_tier,),
+                    -1,
+                    dtype=torch.int32,
+                    device=device,
+                ),
+            )
+        )
+        for tier in range(3)
     )
     serial = sum(
         (
@@ -618,27 +664,44 @@ def test_mixed_k3_k4_k5_matches_serial_and_captures(
         torch.zeros((m, hidden), dtype=torch.float32, device=device),
     )
     props = torch.cuda.get_device_properties(device)
+    route_slots = max_packed_route_slots(m * topk, 8, route_num_experts)
     launch = compile_mixed_trellis3(
         size_m=m,
         hidden_size=hidden,
         intermediate_size=intermediate,
-        tier0_num_experts=2,
-        tier1_num_experts=2,
-        tier2_num_experts=2,
+        tier0_num_experts=experts_per_tier,
+        tier1_num_experts=experts_per_tier,
+        tier2_num_experts=experts_per_tier,
+        route_num_experts=route_num_experts,
         top_k=topk,
-        max_m_blocks=8,
+        max_m_blocks=(route_slots + 7) // 8,
         sms=int(props.multi_processor_count),
         max_shared_mem=int(props.shared_memory_per_block_optin),
         force_tile_config=(128, 128, 128, 128),
         trellis_codebook="mcg",
     )
+    projection_tiers = tuple(
+        tier for tier in range(3) for _ in range(experts_per_tier)
+    )
     global_to_combined, descriptor = build_projection_tiered_maps(
-        [0, 0, 1, 1, 2, 2],
-        [0, 0, 1, 1, 2, 2],
-        [0, 0, 1, 1, 2, 2],
-        tier_slots=(2, 2, 2),
+        projection_tiers,
+        projection_tiers,
+        projection_tiers,
+        tier_slots=(experts_per_tier,) * 3,
         device=device,
     )
+    if route_num_experts > total_experts:
+        global_to_combined = torch.cat(
+            (
+                global_to_combined,
+                torch.full(
+                    (route_num_experts - total_experts,),
+                    -1,
+                    dtype=torch.int32,
+                    device=device,
+                ),
+            )
+        )
     rotations = combine_trellis_rotations(*tiers)
     buffers = make_mixed_trellis3_buffers(
         launch, device=device, sms=int(props.multi_processor_count)

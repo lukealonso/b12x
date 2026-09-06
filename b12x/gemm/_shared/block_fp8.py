@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import math
 import logging
+import math
 import os
 import time
 from collections.abc import Mapping
@@ -10,16 +10,22 @@ from typing import Iterable, Sequence
 
 import torch
 
-from b12x._lib.utils import cuda_stream_to_int
 from b12x._lib.dense_gemm import (
     dense_gemm,
     dense_gemm_fused_quant_a,
 )
+from b12x._lib.quant.mxfp8_rows import quantize_mxfp8_rows_cute
+from b12x._lib.scratch import (
+    ScratchBufferSpec,
+    scratch_buffer_spec,
+    scratch_tensor,
+)
+from b12x._lib.utils import cuda_stream_to_int
 from b12x.gemm._shared.wo_mxfp8 import (
-    MXFP8Rows,
     MXFP8_SCALE_K_TILE,
     MXFP8_SCALE_ROW_TILE,
     MXFP8_SCALE_VEC_SIZE,
+    MXFP8Rows,
     _check_gpu_tensor,
     _check_mxfp8_k,
     _check_mxfp8_rows_storage,
@@ -28,12 +34,11 @@ from b12x.gemm._shared.wo_mxfp8 import (
     mxfp8_rows_from_bases,
     pack_fp8_block_scaled_weight_mxfp8,
 )
-from b12x._lib.scratch import (
-    ScratchBufferSpec,
-    scratch_buffer_spec,
-    scratch_tensor,
+from b12x.gemm.block_fp8_linear._policy import (
+    BLOCK_FP8_LINEAR_POLICY,
+    BlockFp8LinearQuery,
 )
-from b12x._lib.quant.mxfp8_rows import quantize_mxfp8_rows_cute
+from b12x.policy import PolicyContext, get_auto_policy
 
 logger = logging.getLogger(__name__)
 _B12X_TIMING = (
@@ -69,6 +74,7 @@ class BlockFP8LinearBinding:
     # None keeps the M-independent default; set it at bind time so the warmed
     # kernel matches the regime this binding serves.
     expected_m: int | None = None
+    mma_tiler_mn: tuple[int, int] | None = None
 
     def run(self, *, stream: object = None) -> torch.Tensor:
         return block_fp8_linear_mxfp8(binding=self, stream=stream)
@@ -99,6 +105,8 @@ class BlockFP8LinearScratchCaps:
 class BlockFP8LinearScratchPlan:
     caps: BlockFP8LinearScratchCaps
     _scratch_specs: tuple[ScratchBufferSpec, ...]
+    mma_tiler_mn: tuple[int, int]
+    policy_resolution: object | None = None
 
     def scratch_specs(self) -> tuple[ScratchBufferSpec, ...]:
         return self._scratch_specs
@@ -153,6 +161,7 @@ class BlockFP8LinearScratchPlan:
             output=output,
             bias=bias,
             expected_m=expected_m,
+            mma_tiler_mn=self.mma_tiler_mn,
         )
 
 
@@ -360,6 +369,7 @@ def build_block_fp8_linear_binding(
     output: torch.Tensor,
     bias: torch.Tensor | None = None,
     expected_m: int | None = None,
+    mma_tiler_mn: tuple[int, int] | None = None,
 ) -> BlockFP8LinearBinding:
     if not isinstance(packed_weight, BlockFP8LinearWeight):
         raise TypeError("packed_weight must be a BlockFP8LinearWeight")
@@ -385,18 +395,37 @@ def build_block_fp8_linear_binding(
         output=output,
         bias=bias,
         expected_m=expected_m,
+        mma_tiler_mn=mma_tiler_mn,
     )
 
 
 def plan_block_fp8_linear_scratch(
     caps: BlockFP8LinearScratchCaps,
+    *,
+    policy: PolicyContext | None = None,
 ) -> BlockFP8LinearScratchPlan:
+    if not isinstance(caps, BlockFP8LinearScratchCaps):
+        raise TypeError("caps must be BlockFP8LinearScratchCaps")
+    policy = policy or get_auto_policy(caps.device)
+    if not isinstance(policy, PolicyContext):
+        raise TypeError("policy must be a PolicyContext")
+    policy.require_device(caps.device)
+    resolution = policy.resolve(
+        BLOCK_FP8_LINEAR_POLICY,
+        BlockFp8LinearQuery(
+            max_tokens=caps.max_tokens,
+            in_features=caps.in_features,
+            out_features=caps.out_features,
+            output_dtype=str(caps.output_dtype).removeprefix("torch."),
+        ),
+    )
     layout = _block_fp8_linear_scratch_layout(
         tokens=caps.max_tokens,
         in_features=caps.in_features,
         out_features=caps.out_features,
         output_dtype=caps.output_dtype,
     )
+    config = resolution.config
     return BlockFP8LinearScratchPlan(
         caps=caps,
         _scratch_specs=(
@@ -406,6 +435,8 @@ def plan_block_fp8_linear_scratch(
                 device=caps.device,
             ),
         ),
+        mma_tiler_mn=(config.tile_m, config.tile_n),
+        policy_resolution=resolution,
     )
 
 
@@ -624,6 +655,7 @@ def block_fp8_linear_mxfp8(
     its stored expected_m is used.
     """
 
+    mma_tiler_mn = None
     if binding is not None:
         extras = [
             name
@@ -645,6 +677,7 @@ def block_fp8_linear_mxfp8(
         output_storage = binding.output
         bias = binding.bias
         expected_m = binding.expected_m
+        mma_tiler_mn = binding.mma_tiler_mn
     else:
         x_q_storage = None
         output_storage = None
@@ -710,6 +743,7 @@ def block_fp8_linear_mxfp8(
             packed_weight.weight.scale_mma,
             out=output_storage,
             expected_m=expected_m,
+            mma_tiler_mn=mma_tiler_mn,
             sfb_k_replicated=True,
             stream=stream,
         )[:, :, 0]
@@ -734,6 +768,7 @@ def block_fp8_linear_mxfp8(
         sf_vec_size=MXFP8_SCALE_VEC_SIZE,
         out=output_storage,
         expected_m=expected_m,
+        mma_tiler_mn=mma_tiler_mn,
         sfb_k_replicated=True,
         stream=stream,
     )[:, :, 0]
