@@ -258,12 +258,12 @@ def test_a2a_epoch_change_bumps_both_compile_specs() -> None:
         (
             kernels._get_compiled_lse_reduce_scatter,
             "comm.pcie.dcp_a2a.lse_reduce_scatter",
-            35,
+            36,
         ),
         (
             kernels._get_compiled_all_gather_heads,
             "comm.pcie.dcp_a2a.all_gather_heads",
-            12,
+            13,
         ),
     )
     for launcher, identity, version in identities:
@@ -281,12 +281,18 @@ def test_block_pair_barrier_selects_once_and_keeps_scaled_offsets_int64() -> Non
     assert "for peer in cutlass.range_constexpr(1, world_size):" not in prefix
     assert "for peer in cutlass.range_constexpr(1, world_size):" in body
     assert "peer_signal_address = Int64(signals[peer].toint())" in body
-    assert body.count("_membar_sys()") == 1
+    assert body.count("_membar_sys()") == 2
     assert body.count("_store_relaxed_sys_u32(") == 1
     assert body.count("_load_relaxed_sys_u32(") == 2
     assert "Int64(bidx) * Int64(_MAX_RANKS)" in body
     assert "Int64(tidx) * Int64(_FLAG_STRIDE)" in body
     assert body.index("_membar_sys()") < body.index("cute.arch.load(self_ptr")
+    # The second fence is the push transport's acquire, after the wait only.
+    acquire = body.split("if cutlass.const_expr(acquire):", maxsplit=1)[1]
+    assert acquire.lstrip().startswith("_membar_sys()")
+    assert body.index("while observed != value:") < body.index(
+        "if cutlass.const_expr(acquire):"
+    )
 
 
 def test_graph_slot_delta_encoding_keeps_scaled_offsets_64_bit() -> None:
@@ -317,7 +323,7 @@ def test_lse_log_base_is_a_runtime_kernel_argument() -> None:
     from b12x.comm.pcie import _dcp_a2a_cute as kernels
 
     key = kernels._lse_launcher_key(8, 0, "bf16", 256, True)
-    assert key == (8, 0, "bf16", 256, True)
+    assert key == (8, 0, "bf16", 256, True, False)
     assert "natural_log" in inspect.signature(
         kernels._LseReduceScatterLaunch.__call__
     ).parameters
@@ -478,7 +484,7 @@ def test_graph_lse_prepare_warms_shared_runtime_log_launcher(
 
     runtime.prepare_graph_lse_reduce_scatter(dtype=torch.bfloat16, threads=256)
 
-    assert calls == [(2, 0, "bf16", 256, True)]
+    assert calls == [(2, 0, "bf16", 256, True, False)]
 
 
 @pytest.mark.parametrize("natural_log", [False, True])
@@ -509,7 +515,7 @@ def test_graph_capture_checks_the_shared_runtime_log_launcher(
             is_lse_base_on_e=natural_log,
         )
 
-    assert lookups == [(2, 0, "bf16", 256, True)]
+    assert lookups == [(2, 0, "bf16", 256, True, False)]
 
 
 def test_reference_selects_destination_heads_and_combines_lse_weights():
@@ -1530,3 +1536,312 @@ def test_pool_rejects_channel_rollback_during_capture():
 
     with pool.capture(7), pytest.raises(RuntimeError, match="during capture"):
         pool.rollback_channels(checkpoint)
+
+
+def test_a2a_transport_env_selects_push_and_rejects_unknown(monkeypatch) -> None:
+    from b12x.comm.pcie import pcie_dcp_a2a as module
+
+    monkeypatch.delenv("B12X_PCIE_DCP_A2A_TRANSPORT", raising=False)
+    assert module.a2a_transport() == "pull"
+    assert _make_runtime().transport == "pull"
+    assert not _make_runtime().push_transport
+
+    monkeypatch.setenv("B12X_PCIE_DCP_A2A_TRANSPORT", " Push ")
+    assert module.a2a_transport() == "push"
+    runtime = _make_runtime()
+    assert runtime.transport == "push"
+    assert runtime.push_transport
+
+    monkeypatch.setenv("B12X_PCIE_DCP_A2A_TRANSPORT", "copy_engine")
+    with pytest.raises(ValueError, match="B12X_PCIE_DCP_A2A_TRANSPORT"):
+        module.a2a_transport()
+    with pytest.raises(ValueError, match="B12X_PCIE_DCP_A2A_TRANSPORT"):
+        _make_runtime()
+
+
+def test_push_transport_reaches_graph_prepare_and_capture_checks(monkeypatch) -> None:
+    from b12x.comm.pcie import _dcp_a2a_cute as kernels
+
+    monkeypatch.setenv("B12X_PCIE_DCP_A2A_TRANSPORT", "push")
+    runtime = _make_runtime()
+    calls = []
+    monkeypatch.setattr(
+        "b12x.comm.pcie.pcie_dcp_a2a._is_current_stream_capturing",
+        lambda device: False,
+    )
+    monkeypatch.setattr(torch.cuda, "device", lambda device: nullcontext())
+    monkeypatch.setattr(
+        kernels,
+        "_get_compiled_lse_reduce_scatter",
+        lambda *args: calls.append(args),
+    )
+    monkeypatch.setattr(
+        kernels,
+        "_get_compiled_all_gather_heads",
+        lambda *args: calls.append(args),
+    )
+    runtime.prepare_graph_lse_reduce_scatter(dtype=torch.bfloat16, threads=256)
+    runtime.prepare_graph_all_gather_heads(threads=256)
+    assert calls == [(2, 0, "bf16", 256, True, True), (2, 0, 256, True, True)]
+
+    lookups = []
+    monkeypatch.setattr(
+        "b12x.comm.pcie.pcie_dcp_a2a._is_current_stream_capturing",
+        lambda device: True,
+    )
+    monkeypatch.setattr(
+        kernels,
+        "is_lse_reduce_scatter_prepared",
+        lambda *args: lookups.append(args) or False,
+    )
+    monkeypatch.setattr(
+        kernels,
+        "is_all_gather_heads_prepared",
+        lambda *args: lookups.append(args) or False,
+    )
+    partial_output = torch.zeros(1, 32, 64, dtype=torch.bfloat16)
+    partial_lse = torch.zeros(1, 32, dtype=torch.float32)
+    with pytest.raises(RuntimeError, match="cold PCIe DCP LSE"):
+        runtime.lse_reduce_scatter(partial_output, partial_lse)
+    with pytest.raises(RuntimeError, match="cold PCIe DCP gather"):
+        runtime.all_gather_heads(partial_output[:, :16].contiguous())
+    assert lookups == [(2, 0, "bf16", 256, True, True), (2, 0, 256, True, True)]
+
+
+def test_kernel_wrappers_forward_the_push_flag_to_both_launcher_variants(
+    monkeypatch,
+) -> None:
+    from b12x.comm.pcie import _dcp_a2a_cute as kernels
+
+    compiled = []
+    launched = []
+
+    def fake_compile(*args):
+        compiled.append(args)
+        return lambda *launch_args: launched.append(launch_args)
+
+    monkeypatch.setattr(kernels, "_get_compiled_lse_reduce_scatter", fake_compile)
+    monkeypatch.setattr(kernels, "_get_compiled_all_gather_heads", fake_compile)
+    kernels.lse_reduce_scatter(
+        world_size=2,
+        rank=0,
+        dtype_name="bf16",
+        threads=256,
+        local_output_ptr=16,
+        local_lse_ptr=16,
+        output_ptr=16,
+        staging_ptrs=(16, 32),
+        signal_ptrs=(16, 32),
+        lse_offset=256,
+        batch=1,
+        total_heads=32,
+        head_dim=64,
+        input_stride_batch=256,
+        input_stride_head=8,
+        output_stride_batch=128,
+        output_stride_head=8,
+        natural_log=False,
+        device_slot_selection=False,
+        slot_delta_bytes=256,
+        blocks=1,
+        push=True,
+    )
+    kernels.all_gather_heads(
+        world_size=2,
+        rank=0,
+        threads=256,
+        local_input_ptr=16,
+        output_ptr=16,
+        staging_ptrs=(16, 32),
+        signal_ptrs=(16, 32),
+        batch=1,
+        local_heads=16,
+        head_dim=64,
+        element_size=2,
+        device_slot_selection=True,
+        slot_delta_bytes=256,
+        blocks=1,
+        push=True,
+    )
+    # The eager launch also warms the graph (device slot selection) variant
+    # of the same transport.
+    assert compiled == [
+        (2, 0, "bf16", 256, False, True),
+        (2, 0, "bf16", 256, True, True),
+        (2, 0, 256, True, True),
+    ]
+    assert len(launched) == 2
+
+
+def test_launcher_keys_and_compile_specs_carry_the_transport() -> None:
+    from b12x.comm.pcie import _dcp_a2a_cute as kernels
+
+    assert kernels._lse_launcher_key(2, 0, "bf16", 256, True) == (
+        2, 0, "bf16", 256, True, False,
+    )
+    assert kernels._lse_launcher_key(2, 0, "bf16", 256, True, True)[-1] is True
+    assert kernels._gather_launcher_key(2, 0, 256, True) == (2, 0, 256, True, False)
+    assert kernels._gather_launcher_key(2, 0, 256, True, True)[-1] is True
+    for launcher in (
+        kernels._get_compiled_lse_reduce_scatter,
+        kernels._get_compiled_all_gather_heads,
+    ):
+        labels = inspect.getsource(launcher).split("labels=(", maxsplit=1)[1]
+        assert '"push",' in labels.split(")", maxsplit=1)[0]
+
+
+def test_push_lse_kernel_writes_peers_before_the_barrier_and_reads_locally() -> None:
+    from b12x.comm.pcie import _dcp_a2a_cute as kernels
+
+    source = inspect.getsource(kernels._LseReduceScatterLaunch.kernel)
+    write_phase, read_phase = source.split("block_pair_barrier(", maxsplit=1)
+    push_write = write_phase.split("if cutlass.const_expr(self._push):", 1)[1]
+    push_write = push_write.split("else:", 1)[0]
+    assert "push_row = Int64(self._rank) * Int64(rows) + Int64(row)" in push_write
+    assert "for destination_index in cutlass.range_constexpr(" in push_write
+    assert "Int64(staging[destination].toint()) + slot_offset" in push_write
+    assert "push_row * Int64(packs_per_head) * Int64(16)" in push_write
+    assert "_copy_16b_addr(" in push_write
+    assert "st_global_f32(" in push_write
+    assert "lse_offset + push_row * Int64(4)" in push_write
+    assert "local_stage_words" not in push_write
+    assert "local_stage_lse" not in push_write
+
+    barrier_args = read_phase.split(")", maxsplit=1)[0]
+    assert "acquire=self._push," in barrier_args
+    push_reads = read_phase.split("if cutlass.const_expr(self._push):")[1:]
+    assert len(push_reads) == 2
+    lse_base, payload = push_reads
+    lse_base = lse_base.split("if lane == Int32(source_index):", 1)[0]
+    assert "Int64(staging[self._rank].toint())" in lse_base
+    assert "- source_row" in lse_base
+    assert "Int64(source) * Int64(rows)" in lse_base
+    assert "staging[source]" not in lse_base
+    payload = payload.split("else:", 1)[0]
+    assert "staging[self._rank].toint()," in payload
+    assert "(Int64(source) * Int64(rows) + Int64(row))" in payload
+    assert "* Int64(packs_per_head)" in payload
+    assert "staging[source]" not in payload
+
+
+def test_push_gather_kernel_writes_output_rows_to_peers_and_copies_out_locally() -> None:
+    from b12x.comm.pcie import _dcp_a2a_cute as kernels
+
+    source = inspect.getsource(kernels._AllGatherHeadsLaunch.kernel)
+    write_phase, read_phase = source.split("block_pair_barrier(", maxsplit=1)
+    push_write = write_phase.split("if cutlass.const_expr(self._push):", 1)[1]
+    push_write = push_write.split("else:", 1)[0]
+    assert "push_base = Int64(row) * Int64(packs_per_head)" in push_write
+    assert "Int64(staging[destination].toint())" in push_write
+    assert "pack_offset = (push_base + Int64(pack)) * Int64(16)" in push_write
+    # One local load per pack, one posted store per peer.
+    assert push_write.count("ld_global_v4_u32(") == 1
+    assert push_write.count("st_global_v4_u32(") == 1
+    assert push_write.index("ld_global_v4_u32(") < push_write.index(
+        "for destination_index in cutlass.range_constexpr("
+    )
+    assert "local_stage" not in push_write
+
+    barrier_args = read_phase.split(")", maxsplit=1)[0]
+    assert "acquire=self._push," in barrier_args
+    push_read = read_phase.split("if cutlass.const_expr(self._push):", 1)[1]
+    push_read = push_read.split("else:", 1)[0]
+    assert "if source_rank != Int32(self._rank):" in push_read
+    assert "(local_stage + output_base * Int64(4)).toint()" in push_read
+    assert "staging[source]" not in push_read
+
+
+def _emulate_push_staging(world_size: int, batch: int, heads_per_rank: int, head_dim: int):
+    """Model the push transport's staging addressing on the host.
+
+    Returns, for every rank, the per-source partial tensors and LSE rows that
+    its reduce phase reads back from its own staging (or from its local input
+    for its own rank) and the gathered query tensor its copy-out phase
+    produces, both built with the kernels' index formulas: a writer stores
+    row ``row`` of destination ``d`` at compact row ``self * rows + row`` of
+    ``d``'s staging (LSE at the same compact row), and a gather writer stores
+    output row ``row`` at output position ``row`` of every peer's staging.
+    """
+
+    total_heads = world_size * heads_per_rank
+    rows = batch * heads_per_rank
+    generator = torch.Generator().manual_seed(7)
+    partials = [
+        torch.randn(batch, total_heads, head_dim, generator=generator).to(torch.bfloat16)
+        for _ in range(world_size)
+    ]
+    lses = [torch.randn(batch, total_heads, generator=generator) for _ in range(world_size)]
+    queries = [
+        torch.randn(batch, heads_per_rank, head_dim, generator=generator).to(torch.bfloat16)
+        for _ in range(world_size)
+    ]
+
+    staging = [torch.zeros(world_size * rows, head_dim, dtype=torch.bfloat16) for _ in range(world_size)]
+    staging_lse = [torch.full((world_size * rows,), float("nan")) for _ in range(world_size)]
+    gather_staging = [torch.zeros(batch * total_heads, head_dim, dtype=torch.bfloat16) for _ in range(world_size)]
+    for rank in range(world_size):
+        for row in range(rows):
+            batch_index, local_head = divmod(row, heads_per_rank)
+            push_row = rank * rows + row
+            for destination in range(world_size):
+                if destination == rank:
+                    continue
+                source_head = destination * heads_per_rank + local_head
+                staging[destination][push_row] = partials[rank][batch_index, source_head]
+                staging_lse[destination][push_row] = lses[rank][batch_index, source_head]
+        for row in range(batch * total_heads):
+            batch_index, global_head = divmod(row, total_heads)
+            if global_head // heads_per_rank != rank:
+                continue
+            local_head = global_head - rank * heads_per_rank
+            for destination in range(world_size):
+                if destination != rank:
+                    gather_staging[destination][row] = queries[rank][batch_index, local_head]
+
+    reads = []
+    gathers = []
+    for rank in range(world_size):
+        per_source = torch.empty(world_size, batch, heads_per_rank, head_dim, dtype=torch.bfloat16)
+        per_source_lse = torch.empty(world_size, batch, heads_per_rank)
+        for row in range(rows):
+            batch_index, local_head = divmod(row, heads_per_rank)
+            global_head = rank * heads_per_rank + local_head
+            source_row = batch_index * total_heads + global_head
+            for source in range(world_size):
+                if source == rank:
+                    per_source[source, batch_index, local_head] = partials[rank][batch_index, global_head]
+                    per_source_lse[source, batch_index, local_head] = lses[rank][batch_index, global_head]
+                else:
+                    compact = source * rows + row
+                    # The kernel keeps one shared ``base + source_row`` load per
+                    # lane; the push base pre-subtracts source_row.
+                    lse_index = (compact - source_row) + source_row
+                    per_source[source, batch_index, local_head] = staging[rank][compact]
+                    per_source_lse[source, batch_index, local_head] = staging_lse[rank][lse_index]
+        gathered = torch.empty(batch * total_heads, head_dim, dtype=torch.bfloat16)
+        for row in range(batch * total_heads):
+            batch_index, global_head = divmod(row, total_heads)
+            source_rank, local_head = divmod(global_head, heads_per_rank)
+            if source_rank == rank:
+                gathered[row] = queries[rank][batch_index, local_head]
+            else:
+                gathered[row] = gather_staging[rank][row]
+        reads.append((per_source, per_source_lse))
+        gathers.append(gathered.view(batch, total_heads, head_dim))
+    return partials, lses, queries, reads, gathers
+
+
+@pytest.mark.parametrize("world_size,batch", [(2, 1), (4, 3), (9, 4)])
+def test_push_staging_layout_reassembles_every_peer_row(world_size: int, batch: int) -> None:
+    heads_per_rank = 2
+    head_dim = 16
+    partials, lses, queries, reads, gathers = _emulate_push_staging(
+        world_size, batch, heads_per_rank, head_dim
+    )
+    for rank in range(world_size):
+        per_source, per_source_lse = reads[rank]
+        heads = slice(rank * heads_per_rank, (rank + 1) * heads_per_rank)
+        for source in range(world_size):
+            assert torch.equal(per_source[source], partials[source][:, heads])
+            assert torch.equal(per_source_lse[source], lses[source][:, heads])
+        assert torch.equal(gathers[rank], torch.cat(queries, dim=1))

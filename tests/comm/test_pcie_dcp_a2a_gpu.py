@@ -25,7 +25,8 @@ pytestmark = pytest.mark.skipif(
     reason="set B12X_RUN_PCIE_DCP_A2A_TEST=1 to run PCIe DCP A2A GPU tests",
 )
 
-TOTAL_HEADS = 16
+# 16 heads serve world sizes 2/4/8/16; a multiple of 9 (18, 99) serves 9.
+TOTAL_HEADS = int(os.getenv("B12X_PCIE_DCP_A2A_TEST_TOTAL_HEADS", "16"))
 HEAD_DIM = 512
 QUERY_HEAD_DIM = 576
 MAX_BATCH = 64
@@ -924,8 +925,13 @@ def test_pcie_dcp_a2a_eager_and_cuda_graph_correctness():
     if not torch.cuda.is_available():
         pytest.skip("CUDA is unavailable")
     world_size = int(os.getenv("B12X_PCIE_DCP_A2A_WORLD_SIZE", "2"))
-    if world_size not in (2, 4, 8, 16):
-        pytest.skip("PCIe DCP A2A supports world sizes 2, 4, 8, and 16")
+    if world_size not in (2, 4, 8, 9, 16):
+        pytest.skip("PCIe DCP A2A supports world sizes 2, 4, 8, 9, and 16")
+    if TOTAL_HEADS % world_size:
+        pytest.skip(
+            f"B12X_PCIE_DCP_A2A_TEST_TOTAL_HEADS={TOTAL_HEADS} is not divisible "
+            f"by world size {world_size}"
+        )
     if torch.cuda.device_count() < world_size:
         pytest.skip(
             f"need {world_size} CUDA devices, found {torch.cuda.device_count()}"

@@ -16,6 +16,7 @@ from b12x._lib.compiler import KernelCompileSpec, compile as b12x_compile
 from b12x._lib.intrinsics import (
     fmax_f32,
     ld_global_v4_u32,
+    st_global_f32,
     st_global_v4_u32,
     u32_as_f32,
 )
@@ -340,18 +341,33 @@ def _kimi_sort_desc(keys, count: int) -> None:
         width *= 2
 
 class _DCPA2ABase:
+    """Shared launch state of the DCP exchange kernels.
+
+    ``push`` selects the staging transport of the gather and LSE kernels.
+    With the pull transport (default) a rank writes its whole contribution
+    into its own staging slot and every peer reads the rows it needs over
+    PCIe after the block-pair barrier.  With the push transport a rank writes
+    each peer's rows into that peer's staging slot before the barrier and the
+    reduce/copy-out phase reads local memory only; the per-block barrier and
+    the row-to-warp mapping are the same in both transports, so the block
+    that reads a row is paired with the block that wrote it.  The combine
+    arithmetic does not depend on the transport.
+    """
+
     def __init__(
         self,
         world_size: int,
         rank: int,
         threads: int,
         device_slot_selection: bool,
+        push: bool = False,
     ) -> None:
         self._world_size = int(world_size)
         self._rank = int(rank)
         self._threads = int(threads)
         self._warps_per_block = self._threads // 32
         self._device_slot_selection = bool(device_slot_selection)
+        self._push = bool(push)
 
     @cute.jit
     def _staging_words(self, pointer: cute.Pointer) -> cute.Pointer:
@@ -373,12 +389,14 @@ class _LseReduceScatterLaunch(_DCPA2ABase):
         dtype_name: str,
         threads: int,
         device_slot_selection: bool,
+        push: bool = False,
     ) -> None:
         super().__init__(
             world_size,
             rank,
             threads,
             device_slot_selection,
+            push,
         )
         self._dtype_name = str(dtype_name)
 
@@ -621,33 +639,89 @@ class _LseReduceScatterLaunch(_DCPA2ABase):
         while row < rows:
             batch_index = row // heads_per_rank
             local_head = row - batch_index * heads_per_rank
-            for destination in cutlass.range_constexpr(self._world_size):
-                source_row = (
-                    Int64(batch_index) * Int64(total_heads)
-                    + Int64(destination) * Int64(heads_per_rank)
-                    + Int64(local_head)
-                )
-                input_base = (
-                    Int64(batch_index) * input_stride_batch
-                    + (
-                        Int64(destination) * Int64(heads_per_rank)
+            if cutlass.const_expr(self._push):
+                # Push transport: this warp's row of every peer's heads goes
+                # straight into that peer's staging at the compact row
+                # (self rank, row).  The peer's warp with the same index
+                # reads it after the block-pair barrier.  The local heads are
+                # read from local_output by the reduce phase, so the local
+                # staging is written only by peers.
+                push_row = Int64(self._rank) * Int64(rows) + Int64(row)
+                for destination_index in cutlass.range_constexpr(
+                    1, self._world_size
+                ):
+                    destination = (
+                        self._rank + destination_index
+                    ) % self._world_size
+                    source_row = (
+                        Int64(batch_index) * Int64(total_heads)
+                        + Int64(destination) * Int64(heads_per_rank)
                         + Int64(local_head)
                     )
-                    * input_stride_head
-                )
-                staging_base = source_row * Int64(packs_per_head)
-                pack = lane
-                while pack < packs_per_head:
-                    _copy_16b(
-                        local_output + input_base * Int64(4) + Int64(pack) * Int64(4),
-                        local_stage_words
-                        + staging_base * Int64(4)
-                        + Int64(pack) * Int64(4),
+                    input_base = (
+                        Int64(batch_index) * input_stride_batch
+                        + (
+                            Int64(destination) * Int64(heads_per_rank)
+                            + Int64(local_head)
+                        )
+                        * input_stride_head
                     )
-                    pack += Int32(32)
-                if lane == Int32(0):
-                    value = cute.arch.load(local_lse + source_row, Float32)
-                    cute.arch.store(local_stage_lse + source_row, value)
+                    peer_staging = (
+                        Int64(staging[destination].toint()) + slot_offset
+                    )
+                    peer_words = (
+                        peer_staging
+                        + push_row * Int64(packs_per_head) * Int64(16)
+                    )
+                    pack = lane
+                    while pack < packs_per_head:
+                        _copy_16b_addr(
+                            Int64(
+                                (
+                                    local_output
+                                    + input_base * Int64(4)
+                                    + Int64(pack) * Int64(4)
+                                ).toint()
+                            ),
+                            peer_words + Int64(pack) * Int64(16),
+                        )
+                        pack += Int32(32)
+                    if lane == Int32(0):
+                        value = cute.arch.load(local_lse + source_row, Float32)
+                        st_global_f32(
+                            peer_staging + lse_offset + push_row * Int64(4),
+                            value,
+                        )
+            else:
+                for destination in cutlass.range_constexpr(self._world_size):
+                    source_row = (
+                        Int64(batch_index) * Int64(total_heads)
+                        + Int64(destination) * Int64(heads_per_rank)
+                        + Int64(local_head)
+                    )
+                    input_base = (
+                        Int64(batch_index) * input_stride_batch
+                        + (
+                            Int64(destination) * Int64(heads_per_rank)
+                            + Int64(local_head)
+                        )
+                        * input_stride_head
+                    )
+                    staging_base = source_row * Int64(packs_per_head)
+                    pack = lane
+                    while pack < packs_per_head:
+                        _copy_16b(
+                            local_output
+                            + input_base * Int64(4)
+                            + Int64(pack) * Int64(4),
+                            local_stage_words
+                            + staging_base * Int64(4)
+                            + Int64(pack) * Int64(4),
+                        )
+                        pack += Int32(32)
+                    if lane == Int32(0):
+                        value = cute.arch.load(local_lse + source_row, Float32)
+                        cute.arch.store(local_stage_lse + source_row, value)
             row += warp_stride
 
         block_pair_barrier(
@@ -656,6 +730,7 @@ class _LseReduceScatterLaunch(_DCPA2ABase):
             rank=self._rank,
             world_size=self._world_size,
             max_blocks=_MAX_BLOCKS,
+            acquire=self._push,
         )
 
         row = warp_first
@@ -679,6 +754,21 @@ class _LseReduceScatterLaunch(_DCPA2ABase):
                     + slot_offset
                     + lse_offset
                 )
+                if cutlass.const_expr(self._push):
+                    # The pushed LSE of this row sits in the local staging at
+                    # the compact row (source, row); the shared load below
+                    # adds source_row, so the base pre-subtracts it.
+                    source_lse_base = (
+                        Int64(staging[self._rank].toint())
+                        + slot_offset
+                        + lse_offset
+                        + (
+                            Int64(source) * Int64(rows)
+                            + Int64(row)
+                            - source_row
+                        )
+                        * Int64(4)
+                    )
                 if lane == Int32(source_index):
                     lane_lse_base = source_lse_base
 
@@ -741,10 +831,19 @@ class _LseReduceScatterLaunch(_DCPA2ABase):
                         local_output.toint() + local_base * Int64(16)
                     )
                 else:
-                    source_address = _add_u64_opaque(
-                        staging[source].toint(),
-                        slot_offset + staging_base * Int64(16),
-                    )
+                    if cutlass.const_expr(self._push):
+                        source_address = _add_u64_opaque(
+                            staging[self._rank].toint(),
+                            slot_offset
+                            + (Int64(source) * Int64(rows) + Int64(row))
+                            * Int64(packs_per_head)
+                            * Int64(16),
+                        )
+                    else:
+                        source_address = _add_u64_opaque(
+                            staging[source].toint(),
+                            slot_offset + staging_base * Int64(16),
+                        )
                 payload_row_addresses[source_index] = source_address
             for pack in cutlass.range(
                 lane,
@@ -1025,13 +1124,43 @@ class _AllGatherHeadsLaunch(_DCPA2ABase):
                     (Int64(batch_index) * Int64(local_heads) + Int64(local_head))
                     * Int64(packs_per_head)
                 )
-                pack = lane
-                while pack < packs_per_head:
-                    _copy_16b(
-                        local_input + base * Int64(4) + Int64(pack) * Int64(4),
-                        local_stage + base * Int64(4) + Int64(pack) * Int64(4),
-                    )
-                    pack += Int32(32)
+                if cutlass.const_expr(self._push):
+                    # Push transport: the local row lands in every peer's
+                    # staging at its output position; the peer's warp with
+                    # the same index copies it out after the barrier.  One
+                    # local load feeds the stores to all peers, so a lane
+                    # keeps world_size - 1 posted writes in flight per pack.
+                    push_base = Int64(row) * Int64(packs_per_head)
+                    pack = lane
+                    while pack < packs_per_head:
+                        values = ld_global_v4_u32(
+                            (
+                                local_input
+                                + base * Int64(4)
+                                + Int64(pack) * Int64(4)
+                            ).toint()
+                        )
+                        pack_offset = (push_base + Int64(pack)) * Int64(16)
+                        for destination_index in cutlass.range_constexpr(
+                            1, self._world_size
+                        ):
+                            destination = (
+                                self._rank + destination_index
+                            ) % self._world_size
+                            st_global_v4_u32(
+                                Int64(staging[destination].toint())
+                                + pack_offset,
+                                *values,
+                            )
+                        pack += Int32(32)
+                else:
+                    pack = lane
+                    while pack < packs_per_head:
+                        _copy_16b(
+                            local_input + base * Int64(4) + Int64(pack) * Int64(4),
+                            local_stage + base * Int64(4) + Int64(pack) * Int64(4),
+                        )
+                        pack += Int32(32)
             row += warp_stride
 
         block_pair_barrier(
@@ -1040,6 +1169,7 @@ class _AllGatherHeadsLaunch(_DCPA2ABase):
             rank=self._rank,
             world_size=self._world_size,
             max_blocks=_MAX_BLOCKS,
+            acquire=self._push,
         )
 
         row = warp_first
@@ -1059,15 +1189,23 @@ class _AllGatherHeadsLaunch(_DCPA2ABase):
             source_address = Int64(
                 (local_input + source_base * Int64(4)).toint()
             )
-            for source in cutlass.range_constexpr(self._world_size):
-                if source_rank == Int32(source):
-                    if cutlass.const_expr(source == self._rank):
-                        source_words = local_input
-                    else:
-                        source_words = self._staging_words(staging[source])
+            if cutlass.const_expr(self._push):
+                # Every peer's row was pushed into the local staging at its
+                # output position, so one runtime test picks the address.
+                if source_rank != Int32(self._rank):
                     source_address = Int64(
-                        (source_words + source_base * Int64(4)).toint()
+                        (local_stage + output_base * Int64(4)).toint()
                     )
+            else:
+                for source in cutlass.range_constexpr(self._world_size):
+                    if source_rank == Int32(source):
+                        if cutlass.const_expr(source == self._rank):
+                            source_words = local_input
+                        else:
+                            source_words = self._staging_words(staging[source])
+                        source_address = Int64(
+                            (source_words + source_base * Int64(4)).toint()
+                        )
             output_address = Int64(
                 (output + output_base * Int64(4)).toint()
             )
@@ -1830,6 +1968,7 @@ def _lse_launcher_key(
     dtype_name: str,
     threads: int,
     device_slot_selection: bool,
+    push: bool = False,
 ) -> tuple[object, ...]:
     return (
         int(world_size),
@@ -1837,6 +1976,7 @@ def _lse_launcher_key(
         str(dtype_name),
         int(threads),
         bool(device_slot_selection),
+        bool(push),
     )
 
 
@@ -1846,6 +1986,7 @@ def is_lse_reduce_scatter_prepared(
     dtype_name: str,
     threads: int,
     device_slot_selection: bool,
+    push: bool = False,
 ) -> bool:
     return _lse_launcher_key(
         world_size,
@@ -1853,6 +1994,7 @@ def is_lse_reduce_scatter_prepared(
         dtype_name,
         threads,
         device_slot_selection,
+        push,
     ) in _PREPARED_LSE_LAUNCHERS
 
 
@@ -1863,6 +2005,7 @@ def _get_compiled_lse_reduce_scatter(
     dtype_name: str,
     threads: int,
     device_slot_selection: bool,
+    push: bool = False,
 ) -> Callable:
     launch = _LseReduceScatterLaunch(
         world_size,
@@ -1870,13 +2013,15 @@ def _get_compiled_lse_reduce_scatter(
         dtype_name,
         threads,
         device_slot_selection,
+        push,
     )
-    key = (
-        int(world_size),
-        int(rank),
-        str(dtype_name),
-        int(threads),
-        bool(device_slot_selection),
+    key = _lse_launcher_key(
+        world_size,
+        rank,
+        dtype_name,
+        threads,
+        device_slot_selection,
+        push,
     )
     raise_if_kernel_resolution_frozen("cute.compile", target=launch, cache_key=key)
     p_u32 = _u32_ptr(16, align=4)
@@ -1903,7 +2048,7 @@ def _get_compiled_lse_reduce_scatter(
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key(
             "comm.pcie.dcp_a2a.lse_reduce_scatter",
-            35,
+            36,
             key,
             labels=(
                 "world_size",
@@ -1911,6 +2056,7 @@ def _get_compiled_lse_reduce_scatter(
                 "dtype",
                 "threads",
                 "device_slot_selection",
+                "push",
             ),
         ),
     )
@@ -1964,12 +2110,14 @@ def _gather_launcher_key(
     rank: int,
     threads: int,
     device_slot_selection: bool,
+    push: bool = False,
 ) -> tuple[object, ...]:
     return (
         int(world_size),
         int(rank),
         int(threads),
         bool(device_slot_selection),
+        bool(push),
     )
 
 
@@ -1978,12 +2126,14 @@ def is_all_gather_heads_prepared(
     rank: int,
     threads: int,
     device_slot_selection: bool,
+    push: bool = False,
 ) -> bool:
     return _gather_launcher_key(
         world_size,
         rank,
         threads,
         device_slot_selection,
+        push,
     ) in _PREPARED_GATHER_LAUNCHERS
 
 
@@ -1993,18 +2143,21 @@ def _get_compiled_all_gather_heads(
     rank: int,
     threads: int,
     device_slot_selection: bool,
+    push: bool = False,
 ) -> Callable:
     launch = _AllGatherHeadsLaunch(
         world_size,
         rank,
         threads,
         device_slot_selection,
+        push,
     )
-    key = (
-        int(world_size),
-        int(rank),
-        int(threads),
-        bool(device_slot_selection),
+    key = _gather_launcher_key(
+        world_size,
+        rank,
+        threads,
+        device_slot_selection,
+        push,
     )
     raise_if_kernel_resolution_frozen("cute.compile", target=launch, cache_key=key)
     p_u32 = _u32_ptr(16, align=4)
@@ -2023,13 +2176,14 @@ def _get_compiled_all_gather_heads(
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key(
             "comm.pcie.dcp_a2a.all_gather_heads",
-            12,
+            13,
             key,
             labels=(
                 "world_size",
                 "rank",
                 "threads",
                 "device_slot_selection",
+                "push",
             ),
         ),
     )
@@ -2277,6 +2431,7 @@ def lse_reduce_scatter(
     device_slot_selection: bool,
     slot_delta_bytes: int,
     blocks: int,
+    push: bool = False,
 ) -> None:
     slot_delta_256b = _slot_delta_256b(slot_delta_bytes)
     launcher = _get_compiled_lse_reduce_scatter(
@@ -2285,6 +2440,7 @@ def lse_reduce_scatter(
         dtype_name,
         threads,
         device_slot_selection,
+        push,
     )
     if not device_slot_selection:
         _get_compiled_lse_reduce_scatter(
@@ -2293,6 +2449,7 @@ def lse_reduce_scatter(
             dtype_name,
             threads,
             True,
+            push,
         )
     launcher(
         local_output_ptr,
@@ -2330,6 +2487,7 @@ def all_gather_heads(
     device_slot_selection: bool,
     slot_delta_bytes: int,
     blocks: int,
+    push: bool = False,
 ) -> None:
     slot_delta_256b = _slot_delta_256b(slot_delta_bytes)
     launcher = _get_compiled_all_gather_heads(
@@ -2337,6 +2495,7 @@ def all_gather_heads(
         rank,
         threads,
         device_slot_selection,
+        push,
     )
     if not device_slot_selection:
         _get_compiled_all_gather_heads(
@@ -2344,6 +2503,7 @@ def all_gather_heads(
             rank,
             threads,
             True,
+            push,
         )
     launcher(
         local_input_ptr,

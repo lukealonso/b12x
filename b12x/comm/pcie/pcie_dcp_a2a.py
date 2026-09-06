@@ -1,4 +1,23 @@
-"""PCIe one-shot DCP attention exchange with fused LSE reduction."""
+"""PCIe one-shot DCP attention exchange with fused LSE reduction.
+
+Staging transport (``B12X_PCIE_DCP_A2A_TRANSPORT``, read once per runtime):
+
+``pull`` (default)
+    A rank writes its whole contribution into its own staging slot; after the
+    block-pair barrier every peer reads the rows it needs from the owner's
+    memory over PCIe (non-posted reads).
+
+``push``
+    A rank writes each peer's rows into that peer's staging slot before the
+    barrier (posted PCIe writes); the reduce/copy-out phase reads local
+    memory only.  The staging capacity, the double-buffered slots, the
+    per-block barrier and the row-to-warp mapping are the same as for the
+    pull transport, so the safety argument for slot reuse is unchanged, and
+    the combine arithmetic is identical (the same values enter the same
+    fused multiply-adds in the same order), so both transports produce the
+    same bits.  All ranks must select the same transport; the channel layout
+    contract checks it collectively.
+"""
 
 from __future__ import annotations
 
@@ -58,6 +77,21 @@ def _env_int(name: str, fallback: int) -> int:
         return int(raw)
     except ValueError:
         return int(fallback)
+
+
+A2A_TRANSPORTS = ("pull", "push")
+
+
+def a2a_transport() -> str:
+    """Return the staging transport selected by ``B12X_PCIE_DCP_A2A_TRANSPORT``."""
+
+    raw = (os.getenv("B12X_PCIE_DCP_A2A_TRANSPORT") or "pull").strip().lower()
+    if raw not in A2A_TRANSPORTS:
+        raise ValueError(
+            "B12X_PCIE_DCP_A2A_TRANSPORT must be one of "
+            f"{', '.join(A2A_TRANSPORTS)}; got {raw!r}"
+        )
+    return raw
 
 
 def _is_supported_bhd_layout(tensor: torch.Tensor) -> bool:
@@ -550,6 +584,7 @@ class PCIeDCPA2A:
         self._block_limit_override = _env_int(
             "B12X_PCIE_DCP_BLOCK_LIMIT", 0
         )
+        self._transport = a2a_transport()
         self._stream_affine = bool(stream_affine)
         self._owner_stream_key: Optional[int] = None
         self._closed = False
@@ -678,6 +713,7 @@ class PCIeDCPA2A:
                 int(head_dim),
                 int(query_head_dim),
                 layout,
+                a2a_transport(),
             ),
         )
         slab = PCIeOneshotAllReduce._allocate_shared_buffer(
@@ -771,6 +807,16 @@ class PCIeDCPA2A:
             return
         self._bind_stream_key(_current_stream_key(self.device, stream))
 
+    @property
+    def transport(self) -> str:
+        """Staging transport of the gather and LSE kernels (``pull``/``push``)."""
+
+        return self._transport
+
+    @property
+    def push_transport(self) -> bool:
+        return self._transport == "push"
+
     def _resolve_launch_config(
         self,
         *,
@@ -818,6 +864,7 @@ class PCIeDCPA2A:
                 dtype_name,
                 threads,
                 True,
+                self.push_transport,
             )
 
     def prepare_graph_all_gather_heads(self, *, threads: int = 256) -> None:
@@ -836,6 +883,7 @@ class PCIeDCPA2A:
                 self.rank,
                 threads,
                 True,
+                self.push_transport,
             )
 
     def prepare_graph_all_gather_pair(self, *, threads: int = 512) -> None:
@@ -1002,6 +1050,7 @@ class PCIeDCPA2A:
                 dtype_name,
                 threads,
                 True,
+                self.push_transport,
             ):
                 raise RuntimeError(
                     "cold PCIe DCP LSE CUDA graph capture is not allowed; "
@@ -1067,6 +1116,7 @@ class PCIeDCPA2A:
                     self._slot_bytes if slot == 0 else -self._slot_bytes
                 ),
                 blocks=blocks,
+                push=self.push_transport,
             )
 
     def all_gather_heads(
@@ -1151,6 +1201,7 @@ class PCIeDCPA2A:
                 self.rank,
                 threads,
                 True,
+                self.push_transport,
             ):
                 raise RuntimeError(
                     "cold PCIe DCP gather CUDA graph capture is not allowed; "
@@ -1204,6 +1255,7 @@ class PCIeDCPA2A:
                     self._slot_bytes if slot == 0 else -self._slot_bytes
                 ),
                 blocks=blocks,
+                push=self.push_transport,
             )
 
     def all_gather_pair(

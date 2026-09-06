@@ -241,6 +241,7 @@ def _metadata(world_size: int, query_dtype_name: str) -> dict[str, object]:
         "dirty": None if status == "unavailable" else bool(status),
         "world_size": world_size,
         "query_dtype": query_dtype_name,
+        "transport": os.getenv("B12X_PCIE_DCP_A2A_TRANSPORT", "pull"),
         "gpu": {
             "visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
             "logical_index": device_index,

@@ -90,8 +90,17 @@ def block_pair_barrier(
     rank: int,
     world_size: int,
     max_blocks: int,
+    acquire: bool = False,
 ) -> None:
-    """Match the native per-block, per-peer double-buffered barrier."""
+    """Match the native per-block, per-peer double-buffered barrier.
+
+    ``acquire`` adds a system-scope fence after the flag wait.  A kernel whose
+    peers pushed data into *this* rank's memory before arriving needs it: the
+    peer's fence-then-store publishes the data, and the fence after the
+    observing load orders this block's later loads of that data behind the
+    observation.  The pull kernels read remote staging through the peer's own
+    memory system and keep the plain wait.
+    """
     cute.arch.sync_threads()
     tidx, _, _ = cute.arch.thread_idx()
     bidx, _, _ = cute.arch.block_idx()
@@ -134,6 +143,8 @@ def block_pair_barrier(
         observed = _load_relaxed_sys_u32(self_signal + mine_index)
         while observed != value:
             observed = _load_relaxed_sys_u32(self_signal + mine_index)
+        if cutlass.const_expr(acquire):
+            _membar_sys()
 
     cute.arch.sync_threads()
 
