@@ -285,7 +285,9 @@ def test_mhc_supported_rms_eps_match_reference(
         * next_norm_scale
         * norm_weight.float()
     ).to(torch.bfloat16)
-    torch.testing.assert_close(next_residual, next_residual_ref, rtol=0.0, atol=2e-2)
+    torch.testing.assert_close(
+        next_residual, next_residual_ref, rtol=0.0, atol=2e-2 * input_scale
+    )
     torch.testing.assert_close(next_y, next_y_ref, rtol=0.0, atol=6e-3)
     torch.testing.assert_close(next_post, next_post_ref, rtol=2e-6, atol=1e-5)
     torch.testing.assert_close(next_comb, next_comb_ref, rtol=2e-6, atol=4e-5)
@@ -1078,7 +1080,9 @@ def test_b12x_mhc_fused_post_pre_graph_capture() -> None:
     torch.testing.assert_close(comb, comb_ref, rtol=2e-6, atol=1e-5)
 
 
-def test_deepseek_v4_vision_mhc_graph_replay() -> None:
+def test_deepseek_v4_vision_mhc_graph_replay(request: pytest.FixtureRequest) -> None:
+    from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
+
     device = require_b12x()
     tokens = 2
     hidden_size = 4096
@@ -1129,6 +1133,8 @@ def test_deepseek_v4_vision_mhc_graph_replay() -> None:
     eager_values = tuple(output.clone() for output in eager_outputs)
     output_ptrs = tuple(output.data_ptr() for output in eager_outputs)
 
+    request.addfinalizer(unfreeze_kernel_resolution)
+    freeze_kernel_resolution("mHC epsilon 1e-20 graph capture and live replay")
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         graph_outputs = run()
@@ -1138,12 +1144,29 @@ def test_deepseek_v4_vision_mhc_graph_replay() -> None:
 
     for output in graph_outputs:
         output.fill_(float("nan"))
+    allocated = torch.cuda.memory_stats(device)["allocation.all.allocated"]
     graph.replay()
     torch.cuda.synchronize(device)
+    assert torch.cuda.memory_stats(device)["allocation.all.allocated"] == allocated
     assert tuple(output.data_ptr() for output in graph_outputs) == output_ptrs
     for eager, captured, replayed in zip(
         eager_values, capture_values, graph_outputs, strict=True
     ):
         assert bool(torch.isfinite(replayed).all())
+        assert int(torch.count_nonzero(replayed)) > 0
         torch.testing.assert_close(captured, eager, rtol=0.0, atol=0.0)
         torch.testing.assert_close(replayed, eager, rtol=0.0, atol=0.0)
+
+    x.mul_(-0.5)
+    residual.mul_(0.625)
+    live_values = tuple(output.clone() for output in run())
+    assert not torch.equal(live_values[-1], eager_values[-1])
+    for output in graph_outputs:
+        output.fill_(float("nan"))
+    allocated = torch.cuda.memory_stats(device)["allocation.all.allocated"]
+    graph.replay()
+    torch.cuda.synchronize(device)
+    assert torch.cuda.memory_stats(device)["allocation.all.allocated"] == allocated
+    assert tuple(output.data_ptr() for output in graph_outputs) == output_ptrs
+    for expected, replayed in zip(live_values, graph_outputs, strict=True):
+        torch.testing.assert_close(replayed, expected, rtol=0.0, atol=0.0)
