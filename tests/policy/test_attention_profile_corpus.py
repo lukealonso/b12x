@@ -598,6 +598,7 @@ def test_mhc_tuner_races_the_medium_prefill_plan() -> None:
         config
         == {
             "backend": "tf32_tma",
+            "decode_partials_schedule": "default",
             "projection_tile_m": 64,
             "projection_tile_n": 24,
             "projection_tile_k": 64,
@@ -607,6 +608,25 @@ def test_mhc_tuner_races_the_medium_prefill_plan() -> None:
             "projection_k_splits": 8,
         }
         for config in configs
+    )
+
+
+def test_mhc_tuner_races_profiled_decode_partial_grouping() -> None:
+    case = next(
+        case
+        for case in _mhc_cases()
+        if case.query["hidden_size"] == 4_096
+        and case.query["max_tokens"] == 128
+        and case.query["split_k"] == 64
+    )
+    configs = tuple(
+        candidate.config.to_dict()
+        for candidate in _MhcSession(SimpleNamespace(device=None)).candidates(case)
+    )
+
+    assert tuple(config["decode_partials_schedule"] for config in configs) == (
+        "default",
+        "hidden4096_m128_v1",
     )
 
 

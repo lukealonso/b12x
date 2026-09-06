@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
 
@@ -11,6 +12,7 @@ def test_mhc_projection_cache_key_uses_planned_geometry_not_live_rows() -> None:
 
     config = MhcConfig(
         backend="tf32_tma",
+        decode_partials_schedule="default",
         projection_tile_m=64,
         projection_tile_n=24,
         projection_tile_k=64,
@@ -119,6 +121,37 @@ def test_mhc_decode_partial_group_policy_preserves_sm120(monkeypatch) -> None:
     assert select(num_tokens=16, hidden_size=7168, compute_capability=(12, 1)) == 4
 
 
+@pytest.mark.parametrize(
+    ("tokens", "partials_per_cta"),
+    (
+        (1, 1),
+        (2, 2),
+        (4, 3),
+        (8, 5),
+        (16, 7),
+        (24, 13),
+        (95, 13),
+        (96, 4),
+        (128, 4),
+    ),
+)
+def test_mhc_profiled_decode_partial_group_schedule(
+    monkeypatch,
+    tokens: int,
+    partials_per_cta: int,
+) -> None:
+    import b12x.norm.mhc._kernels as residual_kernels
+
+    monkeypatch.delenv("B12X_MHC_PARTIALS_PER_CTA", raising=False)
+
+    assert residual_kernels._selected_post_pre_partials_per_cta(
+        num_tokens=tokens,
+        hidden_size=4096,
+        compute_capability=(12, 0),
+        schedule="hidden4096_m128_v1",
+    ) == partials_per_cta
+
+
 def test_mhc_decode_partial_group_environment_override(monkeypatch) -> None:
     import b12x.norm.mhc._kernels as residual_kernels
 
@@ -128,6 +161,7 @@ def test_mhc_decode_partial_group_environment_override(monkeypatch) -> None:
             num_tokens=16,
             hidden_size=4096,
             compute_capability=(12, 1),
+            schedule="hidden4096_m128_v1",
         )
         == 7
     )
@@ -178,6 +212,7 @@ def test_dense_gemm_launch_has_fake_dispatch() -> None:
             False,
             False,
             None,
+            None,
         )
         torch.ops.b12x.dense_gemm_launch(
             a,
@@ -212,6 +247,7 @@ def test_dense_gemm_launch_has_fake_dispatch() -> None:
             False,
             False,
             False,
+            None,
             123,
         )
 
@@ -244,6 +280,7 @@ def test_mhc_launch_ops_have_fake_dispatch() -> None:
             partials,
             out,
             True,
+            4,
         )
         torch.ops.b12x.mhc_finalize_gram_launch(
             residual,
