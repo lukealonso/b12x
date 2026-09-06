@@ -51,6 +51,8 @@ MODEL_PATH = pathlib.Path("/data/models/GLM-5.1-NVFP4")
 DEFAULT_POOL_FACTOR = 6
 DEFAULT_GRAPH_WIDTH = 8192
 DEFAULT_TOPK = 2048
+# K rows per contiguous extend logits tile (the contiguous scratch default).
+DEFAULT_EXTEND_SUPERTILE_K = 32_768
 DEFAULT_EXTEND_Q_LENS = (16384,)
 
 
@@ -449,7 +451,14 @@ def _run_extend_case(
     device: torch.device,
     pool_factor: int,
     l2_flush,
+    supertile_k: int = DEFAULT_EXTEND_SUPERTILE_K,
 ) -> None:
+    """Time the contiguous extend path for ``batch`` requests of ``q_len`` tokens.
+
+    ``supertile_k`` bounds the K rows scored per logits tile; the tile holds
+    ``batch * q_len`` rows by ``supertile_k`` scores, so an unbounded tile
+    over every request's K rows would not fit a serving GPU at large batches.
+    """
     total_q = batch * q_len
     if q_len > cache_len:
         raise ValueError(f"extend q_len {q_len} must not exceed cache_len {cache_len}")
@@ -511,6 +520,7 @@ def _run_extend_case(
             max_q_rows=total_q,
             max_k_rows=int(kv_fp8[0].shape[0]),
             topk=topk,
+            supertile_k=int(supertile_k),
         )
     )
     contiguous_binding = contiguous_plan.bind(
@@ -538,19 +548,29 @@ def _run_extend_case(
 
     clear_indexer_caches()
     actual = run()
-    expected_logits = contiguous_logits_reference(
-        q_fp8=q_fp8,
-        weights=weights,
-        kv_fp8=kv_fp8,
-        k_start=k_start,
-        k_end=k_start + seqlens_expanded,
-    )
-    expected = _select_ragged_topk_from_logits(
-        logits=expected_logits,
-        k_start=k_start,
-        lengths=seqlens_expanded,
-        topk=topk,
-    )
+    # Reference per request: a request's rows see only its own K range, so
+    # the dense [total_q, all K rows] logits matrix is never materialized.
+    expected_chunks = []
+    for request in range(batch):
+        rows = slice(request * q_len, (request + 1) * q_len)
+        k_base = int(batch_offsets[request])
+        k_rows = slice(k_base, k_base + valid_per_row)
+        local_k_start = k_start[rows] - k_base
+        request_logits = contiguous_logits_reference(
+            q_fp8=q_fp8[rows],
+            weights=weights[rows],
+            kv_fp8=(kv_fp8[0][k_rows], kv_fp8[1][k_rows]),
+            k_start=local_k_start,
+            k_end=local_k_start + seqlens_expanded[rows],
+        )
+        selected = _select_ragged_topk_from_logits(
+            logits=request_logits,
+            k_start=local_k_start,
+            lengths=seqlens_expanded[rows],
+            topk=topk,
+        )
+        expected_chunks.append(torch.where(selected >= 0, selected + k_base, selected))
+    expected = torch.cat(expected_chunks, dim=0)
     torch.cuda.synchronize()
     _assert_topk_set_match(actual[: expected.shape[0]], expected)
 
@@ -612,6 +632,12 @@ def main() -> None:
         help="decode graph candidate-table width; actual width is max(cache_len, width)",
     )
     parser.add_argument("--topk", type=int, default=DEFAULT_TOPK)
+    parser.add_argument(
+        "--extend-supertile-k",
+        type=int,
+        default=DEFAULT_EXTEND_SUPERTILE_K,
+        help="K rows per contiguous extend logits tile",
+    )
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--replays", type=int, default=50)
     parser.add_argument("--seed", type=int, default=88_000)
@@ -681,6 +707,7 @@ def main() -> None:
                         device=device,
                         pool_factor=args.pool_factor,
                         l2_flush=l2_flush,
+                        supertile_k=args.extend_supertile_k,
                     )
                     case_seed += 17
 

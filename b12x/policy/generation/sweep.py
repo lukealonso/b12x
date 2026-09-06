@@ -6,7 +6,7 @@ import hashlib
 import json
 import math
 from collections import defaultdict
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from copy import copy
 from dataclasses import dataclass
 from typing import ContextManager, Protocol, cast
@@ -162,6 +162,16 @@ class _CachedSweepMeasurements:
     checkpoint_schema_version: int
 
 
+@dataclass(frozen=True, kw_only=True)
+class SweepRaceOutcome:
+    """Reduced result of a sweep: one winning config per runtime query point."""
+
+    records: tuple[DecisionRecord, ...]
+    coverage: dict[str, object]
+    evidence: dict[str, object]
+    completed_work_units: int
+
+
 class SweepSession(Protocol):
     """Stable-allocation measurement session for one case group."""
 
@@ -210,6 +220,7 @@ class DiscreteSweepGenerator:
         coverage: Mapping[str, object],
         candidate_contract_version: int = 1,
         nearest_range_bounds: Mapping[str, tuple[int, int]] | None = None,
+        candidate_tie_breaker: Callable[[SweepCandidate], int | str] | None = None,
     ) -> None:
         self.component_id = component_id
         self.query_schema_version = int(query_schema_version)
@@ -221,6 +232,7 @@ class DiscreteSweepGenerator:
         self._coverage = FrozenMapping(coverage)
         self._candidate_contract_version = int(candidate_contract_version)
         self._nearest_range_bounds = dict(nearest_range_bounds or {})
+        self._candidate_tie_breaker = candidate_tie_breaker
         if not self._cases:
             raise ValueError(f"{component_id} requires at least one sweep case")
         if not self._query_fields or len(self._query_fields) != len(
@@ -271,9 +283,7 @@ class DiscreteSweepGenerator:
         partitions = []
         for group_id in sorted(cases_by_group):
             cases = tuple(cases_by_group[group_id])
-            query_count = len(
-                {_query_key(case, self._query_fields) for case in cases}
-            )
+            query_count = len({_query_key(case, self._query_fields) for case in cases})
             partitions.append(
                 MeasurementPartition(
                     component_id=self.component_id,
@@ -327,10 +337,7 @@ class DiscreteSweepGenerator:
         candidate_ids = [candidate.candidate_id for candidate in candidates]
         if len(candidate_ids) != len(set(candidate_ids)):
             raise ValueError(f"candidate IDs are not unique for {case.case_id}")
-        if (
-            cached is not None
-            and cached.candidate_ids == tuple(candidate_ids)
-        ):
+        if cached is not None and cached.candidate_ids == tuple(candidate_ids):
             checkpoints.save(
                 self.component_id,
                 case.case_id,
@@ -397,13 +404,9 @@ class DiscreteSweepGenerator:
             SweepMeasurement.from_dict(item) for item in raw_measurements
         )
         candidate_ids = tuple(raw_candidate_ids)
-        measured_ids = tuple(
-            item.candidate.candidate_id for item in measurements
-        )
+        measured_ids = tuple(item.candidate.candidate_id for item in measurements)
         if measured_ids != candidate_ids:
-            raise ValueError(
-                "sweep checkpoint measurements do not match candidate IDs"
-            )
+            raise ValueError("sweep checkpoint measurements do not match candidate IDs")
         if len(candidate_ids) != len(set(candidate_ids)):
             raise ValueError("sweep checkpoint candidate IDs are not unique")
         return _CachedSweepMeasurements(
@@ -417,10 +420,7 @@ class DiscreteSweepGenerator:
         self,
         cached: _CachedSweepMeasurements | None,
     ) -> bool:
-        return (
-            cached is not None
-            and cached.checkpoint_schema_version == 2
-        )
+        return cached is not None and cached.checkpoint_schema_version == 2
 
     def _checkpoint_payload(
         self,
@@ -443,13 +443,19 @@ class DiscreteSweepGenerator:
             "measurements": [item.to_dict() for item in measurements],
         }
 
-    def generate(
+    def race(
         self,
         context: GenerationContext,
         *,
         progress: ProgressReporter,
         checkpoints: CheckpointStore,
-    ) -> ComponentGenerationResult:
+    ) -> SweepRaceOutcome:
+        """Measure every case and reduce the races to one winner per query point.
+
+        Composite generators combine the returned records with decisions from
+        other sources before building a planner; :meth:`generate` builds the
+        planner from these records alone.
+        """
         cases_by_group: dict[str, list[SweepCase]] = defaultdict(list)
         for case in self._cases:
             cases_by_group[case.group_id].append(case)
@@ -577,7 +583,14 @@ class DiscreteSweepGenerator:
                 )
             _, winner = min(
                 robust,
-                key=lambda item: (item[0], item[1].candidate_id),
+                key=lambda item: (
+                    item[0],
+                    (
+                        self._candidate_tie_breaker(item[1])
+                        if self._candidate_tie_breaker is not None
+                        else item[1].candidate_id
+                    ),
+                ),
             )
             records.append(
                 DecisionRecord(
@@ -591,12 +604,6 @@ class DiscreteSweepGenerator:
                 detail=f"reduce {grouped[0][0].case_id}",
             )
 
-        planner = build_axis_tree(
-            records,
-            field_order=self._query_fields,
-            range_fields=self._range_fields,
-            nearest_range_bounds=self._nearest_range_bounds,
-        )
         coverage = self._coverage.to_dict()
         coverage.update(
             {
@@ -605,15 +612,9 @@ class DiscreteSweepGenerator:
                 "runtime_query_points": len(records),
             }
         )
-        estimate = self.estimate(context)
-        return ComponentGenerationResult(
-            component={
-                "component_id": self.component_id,
-                "query_schema_version": self.query_schema_version,
-                "config_schema_version": self.config_schema_version,
-                "coverage": coverage,
-                "planner": decision_node_to_dict(planner),
-            },
+        return SweepRaceOutcome(
+            records=tuple(records),
+            coverage=coverage,
             evidence={
                 "winner_query_counts": dict(sorted(winner_counts.items())),
                 "gpu_measurement_cases": len(measured),
@@ -621,13 +622,43 @@ class DiscreteSweepGenerator:
                 "candidate_race_cases": race_cases,
                 "single_candidate_qualification_cases": qualification_cases,
             },
-            completed_work_units=estimate.work_units,
+            completed_work_units=self.estimate(context).work_units,
+        )
+
+    def build_planner(self, records: Sequence[DecisionRecord]):
+        """Reduce decision records to this component's axis-tree planner."""
+        return build_axis_tree(
+            tuple(records),
+            field_order=self._query_fields,
+            range_fields=self._range_fields,
+            nearest_range_bounds=self._nearest_range_bounds,
+        )
+
+    def generate(
+        self,
+        context: GenerationContext,
+        *,
+        progress: ProgressReporter,
+        checkpoints: CheckpointStore,
+    ) -> ComponentGenerationResult:
+        outcome = self.race(context, progress=progress, checkpoints=checkpoints)
+        return ComponentGenerationResult(
+            component={
+                "component_id": self.component_id,
+                "query_schema_version": self.query_schema_version,
+                "config_schema_version": self.config_schema_version,
+                "coverage": outcome.coverage,
+                "planner": decision_node_to_dict(self.build_planner(outcome.records)),
+            },
+            evidence=outcome.evidence,
+            completed_work_units=outcome.completed_work_units,
         )
 
 
 __all__ = [
     "DiscreteSweepGenerator",
     "SweepBenchmarkFactory",
+    "SweepRaceOutcome",
     "SweepCandidate",
     "SweepCase",
     "SweepMeasurement",

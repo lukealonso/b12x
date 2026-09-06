@@ -26,7 +26,9 @@ from b12x.policy.generation.attention_corpus import (
     GDN_GEOMETRIES,
     GQA_GEOMETRIES,
     MLA_GEOMETRIES,
+    QSA_DIRECT_PREFILL_ROWS,
     QSA_GEOMETRIES,
+    QSA_PAGE_SIZES,
     SPARSE_MLA_GEOMETRIES,
     attention_corpus_manifest,
     gdn_cases,
@@ -39,7 +41,8 @@ from b12x.policy.generation.providers import register_builtin_generators
 from b12x.policy.generation.progress import NullProgressReporter
 from b12x.policy.generation.providers.attention import (
     GdnAttentionGenerator,
-    _QsaProbe,
+    QsaAttentionGenerator,
+    _QsaSession,
 )
 from b12x.policy.generation.providers.gpu_workers import GdnBenchmarkFactory
 from b12x.policy.generation.providers.qualification import (
@@ -83,6 +86,32 @@ class _FixedGdnFactory:
         return _FixedGdnSession()
 
 
+class _FixedQsaSession(AbstractContextManager["_FixedQsaSession"]):
+    def __enter__(self) -> "_FixedQsaSession":
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        return None
+
+    def candidates(self, _case):
+        return _QsaSession._CANDIDATES
+
+    def measure(self, _case, candidates):
+        return tuple(
+            SweepMeasurement(
+                candidate=candidate,
+                latency_us=100.0,
+                correct=True,
+            )
+            for candidate in candidates
+        )
+
+
+class _FixedQsaFactory:
+    def __call__(self, _group_id, _cases, _context):
+        return _FixedQsaSession()
+
+
 def test_builtin_registry_covers_every_top_level_component() -> None:
     registry = ComponentGeneratorRegistry()
 
@@ -91,6 +120,61 @@ def test_builtin_registry_covers_every_top_level_component() -> None:
     assert registry.component_ids() == tuple(
         str(item.component_id) for item in list_profiled_components()
     )
+
+
+def test_qsa_generator_races_n32_n16_n64_and_prefers_n32_on_ties(
+    tmp_path,
+) -> None:
+    case = qsa_cases()[0]
+    generator = QsaAttentionGenerator(
+        benchmark_factory=_FixedQsaFactory(),
+        cases=(case,),
+    )
+    context = GenerationContext(
+        device=DeviceIdentity(
+            vendor="nvidia",
+            product_name="Synthetic SM120",
+            compute_capability=(12, 0),
+            sm_count=188,
+        ),
+        device_ordinal=0,
+        work_dir=tmp_path,
+        source_revision="test",
+        settings=GenerationSettings(),
+    )
+    checkpoints = CheckpointStore(tmp_path / "checkpoints")
+
+    result = generator.generate(
+        context,
+        progress=NullProgressReporter(),
+        checkpoints=checkpoints,
+    )
+    checkpoint = checkpoints.load("attention.qsa", case.case_id)
+    assert checkpoint is not None
+    assert checkpoint["candidate_contract_version"] == 2
+    assert [
+        item["config"]["sparse_gqa_direct_kv_warps"]
+        for item in checkpoint["measurements"]
+    ] == [2, 1, 4]
+    profile = profile_from_dict(
+        {
+            "profile_id": "nvidia.synthetic.188sm",
+            "targets": [
+                {
+                    "vendor": "nvidia",
+                    "product_name": "Synthetic SM120",
+                    "compute_capability": [12, 0],
+                    "sm_count": 188,
+                }
+            ],
+            "components": [result.component],
+        }
+    )
+    component = profile.component("attention.qsa")
+    assert component is not None
+    hit = component.lookup(case.query)
+    assert hit is not None
+    assert hit.config["sparse_gqa_direct_kv_warps"] == 2
 
 
 def test_attention_corpora_have_stable_reviewed_cross_products() -> None:
@@ -102,7 +186,7 @@ def test_attention_corpora_have_stable_reviewed_cross_products() -> None:
     assert len(gdn_cases()) == 1_462
     assert len(gqa_cases()) == 14_400
     assert len(mla_cases()) == 200
-    assert len(qsa_cases()) == 6_348
+    assert len(qsa_cases()) == 384
     assert len(sparse_mla_cases()) == 288
     assert len({case.query for case in gqa_cases()}) == len(gqa_cases())
 
@@ -215,22 +299,20 @@ def test_attention_capacity_axes_cover_serving_and_prefill_buckets() -> None:
         int(case.query["query_rows"]) for case in sparse_mla_cases()
     }
 
-    qsa_prefill_rows = {
-        rows
-        for _profile, rows, _context, _dtype, kind in _QsaProbe._CASES
-        if kind == "prefill"
+    assert QSA_DIRECT_PREFILL_ROWS == {
+        2_048: (65, 128, 1_024, 2_048),
+        32_768: (65, 128, 1_024, 4_096, 6_016, 8_192),
+        262_144: (65, 128, 1_024, 4_096, 6_016, 8_192),
     }
-    assert qsa_prefill_rows == set(COMMON_PREFILL_TOKEN_CAPACITIES)
+    assert QSA_PAGE_SIZES == (16, 64, 1_504, 3_008)
     assert {
-        (profile, rows, kv_dtype)
-        for profile, rows, _context, kv_dtype, kind in _QsaProbe._CASES
-        if kind == "prefill"
-    } == {
-        (profile, rows, kv_dtype)
-        for profile in ("tp1", "tp2", "tp4")
-        for rows in COMMON_PREFILL_TOKEN_CAPACITIES
-        for kv_dtype in ("bf16", "fp8_e4m3")
-    }
+        int(candidate.config["sparse_gqa_direct_kv_warps"])
+        for candidate in _QsaSession._CANDIDATES
+    } == {1, 2, 4}
+    assert [
+        int(candidate.config["sparse_gqa_direct_kv_warps"])
+        for candidate in _QsaSession._CANDIDATES
+    ] == [2, 1, 4]
     assert {
         int(case[0].removeprefix("glm52-extend-m"))
         for case in _DsaIndexerProbe._CASES
@@ -357,8 +439,7 @@ def test_mhc_tuner_races_the_medium_prefill_plan() -> None:
     case = next(
         case
         for case in _mhc_cases()
-        if case.query["hidden_size"] == 4_096
-        and case.query["max_tokens"] == 3_072
+        if case.query["hidden_size"] == 4_096 and case.query["max_tokens"] == 3_072
     )
     configs = tuple(
         candidate.config.to_dict()
@@ -388,30 +469,23 @@ def test_glm_profile_generation_envelope_matches_presets() -> None:
     mhc_queries = MhcGenerator().reviewed_queries()
 
     assert any(
-        query.num_q_heads == 32 and query.top_k == 2_048
-        for query in dsa_queries
+        query.num_q_heads == 32 and query.top_k == 2_048 for query in dsa_queries
     )
-    assert any(
-        query.num_q_heads == 32 and query.top_k == 512 for query in dsa_queries
-    )
+    assert any(query.num_q_heads == 32 and query.top_k == 512 for query in dsa_queries)
     assert {
         (query.qk_head_dim, query.v_head_dim, query.model_type)
         for query in sparse_queries
     } == {(576, 512, None), (512, 512, 2)}
     assert {query.num_q_heads for query in sparse_queries} == {8, 16, 32, 64}
     assert any(
-        query.max_tokens == 6
-        and query.hidden_size == 4_096
-        and query.split_k == 64
+        query.max_tokens == 6 and query.hidden_size == 4_096 and query.split_k == 64
         for query in mhc_queries
     )
     assert {4_096, 7_168} == {query.hidden_size for query in mhc_queries}
     assert set(COMMON_PREFILL_TOKEN_CAPACITIES) <= {
         query.max_tokens for query in mhc_queries
     }
-    assert {2_304, 3_072, 3_584} <= {
-        query.max_tokens for query in mhc_queries
-    }
+    assert {2_304, 3_072, 3_584} <= {query.max_tokens for query in mhc_queries}
     assert {query.score_mode for query in dsa_queries} == {"dsa", "msa"}
     assert set(COMMON_PREFILL_TOKEN_CAPACITIES) <= {
         query.max_q_rows for query in dsa_queries if query.mode == "prefill"
@@ -424,19 +498,13 @@ def test_glm_profile_generation_envelope_matches_presets() -> None:
 def test_named_attention_benchmark_presets_are_in_the_reviewed_inventory() -> None:
     preset_ids = {preset.preset_id for preset in ATTENTION_BENCHMARK_PRESETS}
     assert {
-        name.removeprefix("paged:")
-        for name in preset_ids
-        if name.startswith("paged:")
+        name.removeprefix("paged:") for name in preset_ids if name.startswith("paged:")
     } == set(BENCHMARK_PROFILES)
     assert {
-        name.removeprefix("qsa:")
-        for name in preset_ids
-        if name.startswith("qsa:")
+        name.removeprefix("qsa:") for name in preset_ids if name.startswith("qsa:")
     } == set(QSA_PROFILES)
     assert {
-        name.removeprefix("gdn:")
-        for name in preset_ids
-        if name.startswith("gdn:")
+        name.removeprefix("gdn:") for name in preset_ids if name.startswith("gdn:")
     } == {case.name for case in QWEN38_GDN_CASES}
     assert preset_ids == {
         "compressed-mla:deepseek-v4-flash-default",

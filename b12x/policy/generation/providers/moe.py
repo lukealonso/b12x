@@ -32,7 +32,7 @@ from b12x.policy.generation.reducer import (
     decision_node_to_dict,
 )
 from b12x.policy.generation.store import CheckpointStore
-from b12x.policy.types import FrozenMapping
+from b12x.policy.types import ExactDecisionNode, FrozenMapping
 
 _QUERY_FIELDS = (
     "quant_mode",
@@ -52,7 +52,7 @@ _TRITON_ROUTE_MAX_ROWS = 256
 _PREFILL_CAPACITY_TOKENS = frozenset(COMMON_PREFILL_TOKEN_CAPACITIES)
 _QUALIFICATION_TOKENS = frozenset({1, 2, 3, 4, 5, 6, 7, 8, 32, 128})
 _QUALIFICATION_PATTERNS = frozenset({"balanced", "hot"})
-_MOE_CANDIDATE_CONTRACT_VERSION = 6
+_MOE_CANDIDATE_CONTRACT_VERSION = 9
 _MOE_CHECKPOINT_SCHEMA_VERSION = 2
 
 
@@ -340,6 +340,8 @@ def _synthesize_token_capacity_coverage(
 
 
 def _coarse_cases(cases: Sequence[MoeSweepCase]) -> tuple[MoeSweepCase, ...]:
+    if cases and cases[0].geometry.recipe.quant_mode == "nvfp4_auto":
+        return ()
     return tuple(
         case
         for case in cases
@@ -351,6 +353,7 @@ def _coarse_cases(cases: Sequence[MoeSweepCase]) -> tuple[MoeSweepCase, ...]:
 
 def _has_tunable_backend(geometry: MoePhysicalGeometry) -> bool:
     return geometry.recipe.quant_mode in {
+        "nvfp4_auto",
         "nvfp4",
         "w4a16",
         "w4a8_mx",
@@ -484,11 +487,29 @@ def _correctness_reference_rank(candidate: MoeCandidate) -> tuple[object, ...]:
     )
 
 
+def _correctness_anchor_rank(
+    case: MoeSweepCase,
+    candidate: MoeCandidate,
+) -> tuple[object, ...]:
+    tile_m = candidate.config.get("dynamic_tile_m")
+    if isinstance(tile_m, int):
+        distance = abs(case.routed_rows - tile_m)
+    else:
+        distance = abs(case.num_tokens - 4)
+    return (
+        not case.is_model_native_top_k,
+        distance,
+        case.route_pattern != "balanced",
+        case.num_tokens,
+        case.top_k,
+    )
+
+
 class MoeDecodeGenerator:
     """Generate a broad MoE planner from staged per-geometry GPU races."""
 
     component_id = MOE_DECODE
-    query_schema_version = 3
+    query_schema_version = 4
     config_schema_version = 3
 
     def __init__(
@@ -505,6 +526,7 @@ class MoeDecodeGenerator:
 
             benchmark_factory = MoeGpuBenchmarkFactory()
         self._benchmark_factory = benchmark_factory
+        self._precision_identity = None
         known_keys = {geometry.key for geometry in self._geometries}
         if any(case.geometry.key not in known_keys for case in self._cases):
             raise ValueError("MoE sweep cases reference unknown geometries")
@@ -614,6 +636,13 @@ class MoeDecodeGenerator:
         checkpoints: CheckpointStore,
     ) -> tuple[MoeMeasurement, ...]:
         key = f"{stage}-{case.case_id}"
+        precision_identity = None
+        if case.geometry.recipe.quant_mode == "nvfp4_auto":
+            from .moe_precision import source_identity
+
+            if self._precision_identity is None:
+                self._precision_identity = source_identity()
+            precision_identity = self._precision_identity
         cached = checkpoints.load(self.component_id, key)
         expected_ids = [candidate.candidate_id for candidate in candidates]
         if (
@@ -623,19 +652,37 @@ class MoeDecodeGenerator:
             == _MOE_CANDIDATE_CONTRACT_VERSION
             and context.checkpoint_metadata_matches(cached.get("generation"))
             and cached.get("case_id") == case.case_id
-            and cached.get("candidate_ids") == expected_ids
+            and cached.get("precision_source_toolchain_sha256") == precision_identity
         ):
+            cached_ids = cached.get("candidate_ids")
             raw_measurements = cached.get("measurements")
+            if not isinstance(cached_ids, list):
+                raise TypeError("MoE race checkpoint candidate IDs must be an array")
             if not isinstance(raw_measurements, list):
                 raise TypeError("MoE race checkpoint measurements must be an array")
             cached_measurements = tuple(
                 MoeMeasurement.from_dict(item) for item in raw_measurements
             )
+            measured_ids = [
+                item.candidate.candidate_id for item in cached_measurements
+            ]
+            if measured_ids != cached_ids:
+                raise ValueError(
+                    "MoE race checkpoint candidate IDs must match its measurements"
+                )
+            measurements_by_id = {
+                item.candidate.candidate_id: item for item in cached_measurements
+            }
+            requested_measurements = tuple(
+                measurements_by_id[candidate_id]
+                for candidate_id in expected_ids
+                if candidate_id in measurements_by_id
+            )
             if any(
                 item.error is None and item.latency_us is not None
-                for item in cached_measurements
-            ):
-                return cached_measurements
+                for item in requested_measurements
+            ) and len(requested_measurements) == len(expected_ids):
+                return requested_measurements
 
         measurements = session.measure(
             case,
@@ -655,6 +702,7 @@ class MoeDecodeGenerator:
                 "candidate_contract_version": _MOE_CANDIDATE_CONTRACT_VERSION,
                 "generation": context.checkpoint_metadata(),
                 "case_id": case.case_id,
+                "precision_source_toolchain_sha256": precision_identity,
                 "query": case.query(),
                 "route_pattern": case.route_pattern,
                 "candidate_ids": expected_ids,
@@ -671,6 +719,9 @@ class MoeDecodeGenerator:
         context: GenerationContext,
         checkpoints: CheckpointStore,
     ) -> tuple[MoeCandidate, ...]:
+        if cases[0].geometry.recipe.quant_mode == "nvfp4_auto":
+            # Precision candidates qualify independently at every capacity.
+            return session.candidates
         targets_by_anchor: dict[MoeSweepCase, list[MoeCandidate]] = defaultdict(list)
         for candidate in session.candidates:
             eligible_cases = tuple(
@@ -682,12 +733,7 @@ class MoeDecodeGenerator:
                 continue
             anchor = min(
                 eligible_cases,
-                key=lambda case: (
-                    not case.is_model_native_top_k,
-                    abs(case.num_tokens - 4),
-                    case.route_pattern != "balanced",
-                    case.num_tokens,
-                ),
+                key=lambda case: _correctness_anchor_rank(case, candidate),
             )
             targets_by_anchor[anchor].append(candidate)
 
@@ -923,7 +969,13 @@ class MoeDecodeGenerator:
                 raise RuntimeError(
                     f"no route-robust MoE candidate for {_query_dict(case)}"
                 )
-            _, winner = min(robust, key=lambda item: (item[0], item[1].candidate_id))
+            _, winner = min(robust, key=lambda item: (
+                item[0], item[1].config["backend"] != "w4a16", item[1].candidate_id,
+            ))
+            if grouped[0][0].geometry.recipe.quant_mode == "nvfp4_auto":
+                from .moe_precision import select_winner
+
+                winner = select_winner(grouped, context.settings.minimum_cosine)
             representative = grouped[0][0]
             records.append(
                 DecisionRecord.create(
@@ -952,21 +1004,34 @@ class MoeDecodeGenerator:
 
         measured_records = tuple(records)
         token_values = {case.num_tokens for case in self._cases}
-        records = list(
-            _synthesize_token_capacity_coverage(
-                measured_records,
-                minimum=min(token_values),
-                maximum=max(token_values),
+        precision_records = tuple(
+            record for record in measured_records if record.query["quant_mode"] == "nvfp4_auto"
+        )
+        fixed_precision_records = tuple(
+            record for record in measured_records if record.query["quant_mode"] != "nvfp4_auto"
+        )
+        records = list(precision_records)
+        fixed_planner = None
+        if fixed_precision_records:
+            fixed_records = _synthesize_token_capacity_coverage(
+                fixed_precision_records, minimum=min(token_values), maximum=max(token_values),
             )
-        )
-        planner = build_axis_tree(
-            records,
-            field_order=_QUERY_FIELDS,
-            range_fields=frozenset({"num_tokens"}),
-            nearest_range_bounds={
-                "num_tokens": (min(token_values), max(token_values)),
-            },
-        )
+            records.extend(fixed_records)
+            fixed_planner = build_axis_tree(
+                fixed_records, field_order=_QUERY_FIELDS,
+                range_fields=frozenset({"num_tokens"}),
+                nearest_range_bounds={"num_tokens": (min(token_values), max(token_values))},
+            )
+        if precision_records:
+            planner = ExactDecisionNode(
+                field="quant_mode",
+                branches=(("nvfp4_auto", build_axis_tree(
+                    precision_records, field_order=_QUERY_FIELDS,
+                )),),
+                default=fixed_planner,
+            )
+        else:
+            planner = fixed_planner
         component = {
             "component_id": self.component_id,
             "query_schema_version": self.query_schema_version,

@@ -12,8 +12,9 @@ signature change.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal
 
 import torch
@@ -30,7 +31,12 @@ from b12x._lib.scratch_layout import (
     materialize_scratch_strided_view,
     materialize_scratch_view,
 )
-from b12x.attention._shared.mla.traits import ModelType
+from b12x.attention._shared.mla.traits import (
+    ModelType,
+    UnifiedMLATraits,
+    infer_model_type,
+    make_unified_traits,
+)
 from b12x.attention._shared.workspace import (
     _split_output_buffer_from_tmp,
     _split_tmp_output_stride,
@@ -46,11 +52,22 @@ class B12XSparseMLAScratchCaps:
     num_q_heads: int
     max_q_rows: int
     max_width: int
+    softmax_scale: float
     dtype: torch.dtype = torch.bfloat16
     kv_dtype: torch.dtype = torch.bfloat16
     head_dim: int = 576
     v_head_dim: int = 512
     model_type: int | None = None
+    scale_format: int | None = None
+    cache_record_bytes: int | None = None
+    fp8_rope: bool | None = None
+    latent_scale_per_token: bool = False
+    cache_traits: UnifiedMLATraits | None = field(
+        default=None,
+        init=False,
+        repr=False,
+        compare=False,
+    )
     mode: Literal["decode", "extend", "verify", "draft_extend"] = "decode"
     max_batch: int | None = None
     max_kv_rows: int = 0
@@ -59,6 +76,10 @@ class B12XSparseMLAScratchCaps:
     max_q_chunks: int | None = None
     page_size: int = 64
     head_major_output: bool = False
+    latent_scale: float = 1.0
+    return_lse: bool = False
+    lse_scale: Literal["base2", "natural"] = "base2"
+    has_attention_sink: bool = False
 
     def __post_init__(self) -> None:
         device = torch.device(self.device)
@@ -68,16 +89,59 @@ class B12XSparseMLAScratchCaps:
         object.__setattr__(self, "num_q_heads", max(int(self.num_q_heads), 1))
         object.__setattr__(self, "max_q_rows", max(int(self.max_q_rows), 1))
         object.__setattr__(self, "max_width", max(int(self.max_width), 1))
+        softmax_scale = float(self.softmax_scale)
+        if not math.isfinite(softmax_scale) or softmax_scale <= 0.0:
+            raise ValueError(
+                f"softmax_scale must be finite and positive, got {softmax_scale}"
+            )
+        object.__setattr__(self, "softmax_scale", softmax_scale)
         object.__setattr__(self, "head_dim", max(int(self.head_dim), 1))
         object.__setattr__(self, "v_head_dim", max(int(self.v_head_dim), 1))
-        if self.model_type is not None:
-            object.__setattr__(self, "model_type", int(self.model_type))
-            if int(self.model_type) == int(ModelType.GLM_NEXT):
+        requested_model_type = self.model_type
+        if requested_model_type is not None:
+            requested_model_type = int(requested_model_type)
+            if requested_model_type == int(ModelType.GLM_NEXT):
                 if int(self.head_dim) != 512 or int(self.v_head_dim) != 512:
                     raise ValueError(
                         "ModelType.GLM_NEXT requires head_dim=512 and "
                         f"v_head_dim=512; got {self.head_dim} and {self.v_head_dim}"
                     )
+        model_type, compute_mode, default_scale_format = infer_model_type(
+            int(self.head_dim),
+            self.kv_dtype,
+            model_type=requested_model_type,
+        )
+        scale_format = (
+            int(default_scale_format)
+            if self.scale_format is None
+            else int(self.scale_format)
+        )
+        traits = make_unified_traits(
+            model_type,
+            compute_mode,
+            scale_format,
+            fp8_rope=self.fp8_rope,
+            latent_scale_per_token=bool(self.latent_scale_per_token),
+        )
+        record_bytes = int(traits.kv_gmem_stride)
+        if (
+            self.cache_record_bytes is not None
+            and int(self.cache_record_bytes) != record_bytes
+        ):
+            raise ValueError(
+                "sparse MLA cache_record_bytes does not match its planned "
+                f"recipe: got {int(self.cache_record_bytes)}, expected {record_bytes}"
+            )
+        object.__setattr__(self, "model_type", int(traits.model_type))
+        object.__setattr__(self, "scale_format", int(traits.scale_format))
+        object.__setattr__(self, "cache_record_bytes", record_bytes)
+        object.__setattr__(self, "fp8_rope", bool(traits.fp8_rope))
+        object.__setattr__(
+            self,
+            "latent_scale_per_token",
+            bool(traits.latent_scale_per_token),
+        )
+        object.__setattr__(self, "cache_traits", traits)
         max_batch = self.max_q_rows if self.max_batch is None else self.max_batch
         object.__setattr__(self, "max_batch", max(int(max_batch), 1))
         object.__setattr__(self, "max_kv_rows", max(int(self.max_kv_rows), 0))
@@ -99,6 +163,18 @@ class B12XSparseMLAScratchCaps:
         if self.max_q_chunks is not None:
             object.__setattr__(self, "max_q_chunks", max(int(self.max_q_chunks), 1))
         object.__setattr__(self, "page_size", max(int(self.page_size), 1))
+        latent_scale = float(self.latent_scale)
+        if not math.isfinite(latent_scale) or latent_scale <= 0.0:
+            raise ValueError(
+                f"latent_scale must be finite and positive, got {latent_scale}"
+            )
+        object.__setattr__(self, "latent_scale", latent_scale)
+        object.__setattr__(self, "return_lse", bool(self.return_lse))
+        if self.lse_scale not in ("base2", "natural"):
+            raise ValueError(
+                f"lse_scale must be 'base2' or 'natural', got {self.lse_scale!r}"
+            )
+        object.__setattr__(self, "has_attention_sink", bool(self.has_attention_sink))
 
 
 @dataclass(kw_only=True)
@@ -136,6 +212,11 @@ class B12XSparseMLAScratch:
     num_chunks_value: int | None = None
     sm_scale_value: float | None = None
     model_type: int | None = None
+    scale_format: int | None = None
+    cache_record_bytes: int | None = None
+    fp8_rope: bool = False
+    latent_scale_per_token: bool = False
+    cache_traits: UnifiedMLATraits | None = None
 
     def set_split_chunk_config(self, *, kv_chunk_size: int, num_chunks: int) -> None:
         if num_chunks <= 0 or num_chunks > self.max_chunks_per_row:
@@ -160,6 +241,7 @@ class B12XSparseMLAScratch:
         selected_indices: torch.Tensor,
         cache_seqlens_int32: torch.Tensor,
         nsa_cache_seqlens_int32: torch.Tensor,
+        kv_cache: torch.Tensor | None = None,
     ) -> "B12XSparseMLABinding":
         return build_sparse_mla_binding(
             scratch=self,
@@ -167,6 +249,7 @@ class B12XSparseMLAScratch:
             selected_indices=selected_indices,
             cache_seqlens_int32=cache_seqlens_int32,
             nsa_cache_seqlens_int32=nsa_cache_seqlens_int32,
+            kv_cache=kv_cache,
         )
 
 
@@ -177,6 +260,13 @@ class B12XSparseMLABinding:
     selected_indices: torch.Tensor
     cache_seqlens_int32: torch.Tensor
     nsa_cache_seqlens_int32: torch.Tensor
+    model_type: int | None = None
+    scale_format: int | None = None
+    cache_record_bytes: int | None = None
+    fp8_rope: bool | None = None
+    latent_scale_per_token: bool | None = None
+    cache_traits: UnifiedMLATraits | None = None
+    kv_cache: torch.Tensor | None = None
 
 
 def _validate_device(
@@ -235,9 +325,20 @@ def _validate_selected_indices(
         raise ValueError(
             f"selected_indices rows {int(selected_indices.shape[0])} do not match q rows {rows}"
         )
-    if int(selected_indices.shape[1]) > int(scratch.topk):
+    selected_width = int(selected_indices.shape[1])
+    planned_width = int(scratch.topk)
+    if selected_width > planned_width:
         raise ValueError(
-            f"selected_indices width {int(selected_indices.shape[1])} exceeds scratch topk {scratch.topk}"
+            f"selected_indices width {selected_width} exceeds scratch topk {planned_width}"
+        )
+    model_type = getattr(scratch, "model_type", None)
+    if model_type in (ModelType.GLM_NSA, ModelType.GLM_NEXT) and (
+        selected_width != planned_width
+    ):
+        raise ValueError(
+            "GLM sparse MLA selected_indices width must match the planned "
+            f"top-k width {planned_width}, got {selected_width}; carry the live "
+            "valid count in nsa_cache_seqlens_int32"
         )
     return selected_indices
 
@@ -275,6 +376,7 @@ def build_sparse_mla_binding(
     selected_indices: torch.Tensor,
     cache_seqlens_int32: torch.Tensor,
     nsa_cache_seqlens_int32: torch.Tensor,
+    kv_cache: torch.Tensor | None = None,
 ) -> B12XSparseMLABinding:
     q = _validate_q(q, scratch=scratch)
     rows = int(q.shape[0])
@@ -295,12 +397,43 @@ def build_sparse_mla_binding(
         name="nsa_cache_seqlens_int32",
         rows=rows,
     )
+    if kv_cache is not None:
+        if kv_cache.ndim != 3:
+            raise ValueError(f"kv_cache must be rank-3, got {tuple(kv_cache.shape)}")
+        _validate_device(kv_cache, scratch=scratch, name="kv_cache")
+        if kv_cache.dtype != scratch.kv_dtype:
+            raise TypeError(
+                f"kv_cache must have dtype {scratch.kv_dtype}, got {kv_cache.dtype}"
+            )
+        if int(kv_cache.shape[-1]) != int(scratch.cache_record_bytes):
+            raise ValueError(
+                "kv_cache record width does not match the sparse MLA plan: "
+                f"got {int(kv_cache.shape[-1])}, expected "
+                f"{int(scratch.cache_record_bytes)}"
+            )
+        # Contiguous caches are flat record storage; their first two dimensions
+        # may be reshaped without changing the address contract. A strided cache
+        # encodes physical page boundaries and must match the planned page size.
+        if not kv_cache.is_contiguous() and int(kv_cache.shape[1]) != int(
+            scratch.page_size
+        ):
+            raise ValueError(
+                "kv_cache page size does not match the sparse MLA plan: "
+                f"got {int(kv_cache.shape[1])}, expected {int(scratch.page_size)}"
+            )
     return B12XSparseMLABinding(
         scratch=scratch,
         q=q,
         selected_indices=selected_indices,
         cache_seqlens_int32=cache_seqlens_int32,
         nsa_cache_seqlens_int32=nsa_cache_seqlens_int32,
+        model_type=getattr(scratch, "model_type", None),
+        scale_format=getattr(scratch, "scale_format", None),
+        cache_record_bytes=getattr(scratch, "cache_record_bytes", None),
+        fp8_rope=getattr(scratch, "fp8_rope", None),
+        latent_scale_per_token=getattr(scratch, "latent_scale_per_token", None),
+        cache_traits=getattr(scratch, "cache_traits", None),
+        kv_cache=kv_cache,
     )
 
 
@@ -481,6 +614,11 @@ def _materialize_sparse_mla_scratch(
         head_dim=caps.head_dim,
         v_head_dim=v_head_dim,
         model_type=caps.model_type,
+        scale_format=caps.scale_format,
+        cache_record_bytes=caps.cache_record_bytes,
+        fp8_rope=bool(caps.fp8_rope),
+        latent_scale_per_token=bool(caps.latent_scale_per_token),
+        cache_traits=caps.cache_traits,
         topk=caps.max_width,
         max_total_q=caps.max_q_rows,
         max_batch=caps.max_batch,
@@ -520,6 +658,7 @@ class B12XSparseMLAScratchPlan:
         selected_indices: torch.Tensor,
         cache_seqlens_int32: torch.Tensor,
         nsa_cache_seqlens_int32: torch.Tensor,
+        kv_cache: torch.Tensor | None = None,
     ) -> B12XSparseMLABinding:
         scratch_storage = scratch_tensor(
             scratch,
@@ -537,6 +676,7 @@ class B12XSparseMLAScratchPlan:
             selected_indices=selected_indices,
             cache_seqlens_int32=cache_seqlens_int32,
             nsa_cache_seqlens_int32=nsa_cache_seqlens_int32,
+            kv_cache=kv_cache,
         )
 
 

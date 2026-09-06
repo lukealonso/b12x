@@ -319,3 +319,55 @@ def test_sparse_mla_split_decode_merge_graph_replay_matches_fp32_oracle() -> Non
 @torch.inference_mode()
 def test_sparse_mla_split_decode_sink_merge_graph_replay_matches_fp32_oracle() -> None:
     _run_fixed_merge_graph_case(with_sink=True)
+
+
+def test_split_merge_covers_every_slot_up_to_capacity_across_calls() -> None:
+    """Merge partial counts up to the workspace's slot capacity, repeatedly.
+
+    Every slot weight must be written on every call: a stale weight left in
+    shared memory by an earlier launch would otherwise weight a partial.
+    """
+    from b12x.attention._shared.workspace import _SPLIT_MAX_CHUNKS
+
+    device = require_b12x()
+    rows, heads = 3, 8
+    generator = torch.Generator(device=device)
+    for chunks in (64, 65, 200, _SPLIT_MAX_CHUNKS):
+        problem = _make_fixed_merge_problem(
+            rows=rows, heads=heads, chunks=chunks, device=device
+        )
+        generator.manual_seed(1234 + chunks)
+        for call in range(3):
+            partials = torch.empty_like(problem.tmp_output).normal_(
+                mean=0.0, std=0.25, generator=generator
+            )
+            lse = torch.empty(
+                (rows, heads, chunks), dtype=torch.float32, device=device
+            ).normal_(mean=0.1, std=1.0, generator=generator)
+            if call == 2:
+                # Only the low half of the slots carries partials.
+                lse[:, :, chunks // 2 :] = -torch.inf
+            sink = (
+                None
+                if call == 1
+                else torch.linspace(-1.0, 1.0, heads, dtype=torch.float32, device=device)
+            )
+            expected = _split_merge_fp32_oracle(
+                partials, lse, chunks=chunks, attn_sink=sink
+            )
+            _install_scenario(
+                problem, partials=partials, lse=lse, live_sink=None, source_sink=None
+            )
+            static_chunks = chunks if call == 0 else None
+            mla_merge.run_sparse_mla_split_decode_merge(
+                tmp_output=problem.tmp_output,
+                tmp_lse=problem.tmp_lse,
+                num_chunks_ptr=problem.num_chunks_ptr,
+                num_chunks=static_chunks,
+                attn_sink=sink,
+                output=problem.output,
+            )
+            torch.cuda.synchronize(device)
+            torch.testing.assert_close(
+                problem.output.float(), expected, atol=1.5e-2, rtol=1.5e-2
+            )

@@ -398,6 +398,7 @@ class _SparseMlaProbe:
         policy = PolicyContext.for_device(device, mode=PolicyMode.HEURISTIC_ONLY)
         measurements = []
         for index, (label, rows, heads, topk) in enumerate(self._GLM52_CASES):
+            sm_scale = 1.0 / math.sqrt(576)
             q, kv_cache, selected, cache_seqlens, _kv_bytes = _make_glm_inputs(
                 rows=rows,
                 num_heads=heads,
@@ -411,6 +412,7 @@ class _SparseMlaProbe:
                     num_q_heads=heads,
                     max_q_rows=rows,
                     max_width=topk,
+                    softmax_scale=sm_scale,
                     dtype=torch.bfloat16,
                     kv_dtype=torch.uint8,
                     head_dim=576,
@@ -433,11 +435,11 @@ class _SparseMlaProbe:
                 plan,
                 scratch=scratch,
                 q=q,
+                kv_cache=kv_cache,
                 selected_indices=selected,
-                cache_seqlens_int32=cache_seqlens,
-                nsa_cache_seqlens_int32=cache_seqlens,
+                cache_lengths=cache_seqlens,
+                selected_lengths=cache_seqlens,
             )
-            sm_scale = 1.0 / math.sqrt(576)
             expected = sparse_mla_reference(
                 q_all=q,
                 kv_cache=kv_cache,
@@ -448,12 +450,7 @@ class _SparseMlaProbe:
             )
 
             def run():
-                return sparse_mla.run_decode(
-                    kv_cache=kv_cache,
-                    binding=binding,
-                    sm_scale=sm_scale,
-                    v_head_dim=512,
-                )
+                return sparse_mla.run(binding)
 
             output = run()
             torch.cuda.synchronize(device)
@@ -513,12 +510,14 @@ class _SparseMlaProbe:
             cache_seqlens = torch.full(
                 (rows,), num_records, dtype=torch.int32, device=device
             )
+            sm_scale = 256**-0.5
             plan = sparse_mla.plan(
                 sparse_mla.Caps(
                     device=device,
                     num_q_heads=heads,
                     max_q_rows=rows,
                     max_width=width,
+                    softmax_scale=sm_scale,
                     dtype=torch.bfloat16,
                     kv_dtype=torch.uint8,
                     head_dim=512,
@@ -541,11 +540,11 @@ class _SparseMlaProbe:
                     device=scratch_spec.device,
                 ),
                 q=q,
+                kv_cache=kv_cache,
                 selected_indices=selected,
-                cache_seqlens_int32=cache_seqlens,
-                nsa_cache_seqlens_int32=active,
+                cache_lengths=cache_seqlens,
+                selected_lengths=active,
             )
-            sm_scale = 256**-0.5
             expected = sparse_mla_reference(
                 q_all=q,
                 kv_cache=kv_cache.view(num_records, 1, 528),
@@ -556,12 +555,7 @@ class _SparseMlaProbe:
             )
 
             def run_glm53():
-                return sparse_mla.run_decode(
-                    kv_cache=kv_cache,
-                    binding=binding,
-                    sm_scale=sm_scale,
-                    v_head_dim=512,
-                )
+                return sparse_mla.run(binding)
 
             output = run_glm53()
             torch.cuda.synchronize(device)

@@ -11,12 +11,14 @@ from b12x.policy.generation.moe_corpus import (
     MOE_BENCHMARK_PRESETS,
     MOE_RECIPES,
 )
+from b12x.policy.generation.providers.gemm import _bf16_vocab_projection_cases
 from b12x.tools.inspect_model_policy import (
     _MODEL_FACTORIES,
     _canonical_model,
     _deepseek_v4_flash_queries,
     _device_selection,
     _glm52_queries,
+    _glm53_queries,
     _glm53_flash_queries,
     _minimax_m27_queries,
     _minimax_m3_queries,
@@ -54,6 +56,8 @@ def test_qwen_flash_next_preset_rejects_unprofiled_qsa_tp() -> None:
 def test_model_aliases_are_canonicalized() -> None:
     assert _canonical_model("glm52") == "glm-5.2"
     assert _canonical_model("GLM 5.2") == "glm-5.2"
+    assert _canonical_model("glm53") == "glm-5.3"
+    assert _canonical_model("GLM 5.3") == "glm-5.3"
     assert _canonical_model("glm5.3-flash") == "glm-5.3-flash"
     assert _canonical_model("GLM 5.3 Flash") == "glm-5.3-flash"
     assert _canonical_model("glm53-flash-shape") == "glm-5.3-flash"
@@ -73,6 +77,7 @@ def test_every_moe_benchmark_preset_spelling_is_accepted() -> None:
     for preset in MOE_BENCHMARK_PRESETS:
         canonical = _canonical_model(preset.preset_id)
         assert canonical in _MODEL_FACTORIES
+        recipe = recipes[preset.recipe_id]
         query = next(
             item.query
             for item in _MODEL_FACTORIES[canonical](
@@ -80,8 +85,9 @@ def test_every_moe_benchmark_preset_spelling_is_accepted() -> None:
                 runtime_device="cuda:0",
             )
             if item.policy.component_id == "moe.decode"
+            and item.query.quant_mode == recipe.quant_mode
+            and item.query.source_format == recipe.source_format
         )
-        recipe = recipes[preset.recipe_id]
         assert (query.quant_mode, query.source_format) == (
             recipe.quant_mode,
             recipe.source_format,
@@ -206,6 +212,7 @@ def test_cli_lists_model_presets(capsys) -> None:
         "dsv4f-nvfp4",
         "glm-5.1",
         "glm-5.2",
+        "glm-5.3",
         "glm-5.3-flash",
         "kimi-k3",
         "laguna-s2.1",
@@ -249,7 +256,8 @@ def test_glm53_flash_preset_composes_kda_sparse_mla_mhc_and_moe() -> None:
     indexer = selections["pooled-indexer-spec6"].query
     sparse_mla = selections["sparse-mla-spec6"].query
     mhc = selections["mhc-spec6"].query
-    moe = selections["moe-m4"].query
+    main_moe = selections["main-moe-m4"].query
+    mtp_moe = selections["mtp-moe-m4"].query
     vocab = selections["vocab-projection-m1"].query
     assert (kda.key_heads, kda.value_heads) == (16, 16)
     assert (kda.max_seqs, kda.max_tokens, kda.state_index_columns) == (4, 24, 6)
@@ -257,12 +265,61 @@ def test_glm53_flash_preset_composes_kda_sparse_mla_mhc_and_moe() -> None:
     assert (sparse_mla.qk_head_dim, sparse_mla.v_head_dim) == (512, 512)
     assert int(sparse_mla.model_type) == 2
     assert (mhc.hidden_size, mhc.split_k) == (4_096, 64)
-    assert (moe.quant_mode, moe.intermediate_size, moe.top_k) == (
+    assert (main_moe.quant_mode, main_moe.intermediate_size, main_moe.top_k) == (
+        "nvfp4",
+        512,
+        8,
+    )
+    assert (mtp_moe.quant_mode, mtp_moe.intermediate_size, mtp_moe.top_k) == (
         "w4a16",
         512,
         8,
     )
-    assert (vocab.in_features, vocab.out_features) == (4_096, 40_992)
+    assert (vocab.in_features, vocab.out_features) == (4_096, 38_720)
+
+
+def test_glm53_preset_composes_dsa_sparse_mla_main_and_mtp_moe() -> None:
+    selections = {
+        item.scenario: item
+        for item in _glm53_queries(8, runtime_device="cuda:0")
+    }
+
+    indexer = selections["dsa-decode-spec4"].query
+    sparse_mla = selections["sparse-mla-spec4"].query
+    main_moe = selections["main-moe-m4"].query
+    mtp_moe = selections["mtp-moe-m4"].query
+    vocab = selections["vocab-projection-m1"].query
+    assert (indexer.num_q_heads, indexer.top_k) == (32, 2_048)
+    assert (sparse_mla.num_q_heads, sparse_mla.qk_head_dim) == (8, 576)
+    assert (main_moe.quant_mode, main_moe.intermediate_size, main_moe.top_k) == (
+        "nvfp4",
+        256,
+        8,
+    )
+    assert (mtp_moe.quant_mode, mtp_moe.intermediate_size, mtp_moe.top_k) == (
+        "w4a16",
+        256,
+        8,
+    )
+    assert (vocab.in_features, vocab.out_features) == (6_144, 19_360)
+
+
+def test_glm53_vocab_projection_corpus_uses_checkpoint_vocabulary() -> None:
+    cases = _bf16_vocab_projection_cases()
+    glm53_cases = tuple(
+        case
+        for case in cases
+        if case.metadata["model_id"] in {"glm-5.3", "glm-5.3-flash"}
+    )
+
+    assert {case.metadata["global_vocab_size"] for case in glm53_cases} == {
+        154_880
+    }
+    assert {
+        (case.query["in_features"], case.query["out_features"])
+        for case in glm53_cases
+        if case.metadata["tp_size"] == 8
+    } == {(4_096, 19_360), (6_144, 19_360)}
 
 
 def test_deepseek_v4_flash_preset_composes_indexer_sparse_mla_and_moe() -> None:
@@ -295,7 +352,9 @@ def test_minimax_m3_preset_includes_paged_attention_msa_and_moe() -> None:
     assert selections[1].query.score_mode == "msa"
 
 
-@pytest.mark.parametrize("factory", (_glm52_queries, _glm53_flash_queries))
+@pytest.mark.parametrize(
+    "factory", (_glm52_queries, _glm53_queries, _glm53_flash_queries)
+)
 def test_glm_presets_reject_unqualified_four_head_attention_shards(factory) -> None:
     with pytest.raises(ValueError, match="TP 1, 2, 4, or 8"):
         factory(16, runtime_device="cuda:0")
@@ -333,18 +392,16 @@ def test_qwen_dense_inspection_is_fully_preplanned_on_gb10(
     }
 
 
-@pytest.mark.parametrize("model", ("glm-5.2", "glm-5.3-flash"))
+@pytest.mark.parametrize("model", ("glm-5.2", "glm-5.3", "glm-5.3-flash"))
 @pytest.mark.parametrize("tp_size", (1, 2, 4, 8))
-def test_glm_inspection_is_fully_preplanned_on_gb10(
+def test_glm_inspection_reports_packed_a16_heuristics_on_gb10(
     model: str,
     tp_size: int,
 ) -> None:
     payload = inspect_model_policy(model, tp_size=tp_size, device="gb10")
 
     assert payload["profile_id"] == "nvidia.gb10.48sm"
-    assert {selection["source"] for selection in payload["selections"]} == {
-        "preplanned"
-    }
+    _assert_profile_coverage_with_uniform_nvfp4_a16_heuristics(payload)
 
 
 @pytest.mark.parametrize(
@@ -355,6 +412,7 @@ def test_glm_inspection_is_fully_preplanned_on_gb10(
         ("dsv4f-nvfp4", 2),
         ("glm-5.1", 8),
         ("glm-5.2", 8),
+        ("glm-5.3", 8),
         ("glm-5.3-flash", 1),
         ("kimi-k3", 12),
         ("laguna-s2.1", 1),
@@ -368,12 +426,20 @@ def test_glm_inspection_is_fully_preplanned_on_gb10(
         ("qwen3.8-flash-next-180b", 1),
     ),
 )
-def test_every_canonical_model_is_fully_preplanned_at_its_benchmark_tp(
+def test_canonical_model_profile_coverage_at_its_benchmark_tp(
     model: str,
     tp_size: int,
 ) -> None:
     payload = inspect_model_policy(model, tp_size=tp_size, device="gb10")
 
-    assert {selection["source"] for selection in payload["selections"]} == {
-        "preplanned"
-    }
+    _assert_profile_coverage_with_uniform_nvfp4_a16_heuristics(payload)
+
+
+def _assert_profile_coverage_with_uniform_nvfp4_a16_heuristics(payload):
+    for selection in payload["selections"]:
+        query = selection["query"]
+        uniform_nvfp4_a16 = (
+            query.get("quant_mode") == "w4a16"
+            and query.get("source_format") == "modelopt_nvfp4"
+        )
+        assert selection["source"] == ("heuristic" if uniform_nvfp4_a16 else "preplanned")

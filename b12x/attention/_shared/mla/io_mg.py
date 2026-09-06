@@ -38,6 +38,7 @@ _GLM_NEXT_IO_STRIDE = 528
 # + 128B BF16 RoPE. The 288B NoPE+scales+pad region bulk-copies into the kv_fp8
 # row; RoPE is read from global/L2 by the math exactly like GLM.
 _NVFP4_IO_STRIDE = 432
+_GLM_NEXT_NVFP4_IO_STRIDE = 304
 _NVFP4_NOPE_SCALE_BYTES = 288
 _NVFP4_FP8_ROPE_IO_STRIDE = 368
 
@@ -166,16 +167,16 @@ def io_issue_gather_glm_mg(
     if cutlass.const_expr(scale_format == 2):
         if cutlass.const_expr(fp8_rope):
             _ios = Int64(_NVFP4_FP8_ROPE_IO_STRIDE)
-        else:
+        elif cutlass.const_expr(has_rope):
             _ios = Int64(_NVFP4_IO_STRIDE)
+        else:
+            _ios = Int64(_GLM_NEXT_NVFP4_IO_STRIDE)
         _nope = Int32(_NVFP4_NOPE_SCALE_BYTES)
     else:
         _ios = Int64(_GLM_IO_STRIDE if has_rope else _GLM_NEXT_IO_STRIDE)
         _nope = Int32(_GLM_NOPE_SCALE_BYTES)
 
-    if cutlass.const_expr(
-        scale_format == 2 and fp8_rope and per_token_latent_scale
-    ):
+    if cutlass.const_expr(scale_format == 2 and per_token_latent_scale):
         # NVFP4 two-level record: scalar-gather the per-token fp32 latent
         # scale ([292, 296); loaded as the second word of the 8-aligned pair
         # at [288, 296)) into the contiguous smem kv_sc buffer -- the MG

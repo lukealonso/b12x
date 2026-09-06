@@ -1172,6 +1172,7 @@ def _make_mla_binding(
 ):
     plan = plan_sparse_mla_scratch(
         B12XSparseMLAScratchCaps(
+            softmax_scale=1.0,
             mode=mode,
             device=device,
             dtype=torch.bfloat16,
