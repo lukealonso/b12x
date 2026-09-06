@@ -350,6 +350,18 @@ def _max_active_clusters_for(
     )
 
 
+def _tile_major_cluster_limit(
+    max_active_clusters: int,
+    *,
+    n: int,
+    l: int,
+    tile_n: int,
+) -> int:
+    """Apply the qualified 64-output-tile launch cap by grid geometry."""
+    output_tiles = ((n + tile_n - 1) // tile_n) * l
+    return min(max_active_clusters, 40) if output_tiles == 64 else max_active_clusters
+
+
 def _use_direct_sfa_live16(
     *,
     m: int,
@@ -421,7 +433,10 @@ def _dense_gemm_policy_for(
     mma_tiler_mn: Tuple[int, int],
     cluster_shape_mn: Tuple[int, int],
     sm_count: int,
+    tile_k: int = 128,
     expected_m: Optional[int] = None,
+    generalize_mxfp8_split_k: bool = False,
+    generalize_block_fp8_split_k: bool = False,
 ) -> _DenseGemmPolicy:
     max_active_clusters = _max_active_clusters_for(cluster_shape_mn, sm_count)
     tile_m, tile_n = mma_tiler_mn
@@ -447,6 +462,13 @@ def _dense_gemm_policy_for(
     )
     split_k_slices = 1
     split_k_atomic_bf16 = _B12X_DENSE_SPLITK_TURBO
+    # The slice count fixes how the K reduction is grouped into partial sums
+    # that the atomic BF16 epilogue combines, so it is part of the served
+    # decode numerics. ``generalize_mxfp8_split_k`` and
+    # ``generalize_block_fp8_split_k`` (grid-capacity slice policies measured
+    # for other GPU classes) therefore only tune the mainloop unroll below;
+    # the slice selection itself is the served policy. ``block_fp8`` decode
+    # slices are computed for the plan selector's tile choice only.
     if split_k_candidate:
         split_k_slices = (
             4 if m == 8 and (n, k) == (4096, 4096) and mma_tiler_mn == (16, 128) else 2
@@ -495,6 +517,35 @@ def _dense_gemm_policy_for(
         and not direct_one_m_tile_scheduler
         and not use_m1_non_tma
     )
+    if (
+        generalize_mxfp8_split_k
+        and _dense_spark_policy_for_sm_count(sm_count)
+        and mma_tiler_mn == (128, 128)
+        and tile_k == 64
+        and expected_m is not None
+    ):
+        if 1536 <= expected_m <= 2048 and n >= 4096 and k >= 2048:
+            # The bounded medium-prefill BK64 plan needs four-way mainloop
+            # unrolling and the unswizzled persistent scheduler.
+            use_large_m_unroll = True
+        elif expected_m >= 4096 and k >= 4096:
+            # At large M the 16-way persistent swizzle is the structural win
+            # for BK64. Coupling it off through large_m_unroll causes severe
+            # WO-B/Qwen cliffs (up to ~3x at M=8192).
+            use_large_m_unroll = False
+    if (
+        generalize_block_fp8_split_k
+        and _dense_spark_policy_for_sm_count(sm_count)
+        and mma_tiler_mn == (128, 128)
+        and expected_m is not None
+        and expected_m >= 2048
+        and k >= 10240
+    ):
+        # K128 block scaling lengthens each staged accumulation. Once the
+        # reduction reaches 80 scale blocks, a 128-row tile wins by reusing B;
+        # keeping two-way unroll and the 16-way scheduler swizzle avoids the
+        # large-M cliff seen with the generic FP8 unroll threshold.
+        use_large_m_unroll = False
     return _DenseGemmPolicy(
         single_work_tile_per_cta=single_work_tile_per_cta,
         direct_one_m_tile_scheduler=direct_one_m_tile_scheduler,
@@ -505,6 +556,29 @@ def _dense_gemm_policy_for(
             ab_dtype == cutlass.Float8E4M3FN and use_large_m_unroll and l == 1
         ),
     )
+
+
+def _select_block_fp8_decode_slices(
+    m: int,
+    n: int,
+    k: int,
+    sm_count: int,
+) -> int:
+    """Select a qualified low-SM K128 block-FP8 decode split count."""
+    n_tiles_64 = (n + 63) // 64
+    minimum_tiles = (2 * sm_count + 2) // 3
+    if (
+        not _dense_spark_policy_for_sm_count(sm_count)
+        or m > 6
+        or n_tiles_64 < minimum_tiles
+        or k < 4096
+    ):
+        return 1
+    if k % (4 * 128) == 0:
+        return 4
+    if k <= 4352 and k % (2 * 128) == 0:
+        return 2
+    return 1
 
 
 @cute.jit
@@ -4707,9 +4781,13 @@ class _DenseGemmLaunch:
             and b_tile_major
             and sfb_k_reuse
             and alpha_is_one
-            and (n, k, l) in ((1024, 4096, 4), (4096, 4096, 1))
         ):
-            self._max_active_clusters = min(self._max_active_clusters, 40)
+            self._max_active_clusters = _tile_major_cluster_limit(
+                self._max_active_clusters,
+                n=n,
+                l=l,
+                tile_n=mma_tiler_mn[1],
+            )
 
     def compile_key(self) -> tuple[object, ...]:
         """Return every value that can specialize the generated kernel."""
@@ -5975,7 +6053,9 @@ def dense_gemm_fused_quant_a_grouped(
         mma_tiler_mn=mma_tiler_mn,
         cluster_shape_mn=(1, 1),
         sm_count=sm_count,
+        tile_k=128,
         expected_m=expected_m,
+        generalize_mxfp8_split_k=True,
     )
     if policy.split_k_slices != 1:
         raise ValueError("fused grouped MXFP8 quantization does not support split-K")
@@ -6877,6 +6957,20 @@ def _select_default_mma_tiler_mn(
             return (64, 64)
         return (64, 128)
 
+    if (
+        48 <= plan_m <= 64
+        and n >= 4096
+        and k is not None
+        and k >= 5120
+        and _dense_spark_policy_for_sm_count(sm_count)
+    ):
+        # Joint tile/BK/load sweeps across Qwen TP=1/2/4/8 and the common
+        # corpus found a bounded medium-M window where doubling the N-tile
+        # count wins after swapping the logical operands. TMA remains the load
+        # path; _select_default_dense_gemm_plan attaches swapped storage to the
+        # narrow tile.
+        return (64, 32)
+
     coarse_tiles = ((m + coarse_tile[0] - 1) // coarse_tile[0]) * (
         (n + coarse_tile[1] - 1) // coarse_tile[1]
     )
@@ -6886,6 +6980,12 @@ def _select_default_mma_tiler_mn(
     # still leaves the GPU below the existing half-SM occupancy proxy.
     if n > 1536:
         if m <= 64:
+            # Very wide outputs already expose multiple full 128-column waves.
+            # A 64-column tile gives the producer/epilogue a smaller working
+            # set without relying on extra K splits; keep 128 columns for
+            # narrower grids where duplicating A traffic does not pay back.
+            if (n + 127) // 128 >= 2 * sm_count:
+                return (64, 64)
             return (64, 128)
         if m <= 256 and coarse_tiles < max(1, sm_count // 2):
             return (64, 128)
@@ -6909,6 +7009,25 @@ def _select_mxfp8_tile_k(
     expected_m: Optional[int],
     sm_count: int,
 ) -> int:
+    plan_m = expected_m if expected_m is not None else m
+    if (
+        expected_m is not None
+        and k <= 1024
+        and n >= 4096
+        and _dense_spark_policy_for_sm_count(sm_count)
+    ):
+        medium_prefill_bk64 = (
+            1536 <= plan_m <= 2048
+            and (n + 127) // 128 <= 2 * sm_count
+        )
+        return 64 if medium_prefill_bk64 else 128
+    if (
+        1536 <= plan_m <= 2048
+        and n >= 4096
+        and k >= 2048
+        and _dense_spark_policy_for_sm_count(sm_count)
+    ):
+        return 64
     # Keep tile-M and tile-K as one hardware-specific q_b plan: Spark uses
     # BM64/BK128, while the RTX specialization below remains BM128/BK64.
     if (
@@ -6927,6 +7046,34 @@ def _select_mxfp8_tile_k(
         and ((n >= 16384 and k <= 1024) or (n, k) == (4096, 4096))
     )
     return 64 if hinted_bk64 else 128
+
+
+def _select_fp4_tile_k(
+    m: int,
+    n: int,
+    k: int,
+    expected_m: Optional[int],
+    sm_count: int,
+    mma_tiler_mn: Tuple[int, int],
+) -> int:
+    """Select the staged K depth for prequantized NVFP4 GEMM."""
+    plan_m = expected_m if expected_m is not None else m
+    if (
+        plan_m <= 128
+        and k >= 4096
+        and k % 256 == 0
+        and _dense_spark_policy_for_sm_count(sm_count)
+    ):
+        tile_n = mma_tiler_mn[1]
+        n_tiles = (n + tile_n - 1) // tile_n
+        # NCU showed BK128 long-scoreboard-bound with 1.9-3.3x the reference's
+        # TMA-pipe instructions. BK256 amortizes each handshake over two scale
+        # tiles. Narrow tiles retain enough pipeline depth on small grids;
+        # 128-column tiles need at least a half-SM wave to hide the shallower
+        # pipeline. The offline TP/corpus sweep qualifies this through M=64.
+        if tile_n <= 64 or n_tiles >= max(1, sm_count // 2):
+            return 256
+    return 128
 
 
 def _validate_mxfp8_bk64_plan(
@@ -6949,6 +7096,7 @@ def _select_default_dense_gemm_plan(
     *,
     is_mxfp8: bool,
     is_mxfp6: bool = False,
+    block_fp8: bool = False,
     expected_m: Optional[int] = None,
 ) -> _DenseGemmPlan:
     tile = _select_default_mma_tiler_mn(
@@ -6960,6 +7108,112 @@ def _select_default_dense_gemm_plan(
         expected_m=expected_m,
         k=k,
     )
+    plan_m = expected_m if expected_m is not None else m
+    if (
+        block_fp8
+        and _select_block_fp8_decode_slices(plan_m, n, k, sm_count) > 1
+    ):
+        tile = (32, 64)
+    elif (
+        is_mxfp8
+        and not block_fp8
+        and k <= 1024
+        and n >= 4096
+        and _dense_spark_policy_for_sm_count(sm_count)
+    ):
+        n_tiles_128 = (n + 127) // 128
+        if plan_m <= 6:
+            # Short-K decode is output-grid-bound. A 64-column tile supplies
+            # at least one full CTA wave down through TP=8 while preserving
+            # the two-CTA occupancy policy for the 16-row MMA tile.
+            tile = (16, 64)
+        elif 1536 <= plan_m <= 2048 and n_tiles_128 <= 2 * sm_count:
+            # Smaller medium-prefill shards benefit from BK64 scale staging;
+            # wider grids retain the 64x128/BK128 plan.
+            tile = (128, 128)
+        elif plan_m > 128:
+            tile = (64, 128)
+    elif (
+        is_mxfp8
+        and not block_fp8
+        and plan_m <= 6
+        and k % (4 * 128) == 0
+        and 4096 <= k <= 6144
+        and (n + 63) // 64 >= sm_count
+        and _dense_spark_policy_for_sm_count(sm_count)
+    ):
+        # The four-slice decode kernel uses one 64-column CTA per output tile.
+        # Select the jointly tuned 32-row tile only once that grid spans a full
+        # SM wave; smaller grids retain the direct 16-row plan.
+        tile = (32, 64)
+    elif (
+        is_mxfp8
+        and not block_fp8
+        and 1536 <= plan_m <= 2048
+        and n >= 4096
+        and k >= 2048
+        and _dense_spark_policy_for_sm_count(sm_count)
+    ):
+        # Across Qwen TP=1/2/4/8 and the N=4096 K-boundary corpus, the
+        # 128x128/BK64 plan is the bounded medium-prefill winner. The M bounds
+        # exclude measured 1024 and 3072 counterexamples.
+        tile = (128, 128)
+    elif (
+        is_mxfp8
+        and not block_fp8
+        and 512 <= plan_m <= 3072
+        and 1536 < n < 4096
+        and _dense_spark_policy_for_sm_count(sm_count)
+    ):
+        # A narrow-wide output does not provide enough 128-column tiles to
+        # offset repeated B loads from the 64-row prefill default. Doubling M
+        # while halving N preserves the output grid and wins throughout the
+        # qualified prefill window; M=4096 counterexamples retain 64x128.
+        tile = (128, 64)
+    if (
+        block_fp8
+        and 96 <= plan_m <= 128
+        and k >= 8192
+        and (n + 127) // 128 < sm_count
+        and _dense_spark_policy_for_sm_count(sm_count)
+    ):
+        # Deep-K medium batches benefit from B reuse before the full prefill
+        # regime begins; the narrow output grid remains a full M-expanded wave.
+        tile = (128, 128)
+    if (
+        is_mxfp8
+        and not block_fp8
+        and expected_m is not None
+        and expected_m <= 8
+        and k >= 8192
+        and (n + 127) // 128 < sm_count
+    ):
+        # A deep-K, narrow-N decode shape otherwise exposes fewer than one
+        # 128-column wave and falls back to split-K. Two 64-column waves keep
+        # the same CTA parallelism without partial-output reduction.
+        tile = (16, 64)
+    elif (
+        is_mxfp8
+        and not block_fp8
+        and expected_m is not None
+        and expected_m >= 2048
+        and k >= 8192
+        and (n + 127) // 128 < sm_count
+    ):
+        # Deep-K prefill reloads the full weight matrix once per M tile. A
+        # 128-row tile halves those reloads while the large M dimension still
+        # leaves a deeply oversubscribed grid.
+        tile = (128, 128)
+    if (
+        block_fp8
+        and expected_m is not None
+        and expected_m >= 2048
+        and k >= 10240
+    ):
+        # Block-FP8 accumulates and rescales every K128 stage. Deep-K prefill
+        # benefits from doubling tile M: it halves the number of CTAs that
+        # reload each weight/scaling block without starving the large-M grid.
+        tile = (128, 128)
     return _DenseGemmPlan(
         mma_tiler_mn=tile,
         load_path="tma",
@@ -7067,7 +7321,9 @@ def dense_gemm_fused_quant_a(
         mma_tiler_mn=mma_tiler_mn,
         cluster_shape_mn=(1, 1),
         sm_count=sm_count,
+        tile_k=128,
         expected_m=expected_m,
+        generalize_mxfp8_split_k=True,
     )
     split_k_slices = policy.split_k_slices
     split_k_output = split_k_slices > 1
@@ -7169,6 +7425,9 @@ def dense_gemm(
     plain_fp8: bool = False,
     row_scale: Optional[torch.Tensor] = None,
     block_fp8: bool = False,
+    _tile_k_override: Optional[int] = None,
+    _split_k_slices_override: Optional[int] = None,
+    _large_m_unroll_override: Optional[bool] = None,
 ) -> torch.Tensor:
     """Execute dense block-scaled GEMM for one expert-major batch stack.
 
@@ -7235,7 +7494,7 @@ def dense_gemm(
         is_mxfp6 = False
         k *= 2
         mma_k = 64
-        tile_k = sf_vec_size * 8
+        tile_k = 128
     elif ab_dtype == "float8_e4m3fn":
         is_mxfp8 = True
         is_mxfp6 = False
@@ -7264,6 +7523,33 @@ def dense_gemm(
                 raise ValueError(f"unsupported {name}={fmt!r}")
     else:
         raise TypeError(f"dense_gemm unsupported ab_dtype: {ab_dtype}")
+    if _tile_k_override is not None:
+        if ab_dtype == "float4_e2m1fn":
+            valid_tile_k = (128, 256, 512)
+            format_name = "NVFP4"
+        elif (
+            ab_dtype == "float8_e4m3fn"
+            and not block_fp8
+            and not plain_fp8
+            and sf_dtype == "float8_e8m0fnu"
+            and sf_vec_size == 32
+        ):
+            valid_tile_k = (64, 128)
+            format_name = "MXFP8"
+        else:
+            raise ValueError(
+                "_tile_k_override is restricted to NVFP4 or MXFP8 autotuning"
+            )
+        if _tile_k_override not in valid_tile_k or k % _tile_k_override:
+            if format_name == "NVFP4":
+                requirement = "128, 256, or 512"
+            else:
+                requirement = "one of (64, 128)"
+            raise ValueError(
+                f"{format_name} _tile_k_override must be {requirement} and divide "
+                f"logical K={k}, got {_tile_k_override}"
+            )
+        tile_k = _tile_k_override
     if block_fp8:
         plain_fp8 = True
         expected_sfa_shape = (m, k // 128)
@@ -7382,6 +7668,7 @@ def dense_gemm(
             sm_count,
             is_mxfp8=is_mxfp8,
             is_mxfp6=is_mxfp6,
+            block_fp8=block_fp8,
             expected_m=expected_m,
         )
         if mma_tiler_mn is None:
@@ -7392,6 +7679,19 @@ def dense_gemm(
             swap_ab = default_plan.swap_ab if mma_tiler_mn[1] < 64 else False
     assert load_path is not None
     assert swap_ab is not None
+    if ab_dtype == "float4_e2m1fn" and _tile_k_override is None:
+        tile_k = _select_fp4_tile_k(
+            m,
+            n,
+            k,
+            expected_m,
+            sm_count,
+            mma_tiler_mn,
+        )
+    if is_mxfp8 and swap_ab:
+        # BK64 packed-scale staging requires the weight operand to remain in
+        # the unswapped 128-row slot. Swapped storage therefore uses BK128.
+        tile_k = 128
     if is_mxfp6:
         # Only the unswapped single-slice TMA mainloop is wired for the FP6
         # byte-container path; fail loudly instead of silently miscomputing.
@@ -7454,8 +7754,77 @@ def dense_gemm(
         mma_tiler_mn=mma_tiler_mn,
         cluster_shape_mn=cluster_shape_mn,
         sm_count=sm_count,
+        tile_k=tile_k,
         expected_m=expected_m,
+        generalize_mxfp8_split_k=(is_mxfp8 and not block_fp8 and not plain_fp8),
+        generalize_block_fp8_split_k=block_fp8,
     )
+    if _split_k_slices_override is not None:
+        mxfp8_autotune = (
+            is_mxfp8
+            and not block_fp8
+            and not plain_fp8
+            and sf_vec_size == 32
+            and sf_dtype == "float8_e8m0fnu"
+        )
+        block_fp8_autotune = (
+            is_mxfp8
+            and block_fp8
+            and sf_vec_size == 128
+            and sf_dtype == "float32"
+        )
+        if not (mxfp8_autotune or block_fp8_autotune):
+            raise ValueError(
+                "_split_k_slices_override is restricted to MXFP8 or block-FP8 "
+                "autotuning"
+            )
+        if _split_k_slices_override not in (1, 2, 4):
+            raise ValueError(
+                "FP8 _split_k_slices_override must be 1, 2, or 4, got "
+                f"{_split_k_slices_override}"
+            )
+        if _split_k_slices_override > 1:
+            if m > 8 or m > mma_tiler_mn[0] or l != 1 or swap_ab:
+                raise ValueError(
+                    "split-K FP8 autotuning requires M<=8 within one M tile, "
+                    f"L=1, and an unswapped plan; got M={m}, L={l}, "
+                    f"tile={mma_tiler_mn}, swap_ab={swap_ab}"
+                )
+            if k % (tile_k * _split_k_slices_override):
+                raise ValueError(
+                    "split-K FP8 autotuning requires the staged K-tile count "
+                    f"to divide evenly across slices; got K={k}, BK={tile_k}, "
+                    f"slices={_split_k_slices_override}"
+                )
+            if _split_k_slices_override > 2 and not _B12X_DENSE_SPLITK_TURBO:
+                raise ValueError(
+                    "four-way split-K requires the atomic-BF16 reduction path"
+                )
+        policy = _DenseGemmPolicy(
+            single_work_tile_per_cta=policy.single_work_tile_per_cta,
+            direct_one_m_tile_scheduler=policy.direct_one_m_tile_scheduler,
+            use_m1_non_tma=policy.use_m1_non_tma,
+            split_k_slices=_split_k_slices_override,
+            split_k_atomic_bf16=(
+                _split_k_slices_override > 1 and _B12X_DENSE_SPLITK_TURBO
+            ),
+            large_m_unroll=policy.large_m_unroll,
+        )
+    if _large_m_unroll_override is not None:
+        if not is_mxfp8 or is_mxfp6 or l != 1:
+            raise ValueError(
+                "_large_m_unroll_override is restricted to FP8 autotuning with L=1"
+            )
+        if not isinstance(_large_m_unroll_override, bool):
+            raise ValueError("_large_m_unroll_override must be a bool")
+        policy = _DenseGemmPolicy(
+            single_work_tile_per_cta=policy.single_work_tile_per_cta,
+            direct_one_m_tile_scheduler=policy.direct_one_m_tile_scheduler,
+            use_m1_non_tma=policy.use_m1_non_tma,
+            split_k_slices=policy.split_k_slices,
+            split_k_atomic_bf16=policy.split_k_atomic_bf16,
+            large_m_unroll=_large_m_unroll_override,
+        )
     split_k_slices = policy.split_k_slices
     if swap_ab and split_k_slices != 1:
         policy = _DenseGemmPolicy(
