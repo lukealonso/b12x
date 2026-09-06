@@ -5,7 +5,13 @@ interpreter on CPU when ``TRITON_INTERPRET=1`` is set before ``triton`` is
 imported; otherwise the kernel tests skip. The interpreter emulates
 ``tl.sort`` at roughly 0.2 s per program, so the shapes below keep the expert
 count small except for one served-shape case (896 experts); the whole module
-takes about 15 minutes under the interpreter and seconds on a GPU.
+takes about 10 minutes under the interpreter and seconds on a GPU.
+
+The interpreter proves the layout but not compilability: it executes the
+taken branch of a Python ``if`` and never joins branch types, so a kernel
+that cannot compile can still pass here.
+``test_w4a16_route_pack_compile.py`` compiles every launched kernel instance
+for the served target and covers that gap without a GPU.
 """
 
 from __future__ import annotations
@@ -21,8 +27,11 @@ from b12x.moe._shared.kernels.w4a16.host import route_pack_capacity
 from b12x.moe._shared.kernels.w4a16.route_pack import pack_topk_routes_by_expert
 
 _STABLE_MIN_ROUTES = route_pack_module._STABLE_SORT_MIN_ROUTES
-_SORT_SMALL = route_pack_module._STABLE_SEGMENT_SORT_SMALL
-_SORT_LARGE = route_pack_module._STABLE_SEGMENT_SORT_LARGE
+_SEGMENT_SORT_WIDTHS = [
+    width for width, _ in route_pack_module._STABLE_SEGMENT_SORT_WIDTHS
+]
+_SORT_SMALL = _SEGMENT_SORT_WIDTHS[0]
+_SORT_LARGE = _SEGMENT_SORT_WIDTHS[-1]
 _TOP_K = 16
 
 
@@ -245,10 +254,10 @@ def test_segment_sort_accepts_int64_route_ids(monkeypatch) -> None:
     [_SORT_SMALL, _SORT_SMALL + 1, _SORT_LARGE, _SORT_LARGE + 1],
 )
 def test_segment_sort_thresholds(segment_rows: int, monkeypatch) -> None:
-    """One expert's segment sits exactly at each width boundary: up to
-    ``_STABLE_SEGMENT_SORT_SMALL`` rows take the short sorting network, up to
-    ``_STABLE_SEGMENT_SORT_LARGE`` the long one, and anything longer is
-    rebuilt by the sequential scan."""
+    """One expert's segment sits exactly at each width boundary: the widths
+    in ``_STABLE_SEGMENT_SORT_WIDTHS`` bound the register sorting networks
+    and anything longer is rebuilt by the sequential scan, so each boundary
+    row count exercises a different launch of the pack sequence."""
     device = _kernel_device()
     num_experts = 64
     ids = _pinned_expert(segment_rows, _TOP_K, num_experts, 11 + segment_rows)
@@ -267,23 +276,35 @@ def test_segment_sort_matches_reference_at_the_served_expert_count(monkeypatch) 
     _check_against_reference_and_scan(topk_ids, 48, num_experts, None, monkeypatch)
 
 
-def test_stable_flag_keeps_small_launches_on_the_atomic_path(monkeypatch) -> None:
-    """Below the stable threshold the segment sort is not launched."""
+def test_stable_pack_launches_one_kernel_per_segment_width(monkeypatch) -> None:
+    """Below the stable threshold no segment kernel is launched. Above it the
+    pack sequence is one sort launch per lane width plus one scan launch,
+    each over all experts, and the launches' ``(COUNT_MIN, SORT_WIDTH]``
+    bands tile every segment size from one route up: the sort bands start at
+    zero and chain, and the scan takes everything above the widest sort. A
+    program's lane count is a compile-time extent, so this host-side split is
+    what lets one launch sequence cover every segment size."""
     device = _kernel_device()
 
     class LaunchRecorder:
-        def __init__(self) -> None:
-            self.launches = 0
+        """Stand-in for a Triton kernel that records ``grid`` and kwargs."""
 
-        def __getitem__(self, _grid):
-            def launch(*_args, **_kwargs) -> None:
-                self.launches += 1
+        def __init__(self) -> None:
+            self.calls: list[tuple[tuple[int, ...], dict]] = []
+
+        def __getitem__(self, grid):
+            def launch(*_args, **kwargs) -> None:
+                self.calls.append((grid, kwargs))
 
             return launch
 
-    recorder = LaunchRecorder()
+    sorts = LaunchRecorder()
+    scans = LaunchRecorder()
     monkeypatch.setattr(
-        route_pack_module, "_pack_topk_routes_segment_sort_kernel", recorder
+        route_pack_module, "_pack_topk_routes_segment_sort_kernel", sorts
+    )
+    monkeypatch.setattr(
+        route_pack_module, "_pack_topk_routes_segment_scan_kernel", scans
     )
     monkeypatch.setenv("B12X_W4A16_STABLE_ROUTE_PACK", "1")
     monkeypatch.delenv("B12X_W4A16_STABLE_ROUTE_PACK_SCAN", raising=False)
@@ -291,10 +312,21 @@ def test_stable_flag_keeps_small_launches_on_the_atomic_path(monkeypatch) -> Non
     small = _uniform(32, 8, num_experts, 1).to(device)
     assert small.numel() < _STABLE_MIN_ROUTES
     pack_topk_routes_by_expert(small, 16, num_experts, **_workspaces(small, 16, num_experts))
-    assert recorder.launches == 0
+    assert sorts.calls == [] and scans.calls == []
+
     large = _uniform(_STABLE_MIN_ROUTES // 8, 8, num_experts, 2).to(device)
     pack_topk_routes_by_expert(large, 16, num_experts, **_workspaces(large, 16, num_experts))
-    assert recorder.launches == 1
+    bands = [(0, _SEGMENT_SORT_WIDTHS[0])] + list(
+        zip(_SEGMENT_SORT_WIDTHS[:-1], _SEGMENT_SORT_WIDTHS[1:], strict=True)
+    )
+    assert [
+        (kwargs["COUNT_MIN"], kwargs["SORT_WIDTH"]) for _, kwargs in sorts.calls
+    ] == bands
+    assert [grid for grid, _ in sorts.calls] == [(num_experts,)] * len(bands)
+    assert len(scans.calls) == 1
+    scan_grid, scan_kwargs = scans.calls[0]
+    assert scan_grid == (num_experts,)
+    assert scan_kwargs["COUNT_MIN"] == _SEGMENT_SORT_WIDTHS[-1]
 
 
 def test_stable_flag_off_keeps_the_arrival_order_layout(monkeypatch) -> None:
