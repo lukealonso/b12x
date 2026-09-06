@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import ctypes
+import datetime
+import json
 import os
 import socket
 import time
@@ -106,6 +108,13 @@ def _reference(
 
 
 def _local_staging_words(channel, stream: torch.cuda.Stream) -> tuple[int, int]:
+    """Sample one gather staging word per slot that a gather call rewrites.
+
+    Pull transport: a rank stages its own rows compactly from offset 0 of
+    its slot, so the first word is its own row 0. Push transport: a rank's
+    slot holds only its peers' rows, at their output positions, so the
+    sample is the first word of the next rank's row 0.
+    """
     assert channel._ipc is not None
     assert len(channel._owned_buffers) == 1
     layout = _staging_layout(
@@ -116,11 +125,15 @@ def _local_staging_words(channel, stream: torch.cuda.Stream) -> tuple[int, int]:
         head_dim=channel.head_dim,
         query_head_dim=channel.query_head_dim,
     )
+    row_offset = 0
+    if channel.push_transport:
+        peer = (channel.rank + 1) % channel.world_size
+        row_offset = peer * channel.heads_per_rank * channel.query_head_dim * 2
     words = (ctypes.c_uint16(), ctypes.c_uint16())
     local_ptr = channel._owned_buffers[0].local_ptr
     for word, offset in zip(
         words,
-        (layout.staging0_offset, layout.staging1_offset),
+        (layout.staging0_offset + row_offset, layout.staging1_offset + row_offset),
         strict=True,
     ):
         channel._ipc.cudaMemcpyAsync(
@@ -785,6 +798,12 @@ def _check_queued_mixed_grid_graph(
         )
 
 
+def _stage(rank: int, name: str) -> None:
+    """One JSON line per rank and check boundary, so a hang or a collective
+    sequence mismatch can be attributed to the check a rank was in."""
+    print(json.dumps({"stage": name, "rank": rank}), flush=True)
+
+
 def _worker(rank: int, world_size: int, port: int) -> None:
     torch.cuda.set_device(rank)
     device = torch.device("cuda", rank)
@@ -793,6 +812,11 @@ def _worker(rank: int, world_size: int, port: int) -> None:
         init_method=f"tcp://127.0.0.1:{port}",
         rank=rank,
         world_size=world_size,
+        # A collective that never completes fails the run after this long
+        # instead of NCCL's ten-minute default.
+        timeout=datetime.timedelta(
+            seconds=int(os.getenv("B12X_PCIE_DCP_A2A_TEST_NCCL_TIMEOUT_S", "600"))
+        ),
     )
     pool = PCIeDCPA2APool.from_process_group(
         process_group=dist.group.WORLD,
@@ -808,19 +832,25 @@ def _worker(rank: int, world_size: int, port: int) -> None:
         pool.prepare_channels(("eager:dcp", "graph"))
         if rank == 0:
             print("A2A GPU gate: eager", flush=True)
+        _stage(rank, "eager")
         _check_eager(pool, rank, world_size, device)
         dist.barrier()
+        _stage(rank, "eager_adjacency")
         _check_eager_adjacency(pool, rank, world_size, device)
         dist.barrier()
+        _stage(rank, "semantic_capture_warmup")
         _check_semantic_capture_warmup(pool, rank, world_size, device)
         dist.barrier()
         if rank == 0:
             print("A2A GPU gate: graph replay", flush=True)
+        _stage(rank, "graph")
         _check_graph(pool, rank, world_size, device)
         dist.barrier()
         if rank == 0:
             print("A2A GPU gate: queued mixed-grid skew", flush=True)
+        _stage(rank, "queued_mixed_grid_graph")
         _check_queued_mixed_grid_graph(pool, rank, world_size, device)
+        _stage(rank, "complete")
         if rank == 0:
             print("A2A GPU gate: complete", flush=True)
         torch.cuda.synchronize(device)
