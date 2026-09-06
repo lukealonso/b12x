@@ -40,6 +40,20 @@ FLAG_SLOTS = 256
 MAX_PIECES = 8
 SCRATCH_ALIGN = 256
 FP8_QUANT_BLOCK = 128
+# Flag-slot range of the all-reduce ring (and the compressed all-to-all): one
+# slot per (step, piece) plus a done slot, at most 2 * (world - 1) *
+# MAX_PIECES + 1 slots, 145 at the largest supported world size. Further
+# collectives on the same channel take disjoint ranges so every slot's
+# monotonic counter is owned by exactly one op kind.
+AR_SLOT_BASE = 0
+AR_SLOT_COUNT = 2 * (max(SUPPORTED_WORLD_SIZES) - 1) * MAX_PIECES + 1
+assert AR_SLOT_BASE + AR_SLOT_COUNT <= FLAG_SLOTS
+# Replay entries used within this many ring operations of the newest one are
+# never evicted: a borrowed static output is consumed by its caller before
+# the caller's next op on the same entry, which in the Kimi-K3 layer is at
+# most three ring ops later (attention all-reduce -> gather pair ->
+# reduce-scatter -> MoE all-reduce).
+REPLAY_EVICTION_GUARD_OPS = 3
 
 
 def _fp8_mode() -> str:
@@ -144,12 +158,14 @@ def _graph_replay_mode() -> bool:
     flag kernels, adds and the cross-stream events), which costs more host
     time than the transfer takes on the wire for prefill-size tensors. With
     replay enabled, every shape at or above ``_graph_replay_min_bytes()``
-    is captured once into a CUDA graph over static input/output buffers and
-    later calls copy in, replay, and copy out. The kernels and their order
-    are unchanged, so the result is bit-identical to the eager path. The
-    static buffers for every cache entry are reserved when the ring is
-    constructed (max_entries x 2 x max_bytes), so serving never allocates
-    and never falls back for lack of device memory.
+    is captured once into a CUDA graph over static buffers and later calls
+    copy in, replay, and copy out. The kernels and their order are unchanged,
+    so the result is bit-identical to the eager path. A caller that writes
+    the static input itself (``all_reduce_input``) and consumes the static
+    output directly (``borrow_output``) skips both copies. The static buffers
+    for every cache entry are reserved when the ring is constructed
+    (max_entries x 2 x max_bytes), so serving never allocates and never
+    falls back for lack of device memory.
     """
     return os.getenv("B12X_PCIE_DMA_GRAPH_REPLAY", "0") == "1"
 
@@ -165,17 +181,73 @@ def _graph_replay_max_entries() -> int:
 
 
 class _ReplayEntry:
-    __slots__ = ("inp", "out", "graph", "slot")
+    """A captured ring graph with its static buffers.
 
-    def __init__(self, inp: torch.Tensor, out: torch.Tensor, graph, slot: int) -> None:
-        self.inp = inp
-        self.out = out
+    ``inputs``/``outputs`` are the static views a caller may write into
+    (``inputs``, via the ``*_input`` accessors) or read directly after the op
+    (``outputs``, when borrowing). The lossless all-reduce entry is in place:
+    its single static buffer is both input and output, so a producer that
+    writes it and a consumer that reads it need no staging copy at all.
+    ``scratch`` holds op-private static storage. ``last_use`` is the ring-op
+    sequence number of the last issue; entries used within
+    ``REPLAY_EVICTION_GUARD_OPS`` of the newest op are not evicted.
+    """
+
+    __slots__ = (
+        "key",
+        "inputs",
+        "outputs",
+        "scratch",
+        "graph",
+        "slot",
+        "last_use",
+    )
+
+    def __init__(
+        self,
+        key: tuple,
+        inputs: tuple[torch.Tensor, ...],
+        outputs: tuple[torch.Tensor, ...],
+        graph,
+        slot: int,
+        scratch: tuple[torch.Tensor, ...] = (),
+    ) -> None:
+        self.key = key
+        self.inputs = inputs
+        self.outputs = outputs
+        self.scratch = scratch
         self.graph = graph
         self.slot = slot
+        self.last_use = 0
+
+    # Source-compatible aliases for the single-tensor all-reduce entry.
+    @property
+    def inp(self) -> torch.Tensor:
+        return self.inputs[0]
+
+    @property
+    def out(self) -> torch.Tensor:
+        return self.outputs[0]
 
 
 def _align_up(value: int, alignment: int) -> int:
     return (value + alignment - 1) // alignment * alignment
+
+
+def _same_storage(a: torch.Tensor, b: torch.Tensor) -> bool:
+    return (
+        a.data_ptr() == b.data_ptr()
+        and a.numel() == b.numel()
+        and a.dtype == b.dtype
+    )
+
+
+def _byte_ranges_overlap(a: torch.Tensor, b: torch.Tensor) -> bool:
+    a_start = a.data_ptr()
+    a_end = a_start + a.numel() * a.element_size()
+    b_start = b.data_ptr()
+    b_end = b_start + b.numel() * b.element_size()
+    return a_start < b_end and b_start < a_end
 
 
 class PCIeDmaAllReduce:
@@ -280,19 +352,32 @@ class PCIeDmaAllReduce:
         self._graph_replay = _graph_replay_mode()
         self._graph_replay_min_bytes = _graph_replay_min_bytes()
         self._graph_replay_max_entries = _graph_replay_max_entries()
-        # Shape key -> captured graph with its static buffers (insertion
-        # order doubles as the LRU order); a shape is captured on its second
-        # eager-eligible call so one-off sizes (prefill tail chunks) stay
-        # eager instead of churning captures.
-        self._replay_entries: "OrderedDict[tuple[int, torch.dtype], _ReplayEntry]" = (
-            OrderedDict()
-        )
-        self._replay_seen: dict[tuple[int, torch.dtype], int] = {}
+        # Replay key ``(op, numel, dtype)`` -> captured graph with its static
+        # buffers (insertion order doubles as the LRU order); a shape is
+        # captured on its second eager-eligible call so one-off sizes
+        # (prefill tail chunks) stay eager instead of churning captures. The
+        # op tag keeps different collectives of equal element counts on
+        # separate entries.
+        self._replay_entries: "OrderedDict[tuple, _ReplayEntry]" = OrderedDict()
+        self._replay_seen: dict[tuple, int] = {}
         self._replay_capture_stream: torch.cuda.Stream | None = None
-        # Static input/output storage for every cached shape is reserved
-        # here, once, so a capture during serving never allocates device
-        # memory (and can never fail for lack of it): one slot of
-        # 2 x max_bytes per cache entry, carved into views per shape.
+        # Ring-op sequence number: every issued op (eager or replayed)
+        # increments it; entries record it as their last use.
+        self._op_seq = 0
+        # The lossless ring reads each input chunk before the step that
+        # overwrites the same chunk of the output (the reduce adds are
+        # elementwise on one chunk; the first send of the owner chunk
+        # completes, through the flag chain around the ring, before the
+        # all-gather step that receives that chunk), so its replay entry can
+        # use one buffer as both static input and output. The compressed
+        # wire modes keep separate buffers.
+        self._replay_in_place = not self._fp8
+        # Static storage for every cached shape is reserved here, once, so a
+        # capture during serving never allocates device memory (and can never
+        # fail for lack of it): one slot of 2 x max_bytes per cache entry,
+        # carved into views per op (an in-place all-reduce uses one buffer of
+        # the tensor size; other collectives carve their inputs and outputs
+        # out of the same slot).
         self._replay_slot_bytes = 2 * _align_up(self.max_bytes, SCRATCH_ALIGN)
         self._replay_arena: torch.Tensor | None = None
         self._replay_free_slots: list[int] = []
@@ -412,11 +497,32 @@ class PCIeDmaAllReduce:
         return inp.is_contiguous() and size_bytes <= self.max_bytes
 
     def all_reduce(
-        self, inp: torch.Tensor, *, out: Optional[torch.Tensor] = None
+        self,
+        inp: torch.Tensor,
+        *,
+        out: Optional[torch.Tensor] = None,
+        borrow_output: bool = False,
     ) -> torch.Tensor:
+        """Ring all-reduce of ``inp``.
+
+        ``borrow_output=True`` lets a replayed call return the entry's static
+        output instead of copying it into fresh storage. The returned tensor
+        then aliases ring-owned memory that the next all-reduce with the same
+        ``(numel, dtype)`` overwrites, so the caller must consume it before
+        issuing that op (and must not pass ``out``). When ``inp`` is the
+        entry's static input (see ``all_reduce_input``; for the lossless
+        in-place entry that is also the buffer a previous borrow returned),
+        the input staging copy is skipped as well. The result is bit-identical
+        either way because the captured kernels and their order do not
+        change. Eager calls (unreplayed shapes) keep out-of-place semantics
+        regardless of ``borrow_output``.
+        """
+        if borrow_output and out is not None:
+            raise ValueError("borrow_output cannot be combined with out=")
         with torch.cuda.device(self.device):
             if self._graph_replay and self._graph_replay_eligible(inp):
-                return self._all_reduce_replayed(inp, out)
+                return self._all_reduce_replayed(inp, out, borrow_output)
+            self._op_seq += 1
             return self._all_reduce_on_device(inp, out=out)
 
     def _graph_replay_eligible(self, inp: torch.Tensor) -> bool:
@@ -428,27 +534,131 @@ class PCIeDmaAllReduce:
             return False
         return self.should_allreduce(inp)
 
-    def _all_reduce_replayed(
-        self, inp: torch.Tensor, out: Optional[torch.Tensor]
-    ) -> torch.Tensor:
-        key = (inp.numel(), inp.dtype)
+    @staticmethod
+    def _all_reduce_key(inp: torch.Tensor) -> tuple:
+        return ("ar", inp.numel(), inp.dtype)
+
+    def _replay_entry_for(
+        self, key: tuple, capture
+    ) -> _ReplayEntry | None:
+        """Return the replay entry for ``key``, capturing it on the second
+        request. ``capture`` builds the entry once a slot is available;
+        ``None`` means the caller must run eagerly this time."""
         entry = self._replay_entries.get(key)
-        if entry is None:
-            seen = self._replay_seen.get(key, 0) + 1
-            if len(self._replay_seen) > 1024:
-                self._replay_seen.clear()
-            self._replay_seen[key] = seen
-            if seen < 2:
-                return self._all_reduce_on_device(inp, out=out)
-            entry = self._capture_replay_entry(inp)
-        else:
+        if entry is not None:
             self._replay_entries.move_to_end(key)
+            return entry
+        seen = self._replay_seen.get(key, 0) + 1
+        if len(self._replay_seen) > 1024:
+            self._replay_seen.clear()
+        self._replay_seen[key] = seen
+        if seen < 2:
+            return None
+        if not self._reserve_replay_slot():
+            return None
+        entry = capture()
+        self._replay_entries[key] = entry
+        logger.debug(
+            "[PCIe DMA ring] captured replay graph for key=%s (%d cached)",
+            key,
+            len(self._replay_entries),
+        )
+        return entry
+
+    def _reserve_replay_slot(self) -> bool:
+        """Free one arena slot for a new entry, evicting the least recently
+        used entry that no caller can still be reading. Returns False when
+        every entry is inside the eviction guard window."""
+        while (
+            not self._replay_free_slots
+            and len(self._replay_entries) >= self._graph_replay_max_entries
+        ):
+            victim_key = None
+            for key, entry in self._replay_entries.items():
+                if self._op_seq - entry.last_use > REPLAY_EVICTION_GUARD_OPS:
+                    victim_key = key
+                    break
+            if victim_key is None:
+                return False
+            evicted = self._replay_entries.pop(victim_key)
+            self._replay_free_slots.append(evicted.slot)
+            del evicted
+        assert self._replay_arena is not None
+        return bool(self._replay_free_slots)
+
+    def _slot_views(
+        self, slot: int, specs: list[tuple[tuple[int, ...], torch.dtype]]
+    ) -> list[torch.Tensor]:
+        """Carve consecutive static views out of one arena slot."""
+        assert self._replay_arena is not None
+        base = slot * self._replay_slot_bytes
+        limit = base + self._replay_slot_bytes
+        views = []
+        for shape, dtype in specs:
+            numel = 1
+            for dim in shape:
+                numel *= int(dim)
+            nbytes = numel * torch.empty((), dtype=dtype).element_size()
+            if base + nbytes > limit:
+                raise ValueError(
+                    "replay arena slot cannot hold the requested static buffers"
+                )
+            views.append(self._replay_arena[base : base + nbytes].view(dtype).view(shape))
+            base = _align_up(base + nbytes, SCRATCH_ALIGN)
+        return views
+
+    def _capture_graph(self, run) -> "torch.cuda.CUDAGraph":
+        """Record ``run()`` into a CUDA graph on a joined side stream.
+
+        Nothing executes during capture, and the device-side flag counters
+        advance only when the graph runs, exactly as the eager kernels
+        would. torch.cuda.graph() would also synchronize the device, run gc
+        and empty the caching allocator; the ring allocates nothing inside
+        the capture, so a bare capture suffices.
+        """
+        main = torch.cuda.current_stream(self.device)
+        side = self._replay_capture_stream
+        if side is None:
+            side = self._replay_capture_stream = torch.cuda.Stream(device=self.device)
+        side.wait_stream(main)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.stream(side):
+            graph.capture_begin(capture_error_mode="thread_local")
+            try:
+                run()
+            finally:
+                graph.capture_end()
+        main.wait_stream(side)
+        return graph
+
+    def _all_reduce_replayed(
+        self,
+        inp: torch.Tensor,
+        out: Optional[torch.Tensor],
+        borrow_output: bool = False,
+    ) -> torch.Tensor:
+        key = self._all_reduce_key(inp)
+        entry = self._replay_entry_for(key, lambda: self._capture_replay_entry(inp))
+        self._op_seq += 1
+        if entry is None:
+            return self._all_reduce_on_device(inp, out=out)
+        entry.last_use = self._op_seq
         # Entries are keyed by element count: the ring treats its input as a
         # flat buffer, so tensors of different shapes but equal size share a
         # graph. Copy through flat views so a [768, 7168] call can reuse the
-        # [1536, 3584] entry (and vice versa).
-        entry.inp.view(-1).copy_(inp.view(-1))
+        # [1536, 3584] entry (and vice versa). A producer that wrote into the
+        # static input (``all_reduce_input``, or a borrowed output of the
+        # in-place entry) skips this copy.
+        if not _same_storage(entry.inp, inp):
+            if _byte_ranges_overlap(entry.inp, inp):
+                raise ValueError(
+                    "all-reduce input partially overlaps the ring's static "
+                    "buffer; pass the whole borrowed tensor or a copy"
+                )
+            entry.inp.view(-1).copy_(inp.view(-1))
         entry.graph.replay()
+        if borrow_output:
+            return entry.out.view(inp.shape)
         if out is None:
             out = torch.empty_like(inp)
         out.view(-1).copy_(entry.out.view(-1))
@@ -456,53 +666,71 @@ class PCIeDmaAllReduce:
 
     def _capture_replay_entry(self, inp: torch.Tensor) -> _ReplayEntry:
         """Capture the eager ring sequence for ``inp``'s shape over static
-        buffers. Every rank captures the same shape sequence, so the
-        cache contents stay symmetric across the group; nothing executes
-        during capture, and the device-side flag counters advance only when
-        the graph runs, exactly as the eager kernels would."""
-        while len(self._replay_entries) >= self._graph_replay_max_entries:
-            _, evicted = self._replay_entries.popitem(last=False)
-            self._replay_free_slots.append(evicted.slot)
-            del evicted
-        assert self._replay_arena is not None and self._replay_free_slots
+        buffers. Every rank captures the same shape sequence, so the cache
+        contents stay symmetric across the group."""
         slot = self._replay_free_slots.pop()
-        nbytes = inp.numel() * inp.element_size()
-        base = slot * self._replay_slot_bytes
-        half = self._replay_slot_bytes // 2
-        static_in = (
-            self._replay_arena[base : base + nbytes].view(inp.dtype).view(inp.shape)
+        spec = (tuple(inp.shape), inp.dtype)
+        if self._replay_in_place:
+            (static_in,) = self._slot_views(slot, [spec])
+            static_out = static_in
+        else:
+            static_in, static_out = self._slot_views(slot, [spec, spec])
+        graph = self._capture_graph(
+            lambda: self._all_reduce_on_device(static_in, out=static_out)
         )
-        static_out = (
-            self._replay_arena[base + half : base + half + nbytes]
-            .view(inp.dtype)
-            .view(inp.shape)
+        return _ReplayEntry(
+            self._all_reduce_key(inp), (static_in,), (static_out,), graph, slot
         )
-        main = torch.cuda.current_stream(self.device)
-        side = self._replay_capture_stream
-        if side is None:
-            side = self._replay_capture_stream = torch.cuda.Stream(device=self.device)
-        # torch.cuda.graph() would also synchronize the device, run gc and
-        # empty the caching allocator; the ring allocates nothing inside the
-        # capture, so a bare capture on a joined side stream suffices.
-        side.wait_stream(main)
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.stream(side):
-            graph.capture_begin(capture_error_mode="thread_local")
-            try:
-                self._all_reduce_on_device(static_in, out=static_out)
-            finally:
-                graph.capture_end()
-        main.wait_stream(side)
-        entry = _ReplayEntry(static_in, static_out, graph, slot)
-        self._replay_entries[(inp.numel(), inp.dtype)] = entry
-        logger.debug(
-            "[PCIe DMA allreduce] captured replay graph for numel=%d dtype=%s "
-            "(%d cached)",
-            inp.numel(),
-            inp.dtype,
-            len(self._replay_entries),
-        )
-        return entry
+
+    def all_reduce_input(
+        self, shape: tuple[int, ...], dtype: torch.dtype
+    ) -> torch.Tensor | None:
+        """Return the static input of the replay entry for ``shape``/``dtype``
+        so its producer can write the all-reduce input in place.
+
+        ``None`` means the shape is not replayed (replay disabled, below the
+        replay threshold, ineligible, first sighting, or no evictable slot);
+        the caller then supplies its own buffer as before. Requesting the
+        buffer counts as a sighting, so a shape is captured on the second
+        request just as a plain all-reduce would be. The buffer is valid
+        until the entry is evicted, which cannot happen while the caller's
+        all-reduce of it is within ``REPLAY_EVICTION_GUARD_OPS`` ring ops.
+        For the in-place entry this is the same buffer ``borrow_output``
+        returns, so a caller chain producer -> all-reduce -> consumer ->
+        producer stays inside one buffer.
+        """
+        if not self._graph_replay or torch.cuda.is_current_stream_capturing():
+            return None
+        probe = torch.empty(shape, dtype=dtype, device="meta")
+        if probe.numel() * probe.element_size() < self._graph_replay_min_bytes:
+            return None
+        if self._closed or dtype not in SUPPORTED_DTYPES:
+            return None
+        numel = probe.numel()
+        alignment = 8 if self.world_size == 9 else self.world_size * 8
+        if numel <= 0 or numel % alignment != 0:
+            return None
+        if numel * probe.element_size() > self.max_bytes:
+            return None
+        with torch.cuda.device(self.device):
+            entry = self._replay_entry_for(
+                self._all_reduce_key(probe),
+                lambda: self._capture_replay_entry(probe),
+            )
+        if entry is None:
+            return None
+        return entry.inp.view(shape)
+
+    def is_ring_storage(self, tensor: torch.Tensor) -> bool:
+        """Whether ``tensor`` lives inside the replay arena (a static input,
+        static output or scratch view handed out by this ring)."""
+        arena = self._replay_arena
+        if arena is None or tensor.device != self.device:
+            return False
+        start = arena.data_ptr()
+        end = start + arena.numel()
+        ptr = tensor.data_ptr()
+        return start <= ptr < end
 
     def _all_reduce_on_device(
         self, inp: torch.Tensor, *, out: Optional[torch.Tensor] = None
