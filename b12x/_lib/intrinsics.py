@@ -7282,6 +7282,89 @@ def packed_decode_trellis_sqg_state_smem_to_e4m3x8(
 
 
 @dsl_user_op
+def packed_decode_trellis_sqg_direct_lut_smem_to_e4m3x8(
+    win_a,
+    win_b,
+    direct_lut_smem_addr,
+    bits: int = 3,
+    *,
+    loc=None,
+    ip=None,
+):
+    """Decode eight L16 windows through a direct E4M3 table in shared memory.
+
+    Shared-memory form of ``packed_decode_trellis_sqg_direct_lut_to_e4m3x8``:
+    the caller stages the 64 KiB rate slice of the direct table
+    (``byte(state) = table[state]``, the frozen XOR-Cheb rank map composed
+    with the modal T12 staircase, so lookups are bit-identical to the T12
+    decode) at a 32-bit shared byte offset. Per weight: one ``bfe``, one
+    ``add``, one ``ld.shared.u8`` and the pack, versus the twelve-instruction
+    bijection the T12 path evaluates before its lookup.
+    """
+    bits = int(bits)
+    if bits not in (2, 3, 4):
+        raise ValueError(
+            f"unsupported SQG-normal trellis bitrate {bits}; expected 2, 3, or 4"
+        )
+    extract_lines: list[str] = []
+    load_lines: list[str] = []
+    pack_lines: list[str] = []
+    for index in range(8):
+        source = "$3" if index < 4 else "$2"
+        shift = (3 - (index & 3)) * bits
+        target = "out0" if index < 4 else "out1"
+        byte_shift = 8 * (index & 3)
+        if shift:
+            extract_lines.append(f"bfe.u32 w{index}, {source}, {shift}, 16;")
+        else:
+            extract_lines.append(f"and.b32 w{index}, {source}, 0xffff;")
+        load_lines.append(
+            f"""
+                add.u32 addr{index}, w{index}, $4;
+                ld.shared.u8 w{index}, [addr{index}];
+            """
+        )
+        if byte_shift:
+            pack_lines.append(f"shl.b32 w{index}, w{index}, {byte_shift};")
+        pack_lines.append(f"or.b32 {target}, {target}, w{index};")
+    asm = (
+        """
+        {
+            .reg .b32 out0,out1;
+            .reg .b32 w0,w1,w2,w3,w4,w5,w6,w7;
+            .reg .b32 addr0,addr1,addr2,addr3,addr4,addr5,addr6,addr7;
+            mov.b32 out0, 0;
+            mov.b32 out1, 0;
+    """
+        + "\n".join(extract_lines)
+        + "\n".join(load_lines)
+        + "\n".join(pack_lines)
+        + """
+            mov.b32 $0, out0;
+            mov.b32 $1, out1;
+        }"""
+    )
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32(), T.i32()]),
+        [
+            Uint32(win_a).ir_value(loc=loc, ip=ip),
+            Uint32(win_b).ir_value(loc=loc, ip=ip),
+            Int32(direct_lut_smem_addr).ir_value(loc=loc, ip=ip),
+        ],
+        asm,
+        "=r,=r,r,r,r",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    lo = llvm.extractvalue(T.i32(), result, [0], loc=loc, ip=ip)
+    hi = llvm.extractvalue(T.i32(), result, [1], loc=loc, ip=ip)
+    return Uint32(lo), Uint32(hi)
+
+
+@dsl_user_op
 def packed_decode_trellis_sqg_direct_lut_to_e4m3x8(
     win_a,
     win_b,

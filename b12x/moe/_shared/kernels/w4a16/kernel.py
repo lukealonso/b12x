@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass, replace
 from functools import partial
@@ -64,6 +65,7 @@ from b12x._lib.intrinsics import (
     packed_decode_sqg_fp16_d3l_to_bfloat2x4,
     packed_decode_sqg_fp16_d3l_to_half2x4,
     packed_decode_sqg_xor_cheb_t12_to_e4m3x8,
+    packed_decode_trellis_sqg_direct_lut_smem_to_e4m3x8,
     ld_global_nc_v4_u32,
     pack_f32x2_to_bfloat2,
     pack_f32x2_to_f16x2,
@@ -85,7 +87,10 @@ from b12x._lib.intrinsics import (
     trellis_align_stream_u32x2,
     warp_reduce,
 )
-from b12x._lib.quant.sqg_e4m3 import sqg_xor_cheb_t12_lut
+from b12x._lib.quant.sqg_e4m3 import (
+    sqg_xor_cheb_t12_direct_lut,
+    sqg_xor_cheb_t12_lut,
+)
 from b12x.moe._shared.kernels.trellis_ring import (
     trellis256_lane_geom_bits as _trellis_ring_lane_geom_bits,
 )
@@ -158,6 +163,49 @@ def _w4a16_small_m_splitk_enabled() -> bool:
     return os.environ.get("B12X_W4A16_SMALL_M_SPLITK", "0") == "1"
 
 
+logger = logging.getLogger(__name__)
+
+# Direct-table fallbacks already reported, keyed by (bits, route block rows,
+# pipeline bytes, device limit): the fallback costs throughput on the launch
+# it affects, so it is logged once per distinct kernel footprint rather than
+# once per layer.
+_SQG_XOR_CHEB_T12_DIRECT_SMEM_FALLBACKS_REPORTED: set[tuple[int, int, int, int]] = set()
+
+
+def _report_sqg_xor_cheb_t12_direct_smem_fallback(
+    bits: int, moe_block_size: int, pipeline_bytes: int, max_shared_mem: int
+) -> None:
+    key = (int(bits), int(moe_block_size), int(pipeline_bytes), int(max_shared_mem))
+    if key in _SQG_XOR_CHEB_T12_DIRECT_SMEM_FALLBACKS_REPORTED:
+        return
+    _SQG_XOR_CHEB_T12_DIRECT_SMEM_FALLBACKS_REPORTED.add(key)
+    logger.warning(
+        "B12X_SQG_XOR_CHEB_T12_DIRECT_SMEM=1 requested but the 64 KiB direct "
+        "table does not fit: %d-bit trellis pipeline at %d route rows per "
+        "block uses %d bytes of shared memory, table needs %d more, device "
+        "limit %d; this launch keeps the 4 KiB modal table (bit-identical)",
+        key[0],
+        key[1],
+        key[2],
+        _SQG_XOR_CHEB_T12_DIRECT_SMEM_REGION_BYTES,
+        key[3],
+    )
+
+
+def _sqg_xor_cheb_t12_direct_smem_enabled() -> bool:
+    """Stage the 64 KiB direct (precomposed) SQG-XOR-Cheb-T12 rate table.
+
+    The direct table maps a raw 16-bit trellis window straight to its E4M3
+    byte, so the decode drops the twelve-instruction rank bijection and pays
+    one shared byte load per weight. It costs 64 KiB of shared memory per
+    CTA (one CTA per SM at the 99 KiB opt-in limit) and applies to
+    uniform-rate layers only; pair-rate kernels keep the modal table.
+    Off by default; participates in the kernel cache key.
+    """
+
+    return os.environ.get("B12X_SQG_XOR_CHEB_T12_DIRECT_SMEM", "0") == "1"
+
+
 def _sqg_xor_cheb_t12_smem_enabled() -> bool:
     """Stage the 4 KiB SQG-XOR-Cheb-T12 staircase once per fused CTA.
 
@@ -181,6 +229,7 @@ _TRELLIS256_BITS = (2, 3, 4, 5, 6)
 _TRELLIS256_CODEBOOKS = {MCG, SQG_E4M3, SQG_FP16}
 _SQG_XOR_CHEB_T12_LUT_ENTRIES = 1 << 12
 _SQG_XOR_CHEB_T12_SMEM_REGION_BYTES = _SQG_XOR_CHEB_T12_LUT_ENTRIES
+_SQG_XOR_CHEB_T12_DIRECT_SMEM_REGION_BYTES = 1 << 16
 _SCALE_FORMATS = {
     "e4m3_k16": "e4m3_k16",
     "e8m0_k32": "e8m0_k32",
@@ -778,6 +827,9 @@ class W4A16FusedMoeCompileResult:
     full_rotation: bool = False
     coupled_hadamard: bool = False
     rotation_input_dtype: str = "fp16"
+    # The kernel staged the 64 KiB direct rate table instead of the 4 KiB
+    # modal table; the launch must pass the matching rate slice.
+    sqg_xor_cheb_t12_direct_smem: bool = False
     cta_threads: int = -1
     shared_memory_bytes: int = -1
 
@@ -1099,6 +1151,7 @@ class W4A16GemmKernel:
             static_pair_rates.get(trellis_pair_kind, (3, 3))
         )
         self.sqg_xor_cheb_t12_smem = False
+        self.sqg_xor_cheb_t12_direct_smem = False
         # Small-M stripe split-K: opt out of the one-tile-per-CTA fast path
         # so decode-heavy small-M phases spread each mn-tile's K range across
         # multiple CTAs (existing tail scheduling plus cross-CTA finalize).
@@ -1207,6 +1260,7 @@ class W4A16GemmKernel:
         else:
             self.sms = 120
             max_shared_mem = _DEFAULT_MAX_SHARED_MEM
+        self.max_shared_mem = int(max_shared_mem)
         self.blocks_per_sm = _determine_blocks_per_sm(
             problem_m=self.size_m,
             problem_n=self.covered_size_n,
@@ -3691,6 +3745,19 @@ class W4A16GemmKernel:
                 o0, o1, o2, o3 = packed_decode_sqg_fp16_d3l_to_bfloat2x4(
                     win_a, win_b, trellis_lut_addr, int(bits)
                 )
+        elif cutlass.const_expr(self.sqg_xor_cheb_t12_direct_smem):
+            e_lo, e_hi = packed_decode_trellis_sqg_direct_lut_smem_to_e4m3x8(
+                win_a,
+                win_b,
+                Int32(trellis_lut_addr),
+                int(bits),
+            )
+            if cutlass.const_expr(self.is_fp16):
+                o0, o1 = fp8x4_e4m3_to_half2x2(e_lo)
+                o2, o3 = fp8x4_e4m3_to_half2x2(e_hi)
+            else:
+                o0, o1 = fp8x4_e4m3_to_bfloat2x2_native_sm120(e_lo)
+                o2, o3 = fp8x4_e4m3_to_bfloat2x2_native_sm120(e_hi)
         else:
             e_lo, e_hi = packed_decode_sqg_xor_cheb_t12_to_e4m3x8(
                 win_a,
@@ -5758,6 +5825,7 @@ class W4A16FusedMoeKernel:
         coupled_hadamard: bool = False,
         rotation_input_dtype: str = "fp16",
         broadcast_suh: bool = False,
+        sqg_xor_cheb_t12_direct_smem: bool | None = None,
     ):
         activation = normalize_moe_activation(activation)
         is_gated = validate_activation(activation)
@@ -6043,17 +6111,66 @@ class W4A16FusedMoeKernel:
             self.trellis_codebook == SQG_E4M3
             and _sqg_xor_cheb_t12_smem_enabled()
         )
+        # Direct table: uniform-rate trellis_t256 layers only (the staged
+        # slice is one rate); requires the modal staging path to be on. ``None`` reads
+        # the environment switch; kernels that are composed into a launch which
+        # stages its own table (the mixed-rate tiers) pass ``False`` because
+        # their host side never stages the direct slice.
+        self.sqg_xor_cheb_t12_direct_smem = (
+            self.sqg_xor_cheb_t12_smem
+            and (
+                _sqg_xor_cheb_t12_direct_smem_enabled()
+                if sqg_xor_cheb_t12_direct_smem is None
+                else bool(sqg_xor_cheb_t12_direct_smem)
+            )
+            and self.weight_layout == "trellis_t256"
+            and self.fc1.trellis_pair_kind is None
+            and self.fc2.trellis_pair_kind is None
+            and int(self.fc1.trellis_bits) == int(self.fc2.trellis_bits)
+            and int(self.fc1.trellis_bits) in (2, 3, 4)
+            # The grid is sized before the table is added: two CTAs per SM
+            # cannot both hold a 64 KiB table, so only the one-CTA-per-SM
+            # (decode) grid stages it.
+            and int(self.blocks_per_sm) == 1
+        )
         self.sqg_xor_cheb_t12_smem_off = 0
         if self.sqg_xor_cheb_t12_smem:
-            self.sqg_xor_cheb_t12_smem_off = (
-                self.shared_words * 4 + 15
-            ) // 16 * 16
+            self.sqg_xor_cheb_t12_smem_off = (self.shared_words * 4 + 15) // 16 * 16
+            # The direct table only fits next to the small-M pipeline footprint;
+            # launches whose working set leaves no room (large-M prefill tiles)
+            # keep the 4 KiB modal table. Both decode paths are bit-identical.
+            if (
+                self.sqg_xor_cheb_t12_direct_smem
+                and self.sqg_xor_cheb_t12_smem_off
+                + _SQG_XOR_CHEB_T12_DIRECT_SMEM_REGION_BYTES
+                > int(self.fc1.max_shared_mem)
+            ):
+                self.sqg_xor_cheb_t12_direct_smem = False
+                _report_sqg_xor_cheb_t12_direct_smem_fallback(
+                    int(self.fc1.trellis_bits),
+                    int(self.moe_block_size),
+                    self.sqg_xor_cheb_t12_smem_off,
+                    int(self.fc1.max_shared_mem),
+                )
+        self.sqg_xor_cheb_t12_smem_region_bytes = (
+            _SQG_XOR_CHEB_T12_DIRECT_SMEM_REGION_BYTES
+            if self.sqg_xor_cheb_t12_direct_smem
+            else _SQG_XOR_CHEB_T12_SMEM_REGION_BYTES
+        )
+        if self.sqg_xor_cheb_t12_smem:
             self.shared_words = (
-                self.sqg_xor_cheb_t12_smem_off
-                + _SQG_XOR_CHEB_T12_SMEM_REGION_BYTES
+                self.sqg_xor_cheb_t12_smem_off + self.sqg_xor_cheb_t12_smem_region_bytes
             ) // 4
+            if self.shared_words * 4 > int(self.fc1.max_shared_mem):
+                raise ValueError(
+                    "fused W4A16 trellis kernel shared memory "
+                    f"{self.shared_words * 4} > {int(self.fc1.max_shared_mem)} bytes "
+                    "with the staged SQG-XOR-Cheb-T12 table"
+                )
             self.fc1.sqg_xor_cheb_t12_smem = True
             self.fc2.sqg_xor_cheb_t12_smem = True
+            self.fc1.sqg_xor_cheb_t12_direct_smem = self.sqg_xor_cheb_t12_direct_smem
+            self.fc2.sqg_xor_cheb_t12_direct_smem = self.sqg_xor_cheb_t12_direct_smem
         self.barrier_count_off = self.sms * 4
         self.barrier_sense_off = self.sms * 4 + 1
 
@@ -6095,6 +6212,7 @@ class W4A16FusedMoeKernel:
             self.broadcast_suh,
             self.rotation_input_dtype,
             self.sqg_xor_cheb_t12_smem,
+            self.sqg_xor_cheb_t12_direct_smem,
             self.small_m_splitk,
             self.fc1.__cache_key__,
             self.fc2.__cache_key__,
@@ -6479,7 +6597,7 @@ class W4A16FusedMoeKernel:
             self._sqg_smem_copy(
                 fc1_trellis_lut_addr,
                 smem_base + Int32(self.sqg_xor_cheb_t12_smem_off),
-                _SQG_XOR_CHEB_T12_SMEM_REGION_BYTES,
+                self.sqg_xor_cheb_t12_smem_region_bytes,
                 tid,
             )
             cute.arch.sync_threads()
@@ -9736,6 +9854,9 @@ def compile_w4a16_fused_moe(
         dual_a=kernel.dual_a,
         trellis_bits=trellis_bits,
         trellis_codebook=kernel.trellis_codebook,
+        sqg_xor_cheb_t12_direct_smem=bool(
+            getattr(kernel, "sqg_xor_cheb_t12_direct_smem", False)
+        ),
         fc1_trellis_pair_kind=kernel.fc1_trellis_pair_kind,
         fc2_trellis_pair_kind=kernel.fc2_trellis_pair_kind,
         full_rotation=full_rotation,
@@ -10427,9 +10548,19 @@ def _w4a16_fused_moe_launch_flat(
     )
     route_num_experts = 0 if expert_map is None else int(expert_map.numel())
     if weight_layout == "trellis_t256" and trellis_codebook != "mcg":
-        trellis_rank_lut = _trellis256_execution_lut(
-            a_input.device, trellis_codebook
-        )
+        if fused.sqg_xor_cheb_t12_direct_smem:
+            # The kernel stages the 64 KiB rate slice of the precomposed
+            # direct table (byte(state, bits) = table[((bits-2) << 16) | state]).
+            direct_bits = int(fused.trellis_bits)
+            trellis_rank_lut = sqg_xor_cheb_t12_direct_lut(a_input.device)[
+                (direct_bits - 2) << 16 : (direct_bits - 1) << 16
+            ]
+            if not trellis_rank_lut.is_contiguous():
+                trellis_rank_lut = trellis_rank_lut.contiguous()
+        else:
+            trellis_rank_lut = _trellis256_execution_lut(
+                a_input.device, trellis_codebook
+            )
         fc1_trellis_lut_addr = trellis_rank_lut.data_ptr()
         fc2_trellis_lut_addr = trellis_rank_lut.data_ptr()
     else:
