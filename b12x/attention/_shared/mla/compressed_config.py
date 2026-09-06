@@ -17,6 +17,19 @@ _COMPRESSED_SPARSE_MLA_BATCHED_SPLIT_CHUNK_SIZE = 1024
 _COMPRESSED_SPARSE_MLA_SPLIT_MAX_CHUNKS = 256
 
 
+def compressed_sparse_mla_uses_single_pass_decode(
+    *, rows: int, heads: int, swa_width: int, indexed_width: int,
+    swa_page_size: int, indexed_page_size: int | None,
+    compute_capability: tuple[int, int],
+) -> bool:
+    """Match the SM121 final-output kernel's row, layout, and chunk limits."""
+    if compute_capability != (12, 1) or rows < 16 or heads != 32 or swa_page_size != 64:
+        return False
+    if indexed_width and indexed_page_size != 64:
+        return False
+    return (swa_width + 63) // 64 + (indexed_width + 63) // 64 <= 10
+
+
 def compressed_sparse_mla_split_config_for_contract(
     *,
     rows: int,
@@ -85,6 +98,7 @@ def compressed_sparse_mla_split_chunks_for_contract(
 
 
 __all__ = [
+    "compressed_sparse_mla_uses_single_pass_decode",
     "compressed_sparse_mla_split_chunks_for_contract",
     "compressed_sparse_mla_split_config_for_contract",
 ]

@@ -184,7 +184,7 @@ def make_moe_decode_policy(
             }
         ),
         encode_query=MoeDecodeQuery.profile_fields,
-        decode_profile=MoeDecodeConfig.from_profile,
+        decode_profile=lambda query, device, payload: MoeDecodeConfig.from_profile(payload),
         heuristic=heuristic,
         validate_config=validate_moe_decode_config,
     )
@@ -209,3 +209,23 @@ __all__ = [
     "make_moe_decode_policy",
     "validate_moe_decode_config",
 ]
+
+
+from b12x.policy.problem import define_problem
+
+TUNING_PROBLEM = define_problem(
+    policy=MOE_DECODE_POLICY, query_type=MoeDecodeQuery, config_type=MoeDecodeConfig,
+    axes=('hidden_size', 'intermediate_size', 'num_tokens', 'num_experts', 'top_k'),
+    family=('quant_mode', 'source_format', 'activation'),
+    constraints=(),
+    environment=(),
+    model_fields=('num_experts', 'hidden_size', 'intermediate_size', 'top_k'),
+    decisions={'backend': ('micro', 'dynamic', 'w4a16'), 'route_planner': ('internal', 'triton'),
+               'max_active_clusters': None, 'dynamic_tile_m': (None, 16, 32, 64, 128),
+               'dynamic_route_mode': (None, 'direct', 'grouped'), 'w4a16_route_mode': (None, 'direct', 'packed')},
+    ordered=('dynamic_tile_m', 'max_active_clusters'),
+    derived_config_fields=(),
+    derived_inputs={'routed_rows': ('num_tokens', 'top_k')},
+    derive_inputs=lambda values: {'routed_rows': values['num_tokens'] * values['top_k']},
+    selection_contract='route_geomean_with_independent_precision_confirmation',
+)

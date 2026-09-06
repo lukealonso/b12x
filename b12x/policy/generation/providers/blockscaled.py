@@ -159,15 +159,15 @@ class _Session(AbstractContextManager):
         def timed_pass(selected):
             attempts = []
             for _ in range(3):
-                _paired(selected, warmup, count, flush)
+                _paired(selected, warmup, count, flush, timing_clock=settings.timing_clock)
                 before = _snapshot()
                 allocated = torch.cuda.memory_allocated()
-                pairs = _paired(selected, warmup, count, flush)
+                pairs = _paired(selected, warmup, count, flush, timing_clock=settings.timing_clock)
                 allocation_delta = torch.cuda.memory_allocated() - allocated
                 after = _snapshot()
                 clocks = _clock_checks(before, after)
                 attempts.append(dict(snapshot_before=before, snapshot_after=after,
-                                     samples_us=pairs, clock_validation=clocks,
+                                     samples_us=pairs, timing_clock=settings.timing_clock, clock_validation=clocks,
                                      replay_allocation_bytes=allocation_delta))
                 if clocks["valid"] and allocation_delta == 0:
                     break
@@ -198,13 +198,14 @@ class _Session(AbstractContextManager):
             error = None
             if not clocks["valid"] or allocation_delta != 0:
                 error = "clock or replay-allocation qualification failed"
-            if index and (name not in eligible or confirmation is None or
-                          not confirmation_clocks["valid"] or
-                          not all(qualifies(confirmation, name, base)[0] for base in baseline_names)):
-                error = error or "A16 was slower than a quantized baseline or lacked valid independent confirmation"
+            selected = not index or (name in eligible and confirmation is not None
+                                     and confirmation_clocks["valid"]
+                                     and all(qualifies(confirmation, name, base)[0]
+                                             for base in baseline_names))
             result.append(SweepMeasurement(
                 candidate=candidate, correct=True,
                 latency_us=statistics.median(p[name] for p in pairs), error=error,
+                selection_eligible=selected,
                 metrics=dict(correctness=checks[name], baseline=baseline,
                              baseline_correctness={base: checks[base] for base in baseline_names},
                              weight_seed=weight_seed, activation_seed=source_seed,
@@ -230,12 +231,29 @@ class BlockscaledPrecisionGenerator(DiscreteSweepGenerator):
     measured_m exists only in the offline corpus. The emitted planner query
     contains model geometry and recipe; live M never enters runtime resolution.
     """
+
+    @staticmethod
+    def cases_for_tuning_queries(queries):
+        from b12x.gemm.blockscaled._policy import TUNING_PROBLEM
+
+        for inputs in queries:
+            query = TUNING_PROBLEM.query_from_inputs(inputs)
+            TUNING_PROBLEM.canonical_inputs(query)
+            measured_m = inputs.get("measured_m")
+            if (set(inputs) != {*QUERY_FIELDS, "measured_m"} or type(measured_m) is not int or measured_m <= 0
+                    or query.recipe not in ("nvfp4", "mxfp8")
+                    or min(query.in_features, query.out_features) <= 0
+                    or query.in_features % 128 or query.out_features % 128):
+                raise ValueError("precision fixtures require NVFP4/MXFP8, positive sampled rows, and 128-aligned N/K")
+            yield from precision_cases(geometries=((query.out_features, query.in_features),),
+                                       counts=(measured_m,), recipes=(query.recipe,))
+
     def __init__(self, *, cases=None):
         super().__init__(component_id=BLOCKSCALED_PRECISION,
                          query_schema_version=1, config_schema_version=1,
                          query_fields=(*QUERY_FIELDS, "measured_m"), range_fields=frozenset(),
                          cases=precision_cases() if cases is None else cases,
-                         benchmark_factory=_Factory(), coverage={}, candidate_contract_version=3,
+                         benchmark_factory=_Factory(), coverage={}, candidate_contract_version=4,
                          candidate_tie_breaker=lambda candidate: int(not candidate.config["a16_rows"]))
 
     def estimate(self, context):
@@ -246,14 +264,31 @@ class BlockscaledPrecisionGenerator(DiscreteSweepGenerator):
                        dimensions={**estimate.dimensions, "candidates_per_case": 17,
                                    "maximum_candidate_measurements": 17 * len(self._cases)})
 
-    def build_planner(self, records):
+    def decision_for_candidate(self, query, candidate):
+        rows = candidate.config["a16_rows"]
+        if not rows:
+            return FrozenMapping({"precision": "quantized"})
+        if len(rows) != 1 or rows[0][0] != query["measured_m"]:
+            raise ValueError("a precision candidate must match its sampled row count")
+        return FrozenMapping({"precision": "a16", **dict(zip(("tile_n", "tile_k", "split_k"), rows[0][1:], strict=True))})
+
+    def build_planner(self, records, *, device=None):
+        from b12x.gemm.blockscaled._policy import BlockscaledQuery, TUNING_PROBLEM
+
         grouped = defaultdict(list)
         for record in records:
             key = tuple(record.query[field] for field in QUERY_FIELDS)
-            grouped[key].extend(record.config["a16_rows"])
-        merged = tuple(DecisionRecord(query=FrozenMapping(dict(zip(QUERY_FIELDS, key, strict=False))),
-                                      config=FrozenMapping({"a16_rows": sorted(rows)}))
-                       for key, rows in grouped.items())
+            rows = record.config["a16_rows"]
+            if rows and (len(rows) != 1 or rows[0][0] != record.query["measured_m"]):
+                raise ValueError("a measured precision decision must match its sampled row count")
+            decision = ({"precision": "a16", **dict(zip(("tile_n", "tile_k", "split_k"), rows[0][1:], strict=True))}
+                        if rows else {"precision": "quantized"})
+            grouped[key].append(({"measured_m": record.query["measured_m"]}, decision))
+        merged = []
+        for key, decisions in grouped.items():
+            query = BlockscaledQuery(**dict(zip(QUERY_FIELDS, key, strict=True)))
+            config = TUNING_PROBLEM.lower_collection(query, device, decisions)
+            merged.append(DecisionRecord(query=FrozenMapping(vars(query)), config=FrozenMapping(config.to_dict())))
         return build_axis_tree(merged, field_order=QUERY_FIELDS, range_fields=frozenset())
 
     def _load_checkpoint(self, **kwargs):

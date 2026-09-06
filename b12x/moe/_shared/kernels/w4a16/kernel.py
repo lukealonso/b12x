@@ -791,7 +791,7 @@ class _W4A16GemmLaunch:
 class _W4A16SmallMDirectLaunch(NamedTuple):
     compiled: object
     grid_x: int
-    m: int
+    capacity_m: int
     hidden_size: int
     intermediate_size: int
     num_experts: int
@@ -1208,7 +1208,7 @@ class W4A16GemmKernel:
             self.sms = 120
             max_shared_mem = _DEFAULT_MAX_SHARED_MEM
         self.blocks_per_sm = _determine_blocks_per_sm(
-            problem_m=self.size_m,
+            problem_m=self.sms if self.dense_route_fast_path else self.size_m,
             problem_n=self.covered_size_n,
             top_k=self.top_k,
             cta_threads=self.cta_threads,
@@ -8615,7 +8615,7 @@ def _small_m_direct_host_barrier_reset_enabled() -> bool:
 
 def _compile_w4a16_small_m_direct(
     *,
-    m: int,
+    capacity_m: int,
     hidden_size: int,
     intermediate_size: int,
     num_experts: int,
@@ -8642,7 +8642,7 @@ def _compile_w4a16_small_m_direct(
     cache_key = (
         "w4a16_small_m_direct",
         None if device is None else int(device.index or 0),
-        int(m),
+        int(capacity_m),
         int(hidden_size),
         int(intermediate_size),
         int(num_experts),
@@ -8663,9 +8663,9 @@ def _compile_w4a16_small_m_direct(
     kernel = MoEMicroKernelW4A16SmallMDirect(
         activation=activation,
         fast_math=bool(fast_math),
-        share_input_across_experts=(int(m) == 1),
+        share_input_across_experts=(int(capacity_m) == 1),
         share_expert_scales=True,
-        single_token=(int(m) == 1),
+        single_token=(int(capacity_m) == 1),
         scale_format=scale_format,
         swiglu_limit=swiglu_limit,
         swiglu_alpha=swiglu_alpha,
@@ -8673,7 +8673,7 @@ def _compile_w4a16_small_m_direct(
         w13_layout=w13_layout,
     )
     kernel.configure(
-        int(m),
+        int(capacity_m),
         int(hidden_size),
         int(intermediate_size),
         int(topk),
@@ -8710,14 +8710,14 @@ def _compile_w4a16_small_m_direct(
         dummy(cutlass.BFloat16),
         barrier_fake,
         barrier_fake,
-        Int32(m),
+        Int32(capacity_m),
         Int32(kernel.grid_x),
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_facts(
             "moe.w4a16.small_m_direct",
-            2,
+            3,
             ("device_index", None if device is None else int(device.index or 0)),
-            ("m", int(m)),
+            ("capacity_m", int(capacity_m)),
             ("hidden_size", int(hidden_size)),
             ("intermediate_size", int(intermediate_size)),
             ("num_experts", int(num_experts)),
@@ -8736,7 +8736,7 @@ def _compile_w4a16_small_m_direct(
     launch = _W4A16SmallMDirectLaunch(
         compiled=compiled,
         grid_x=int(kernel.grid_x),
-        m=int(m),
+        capacity_m=int(capacity_m),
         hidden_size=int(hidden_size),
         intermediate_size=int(intermediate_size),
         num_experts=int(num_experts),
@@ -8936,7 +8936,7 @@ def compile_w4a16_gemm(
             blocks_per_sm=kernel.blocks_per_sm,
         )
 
-    compile_size_m = _fake_m_for_specialization(size_m)
+    compile_size_m = 2 if dense_route_fast_path else _fake_m_for_specialization(size_m)
     compile_route_blocks = 1
     compile_route_slots = compile_route_blocks * int(moe_block_size)
     a_fake = make_ptr(cutlass_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
@@ -9033,7 +9033,7 @@ def compile_w4a16_gemm(
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key(
             "moe.w4a16.gemm",
-            4,
+            5,
             cache_key,
         ),
     )
@@ -9482,23 +9482,6 @@ def compile_w4a16_fused_moe(
         device,
         kernel.__cache_key__,
     )
-    cached = _FUSED_CACHE.get(cache_key)
-    if cached is not None:
-        return replace(
-            cached,
-            size_m=size_m,
-            num_experts=num_experts,
-            max_m_blocks=max_m_blocks,
-            blocks_per_sm=kernel.blocks_per_sm,
-        )
-    if _require_cached:
-        raise RuntimeError(
-            "W4A16 fused MoE launch is not resolved for CUDA graph capture "
-            f"(m={size_m}, moe_block_size={moe_block_size}, "
-            f"max_m_blocks={max_m_blocks}); run an eager warmup at this token "
-            "count before capturing"
-        )
-
     if (not collect_activation_amax) and _small_m_direct_supported(
         m=size_m,
         hidden_size=hidden_size,
@@ -9517,7 +9500,7 @@ def compile_w4a16_fused_moe(
     ):
         for ids_dtype in (torch.int32, torch.int64):
             _compile_w4a16_small_m_direct(
-                m=size_m,
+                capacity_m=size_m,
                 hidden_size=hidden_size,
                 intermediate_size=intermediate_size,
                 num_experts=num_experts,
@@ -9532,6 +9515,23 @@ def compile_w4a16_fused_moe(
                 w13_layout=w13_layout,
                 device=torch.device("cuda", device) if device is not None else None,
             )
+
+    cached = _FUSED_CACHE.get(cache_key)
+    if cached is not None:
+        return replace(
+            cached,
+            size_m=size_m,
+            num_experts=num_experts,
+            max_m_blocks=max_m_blocks,
+            blocks_per_sm=kernel.blocks_per_sm,
+        )
+    if _require_cached:
+        raise RuntimeError(
+            "W4A16 fused MoE launch is not resolved for CUDA graph capture "
+            f"(m={size_m}, moe_block_size={moe_block_size}, "
+            f"max_m_blocks={max_m_blocks}); run an eager warmup at this token "
+            "count before capturing"
+        )
 
     compile_size_m = _fake_m_for_specialization(size_m)
     compile_routed_rows = int(compile_size_m) * int(top_k)
@@ -9970,6 +9970,7 @@ def _w4a16_small_m_direct_launch_flat(
     barrier_count: torch.Tensor,
     barrier_epoch: torch.Tensor,
     m: int,
+    capacity_m: int,
     hidden_size: int,
     intermediate_size: int,
     num_experts: int,
@@ -9984,9 +9985,11 @@ def _w4a16_small_m_direct_launch_flat(
     w13_layout: str,
     stream_int: int,
 ) -> None:
+    if not 0 < m <= capacity_m:
+        raise ValueError("small-M W4A16 live rows exceed the prepared capacity")
     swiglu_limit = float(swiglu_limit_value) if has_swiglu_limit else None
     direct_launch = _compile_w4a16_small_m_direct(
-        m=m,
+        capacity_m=capacity_m,
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
         num_experts=num_experts,
@@ -10047,6 +10050,7 @@ def _w4a16_small_m_direct_launch_op(
     barrier_count: torch.Tensor,
     barrier_epoch: torch.Tensor,
     m: int,
+    capacity_m: int,
     hidden_size: int,
     intermediate_size: int,
     num_experts: int,
@@ -10076,6 +10080,7 @@ def _w4a16_small_m_direct_launch_op(
         barrier_count=barrier_count,
         barrier_epoch=barrier_epoch,
         m=m,
+        capacity_m=capacity_m,
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
         num_experts=num_experts,
@@ -10108,6 +10113,7 @@ def _w4a16_small_m_direct_launch_fake(
     barrier_count: torch.Tensor,
     barrier_epoch: torch.Tensor,
     m: int,
+    capacity_m: int,
     hidden_size: int,
     intermediate_size: int,
     num_experts: int,
@@ -11337,52 +11343,9 @@ def _trellis256_dense_tile_config(size_k: int, size_n: int) -> tuple[int, int]:
     )
 
 
-def _trellis256_dense_launch_geometry(
-    *,
-    size_m: int,
-    size_k: int,
-    size_n: int,
-    sms: int,
-) -> tuple[int, tuple[int, int]]:
-    """Avoid short spill waves in the persistent dense-Trellis schedule.
-
-    A default M64/N256 launch can leave only a handful of CTAs in a second or
-    third SM wave. Narrow projections benefit from a smaller M tile, while wide
-    projections already expose enough N parallelism and only need N128 for a
-    two-wave spill. Past three waves the smaller tile's scheduler overhead costs
-    more than the remaining imbalance.
-    """
-    default = (64, (64, 256 if size_n % 256 == 0 else 128))
-    if size_n % 256 != 0 or sms <= 0:
-        return default
-    tasks = _covering_count(int(size_m), 64) * (int(size_n) // 256)
-    waves = _covering_count(tasks, int(sms))
-    if waves not in (2, 3):
-        return default
-    spill = tasks - (waves - 1) * int(sms)
-    if spill > max(16, int(sms) // 10):
-        return default
-    n_tiles_256 = int(size_n) // 256
-    if n_tiles_256 <= 32:
-        return (48, (64, 128 if waves == 2 else 256))
-    if waves == 2:
-        return (64, (64, 128))
-    if int(size_k) <= 4096:
-        return (48, (64, 256))
-    return default
-
-
-
-def _resolve_exl3_hadamard_128(hadamard_128):
+def _resolve_hadamard_128(hadamard_128):
     if hadamard_128 is None:
-        try:
-            import exllamav3_ext
-        except ImportError as exc:
-            raise RuntimeError(
-                "run_trellis256_dense requires exllamav3_ext.had_r_128 for the "
-                "EXL3 input/output rotations"
-            ) from exc
-        hadamard_128 = exllamav3_ext.had_r_128
+        from b12x.gemm.trellis_linear._rotation import hadamard_128
     elif not callable(hadamard_128):
         hadamard_128 = getattr(hadamard_128, "had_r_128", None)
     if not callable(hadamard_128):
@@ -11499,7 +11462,7 @@ def _run_trellis256_dense_current_device(
     if c_tmp is not None and int(c_tmp.data_ptr()) % 16 != 0:
         raise ValueError("c_tmp must be at least 16-byte aligned")
 
-    hadamard_128 = _resolve_exl3_hadamard_128(hadamard_128)
+    hadamard_128 = _resolve_hadamard_128(hadamard_128)
 
     gemm_output = _trellis_dense_buffer(
         "gemm_output",
@@ -11546,19 +11509,11 @@ def _run_trellis256_dense_current_device(
         getattr(props, "shared_memory_per_block_optin", _DEFAULT_MAX_SHARED_MEM)
     )
     moe_block_size = int(_moe_block_size)
-    if _force_tile_config is None and moe_block_size == 64:
-        moe_block_size, (tile_k, tile_n) = _trellis256_dense_launch_geometry(
-            size_m=m,
-            size_k=size_k,
-            size_n=size_n,
-            sms=sms,
-        )
-    else:
-        tile_k, tile_n = (
-            _trellis256_dense_tile_config(size_k, size_n)
-            if _force_tile_config is None
-            else (int(_force_tile_config[0]), int(_force_tile_config[1]))
-        )
+    tile_k, tile_n = (
+        _trellis256_dense_tile_config(size_k, size_n)
+        if _force_tile_config is None
+        else (int(_force_tile_config[0]), int(_force_tile_config[1]))
+    )
     if moe_block_size not in _ALLOWED_ROUTED_SIZES:
         raise ValueError(f"unsupported Trellis dense moe_block_size={moe_block_size}")
     route_blocks = (m + moe_block_size - 1) // moe_block_size
@@ -11682,7 +11637,7 @@ def run_trellis256_dense(
     The whole input-rotation -> GEMM -> output-rotation chain is device-guarded
     and runs on the current Torch stream for ``x.device``.  To use a non-default
     stream, enter ``torch.cuda.stream(...)`` around this call; accepting a raw
-    driver stream here would leave the surrounding Torch/EXL3 rotations on a
+    driver stream here would leave Torch operations and rotation callbacks on a
     different stream and create an unsynchronized race.
     """
     if not isinstance(x, torch.Tensor) or not x.is_cuda:
@@ -11779,6 +11734,7 @@ def run_w4a16_moe(
     swiglu_alpha: float | None = None,
     swiglu_beta: float | None = None,
     fused_launch: W4A16FusedMoeCompileResult | None = None,
+    planned_token_capacity: int | None = None,
     topk_sum_launch: W4A16TopKSumCompileResult | None = None,
     route_block_size_m: int | None = None,
     intermediate_rotation_scales: torch.Tensor | None = None,
@@ -11983,6 +11939,10 @@ def run_w4a16_moe(
         raise ValueError("output_expert_map is only valid with full_rotation")
 
     m, hidden_size = a_input.shape
+    policy_m = (int(planned_token_capacity) if planned_token_capacity is not None
+                else int(fused_launch.size_m) if fused_launch is not None else int(m))
+    if not 0 < m <= policy_m:
+        raise ValueError(f"W4A16 live rows {m} exceed planned capacity {policy_m}")
     topk = int(topk_ids.shape[1])
     if tuple(topk_weights.shape) != (m, topk):
         raise ValueError(f"topk_weights must have shape {(m, topk)}")
@@ -12091,7 +12051,7 @@ def run_w4a16_moe(
         int(expert_map.numel()) if expert_map is not None else int(prepared.num_experts)
     )
     block_size_m = _resolve_route_block_size_m(
-        m=m,
+        m=policy_m,
         topk=topk,
         route_num_experts=route_num_experts,
         planned_block_size_m=route_block_size_m,
@@ -12104,11 +12064,15 @@ def run_w4a16_moe(
     sms = int(props.multi_processor_count)
     current_stream = current_cuda_stream()
     stream = current_stream if stream is None else stream
+    direct_capacity = (int(planned_token_capacity) if planned_token_capacity is not None
+                       else int(fused_launch.size_m) if fused_launch is not None
+                       else _W4A16_SMALL_M_DIRECT_MAX_M)
     if (
         route_mode != "packed"
+        and m <= direct_capacity
         and (not collect_activation_amax)
         and _small_m_direct_supported(
-            m=m,
+            m=direct_capacity,
             hidden_size=hidden_size,
             intermediate_size=int(prepared.intermediate_size),
             num_experts=int(prepared.num_experts),
@@ -12179,6 +12143,7 @@ def run_w4a16_moe(
             barrier_count,
             barrier_epoch,
             m,
+            direct_capacity,
             hidden_size,
             intermediate_size,
             int(prepared.num_experts),
@@ -12207,7 +12172,7 @@ def run_w4a16_moe(
     prefer_tc_decode = route_mode == "direct" or (
         route_mode == "auto"
         and _w4a16_tc_decode_preferred(
-            m=m,
+            m=policy_m,
             topk=topk,
             num_experts=int(prepared.num_experts),
             sms=sms,
@@ -12238,7 +12203,7 @@ def run_w4a16_moe(
     direct_topk_eligible = (
         (not collect_activation_amax)
         and route_mode != "packed"
-        and (m <= direct_m_cap or use_tc_decode)
+        and (policy_m <= direct_m_cap or use_tc_decode)
         and direct_layout_ok
     )
     use_direct_topk_routes = bool(
@@ -12351,7 +12316,7 @@ def run_w4a16_moe(
             w13_row_rotation=int(
                 getattr(prepared, "x4t_w13_row_rotation", 0)
             ),
-            expert_ids_unique=bool(use_direct_topk_routes and m == 1),
+            expert_ids_unique=bool(use_direct_topk_routes and policy_m == 1),
             stream=stream,
         )
 
@@ -12400,7 +12365,7 @@ def run_w4a16_moe(
         raise ValueError("prepared W4A16 workspace is too small for fused FC1+FC2")
     if fused_launch is None:
         fused = compile_w4a16_fused_moe(
-            size_m=m,
+            size_m=policy_m,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
             num_experts=int(prepared.num_experts),

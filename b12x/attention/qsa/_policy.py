@@ -33,6 +33,15 @@ class QsaQuery:
     position_axes: int
     mrope_interleaved: bool
 
+    @classmethod
+    def from_caps(cls, caps) -> "QsaQuery":
+        return cls(
+            q_dtype=str(caps.dtype).removeprefix("torch."),
+            kv_dtype=str(caps.kv_dtype).removeprefix("torch."),
+            **{name: getattr(caps, name) for name in cls.__dataclass_fields__
+               if name not in {"q_dtype", "kv_dtype"}},
+        )
+
     def profile_fields(self) -> dict[str, object]:
         return {
             "q_dtype": self.q_dtype,
@@ -148,10 +157,29 @@ QSA_POLICY = ComponentPolicy(
         }
     ),
     encode_query=QsaQuery.profile_fields,
-    decode_profile=QsaConfig.from_profile,
+    decode_profile=lambda query, device, payload: QsaConfig.from_profile(payload),
     heuristic=_heuristic,
     validate_config=_validate,
 )
 
 
 __all__ = ["QSA_POLICY", "QsaConfig", "QsaQuery"]
+
+
+from b12x.policy.problem import define_problem
+
+TUNING_PROBLEM = define_problem(
+    policy=QSA_POLICY, query_type=QsaQuery, config_type=QsaConfig,
+    axes=('q_heads', 'kv_heads', 'head_dim', 'index_heads', 'index_kv_heads', 'index_head_dim', 'index_rotary_dim', 'max_batch', 'max_q_rows', 'max_seq_len', 'max_speculative_tokens'),
+    family=('q_dtype', 'kv_dtype', 'main_page_size', 'compress_ratio', 'position_axes', 'mrope_interleaved'),
+    constraints=('budget',),
+    environment=(),
+    model_fields=('q_heads', 'kv_heads', 'head_dim', 'index_heads', 'index_kv_heads', 'index_head_dim', 'index_rotary_dim', 'main_page_size', 'compress_ratio', 'position_axes', 'mrope_interleaved'),
+    decisions={'backend': ('cutedsl',), 'sparse_gqa_direct_kv_warps': (1, 2, 4)},
+    ordered=('sparse_gqa_direct_kv_warps',),
+    derived_config_fields=(),
+    axis_domains={name: (0 if name == 'max_speculative_tokens' else 1, 1)
+                  for name in ('q_heads', 'kv_heads', 'head_dim', 'index_heads', 'index_kv_heads',
+                               'index_head_dim', 'index_rotary_dim', 'max_batch', 'max_q_rows',
+                               'max_seq_len', 'max_speculative_tokens')},
+)

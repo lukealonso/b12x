@@ -26,3 +26,17 @@ PleHashConfig = BackendConfig
 
 
 __all__ = ["PLE_HASH_POLICY", "PleHashConfig", "PleHashQuery"]
+
+
+from b12x.policy.problem import define_problem
+
+TUNING_PROBLEM = define_problem(
+    policy=PLE_HASH_POLICY, query_type=PleHashQuery, config_type=PleHashConfig,
+    axes=('max_tokens', 'max_seqs', 'vocab_size', 'max_order', 'heads_per_order', 'base_table_size'),
+    family=(),
+    constraints=(),
+    environment=(),
+    model_fields=('vocab_size', 'max_order', 'heads_per_order', 'base_table_size'),
+    decisions={'backend': ('triton',)},
+    derived_config_fields=(),
+)

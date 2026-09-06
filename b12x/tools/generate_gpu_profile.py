@@ -12,6 +12,7 @@ import subprocess
 from collections import defaultdict
 from collections.abc import Mapping
 from importlib import metadata
+from functools import partial
 from pathlib import Path
 
 from rich.console import Console
@@ -34,6 +35,7 @@ from b12x.policy.generation import (
 )
 from b12x.policy.generation.parallel import run_parallel_measurements
 from b12x.policy.generation.progress import RichProgressReporter
+from b12x.policy.generation.provenance import capture_measurement_provenance, physical_device_uuid
 from b12x.policy.generation.runner import (
     estimate_generators,
     generate_profile_artifact,
@@ -186,6 +188,22 @@ def _parse_components(raw: str | None) -> tuple[str, ...] | None:
     if not values:
         raise ValueError("--components must select at least one component")
     return values
+
+
+def _load_search_registry(plans: Mapping[str, object]) -> ComponentGeneratorRegistry:
+    from b12x.policy.generation.program import ProfileSearchPlan, QualifiedSearchGenerator
+
+    base = _load_registry()
+    unknown = set(plans) - set(base.component_ids())
+    if unknown:
+        raise ValueError(f"search plans name unregistered components: {sorted(unknown)}")
+    registry = ComponentGeneratorRegistry()
+    for generator in base.select(None):
+        plan = plans.get(generator.component_id)
+        if plan is not None:
+            generator = QualifiedSearchGenerator(generator, ProfileSearchPlan.from_dict(plan))
+        registry.register(generator)
+    return registry
 
 
 def _parse_devices(raw: str) -> tuple[str, ...]:
@@ -357,6 +375,10 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--profile-id")
     parser.add_argument("--components", default="all")
+    parser.add_argument("--search-plan", type=Path,
+                        help="JSON coverage domains, training pools, and independent holdouts for qualified spatial search")
+    parser.add_argument("--measurement-cohort", default="initial",
+                        help="measurement identity; use a distinct cohort for an explicitly fresh rerun")
     parser.add_argument(
         "--partition-shard",
         help="measure one workload-balanced cross-host shard, for example 1/2",
@@ -368,6 +390,8 @@ def _parser() -> argparse.ArgumentParser:
         type=Path,
         help="base full profile whose unselected components are retained",
     )
+    parser.add_argument("--timing-clock", choices=("cuda_event", "globaltimer"), default="cuda_event",
+                        help="cold-replay timing instrumentation, retained in checkpoint identity")
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--repetitions", type=int, default=5)
     parser.add_argument("--groups", type=int, default=5)
@@ -401,7 +425,15 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     console = Console()
-    registry = _load_registry()
+    registry_factory = _load_registry
+    if args.search_plan is not None:
+        payload = json.loads(args.search_plan.read_text())
+        if (not isinstance(payload, dict) or set(payload) != {"schema_version", "components"}
+                or type(payload["schema_version"]) is not int or payload["schema_version"] != 1
+                or not isinstance(payload["components"], dict) or not payload["components"]):
+            raise SystemExit("search plan requires schema_version=1 and nonempty component plans")
+        registry_factory = partial(_load_search_registry, payload["components"])
+    registry = registry_factory()
     if args.list_components:
         for component_id in registry.component_ids():
             console.print(component_id)
@@ -468,6 +500,9 @@ def main(argv: list[str] | None = None) -> int:
         device_ordinal=detected.ordinal,
         work_dir=work_dir,
         source_revision=_source_revision(),
+        provenance=capture_measurement_provenance(detected.ordinal),
+        accepted_physical_devices=tuple(physical_device_uuid(item.ordinal) for item in detected_devices),
+        measurement_cohort=args.measurement_cohort,
         settings=GenerationSettings(
             warmup=args.warmup,
             repetitions=args.repetitions,
@@ -475,6 +510,7 @@ def main(argv: list[str] | None = None) -> int:
             seed=args.seed,
             minimum_cosine=args.minimum_cosine,
             cold_l2=args.cold_l2,
+            timing_clock=args.timing_clock,
             max_candidate_seconds=args.max_candidate_seconds,
         ),
     )
@@ -512,6 +548,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.dry_run:
         return 0
 
+    import torch
+
+    torch.cuda.set_device(detected.ordinal)
     estimates = estimate_generators(generators, context)
     parallel_summary = None
     try:
@@ -521,7 +560,7 @@ def main(argv: list[str] | None = None) -> int:
                 device_specs=device_specs,
                 generators=generators,
                 context=context,
-                registry_factory=_load_registry,
+                registry_factory=registry_factory,
             )
             console.print("Parallel measurements complete; assembling profile.")
         with RichProgressReporter(estimates) as progress:

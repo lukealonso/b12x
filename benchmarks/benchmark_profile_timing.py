@@ -13,15 +13,18 @@ from pathlib import Path
 
 import torch
 
+from b12x.policy.generation.timing import cuda_event_samples_us
+
 from b12x.policy.device import detect_device
 from b12x.policy.generation.contracts import GenerationContext, GenerationSettings
+from b12x.policy.generation.provenance import capture_measurement_provenance
+from b12x.tools.generate_gpu_profile import _source_revision
 from b12x.policy.generation.moe_corpus import (
     expand_physical_geometries,
     expand_sweep_cases,
 )
 from b12x.policy.generation.providers.moe_gpu_worker import (
     _MoeGeometrySession,
-    _cuda_event_samples_us,
 )
 
 
@@ -37,7 +40,7 @@ def snapshot(device: int) -> str:
 
 
 def compare_timing(
-    run, *, count, device, flush, rounds, sample=_cuda_event_samples_us,
+    run, *, count, device, flush, rounds, sample=cuda_event_samples_us,
     include_outer=False,
 ):
     setup_started = time.perf_counter()
@@ -127,9 +130,8 @@ def main() -> None:
     context = GenerationContext(
         device=detected.identity, device_ordinal=args.device,
         work_dir=args.output.parent,
-        source_revision=subprocess.check_output(
-            ["git", "rev-parse", "HEAD"], text=True,
-        ).strip(),
+        source_revision=_source_revision(),
+        provenance=capture_measurement_provenance(args.device),
         settings=GenerationSettings(),
     )
     geometry = next(

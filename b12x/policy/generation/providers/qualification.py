@@ -8,6 +8,9 @@ import json
 import math
 from contextlib import redirect_stdout
 
+from b12x.policy.generation.replay import PreparedCandidate, capture_warmed_graph, measure_prepared_candidates
+from b12x.policy.generation.sweep import SweepCandidate
+
 from b12x.policy.generation.contracts import GenerationContext
 from b12x.policy.generation.attention_corpus import (
     COMMON_PREFILL_TOKEN_CAPACITIES,
@@ -19,9 +22,7 @@ from b12x.policy.generation.measured import (
 )
 
 from .gpu_workers import (
-    _cuda_event_samples_us,
     _l2_flush_fn,
-    _median_of_group_medians,
 )
 
 
@@ -42,9 +43,7 @@ def _timed_graph_measurement(
     for _ in range(settings.warmup):
         run()
     torch.cuda.synchronize(device)
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        run()
+    graph, _ = capture_warmed_graph(run, device=device)
     if output.is_floating_point():
         output.fill_(float("nan"))
     else:
@@ -59,34 +58,14 @@ def _timed_graph_measurement(
             expected.float().reshape(1, -1),
         ).item()
     )
-    allocated_before = torch.cuda.memory_allocated(device)
-    samples = _cuda_event_samples_us(
-        graph.replay,
-        count=settings.groups * settings.repetitions,
-        device=device,
-        flush=flush,
-    )
-    allocated_after = torch.cuda.memory_allocated(device)
-    return GpuProbeMeasurement(
-        label=label,
-        latency_us=_median_of_group_medians(
-            samples,
-            groups=settings.groups,
-            repetitions=settings.repetitions,
-        ),
-        correct=(
-            finite
-            and nonzero
-            and cosine >= settings.minimum_cosine
-            and allocated_after <= allocated_before
-        ),
-        metrics={
-            "cosine": cosine,
-            "finite": finite,
-            "nonzero": nonzero,
-            "replay_allocation_bytes": allocated_after - allocated_before,
-        },
-    )
+    measurement, = measure_prepared_candidates((PreparedCandidate(
+        candidate=SweepCandidate.create({"probe": label}), graph=graph,
+        owners=(run, output, expected),
+        correct=finite and nonzero and cosine >= settings.minimum_cosine,
+        metrics={"cosine": cosine, "finite": finite, "nonzero": nonzero,
+                 "frozen_resolution_capture": True}),), settings=settings, device=device, flush=flush)
+    return GpuProbeMeasurement(label=label, latency_us=measurement.latency_us,
+                               correct=measurement.correct, metrics=measurement.metrics)
 
 
 def _timed_exact_graph_measurement(
@@ -105,36 +84,19 @@ def _timed_exact_graph_measurement(
     for _ in range(settings.warmup):
         run()
     torch.cuda.synchronize(device)
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        run()
+    graph, _ = capture_warmed_graph(run, device=device)
     output.fill_(-2)
     graph.replay()
     torch.cuda.synchronize(device)
     exact = bool(torch.equal(output, expected))
     nonzero = bool(torch.count_nonzero(output).item())
-    allocated_before = torch.cuda.memory_allocated(device)
-    samples = _cuda_event_samples_us(
-        graph.replay,
-        count=settings.groups * settings.repetitions,
-        device=device,
-        flush=flush,
-    )
-    allocated_after = torch.cuda.memory_allocated(device)
-    return GpuProbeMeasurement(
-        label=label,
-        latency_us=_median_of_group_medians(
-            samples,
-            groups=settings.groups,
-            repetitions=settings.repetitions,
-        ),
-        correct=exact and nonzero and allocated_after <= allocated_before,
-        metrics={
-            "exact": exact,
-            "nonzero": nonzero,
-            "replay_allocation_bytes": allocated_after - allocated_before,
-        },
-    )
+    measurement, = measure_prepared_candidates((PreparedCandidate(
+        candidate=SweepCandidate.create({"probe": label}), graph=graph,
+        owners=(run, output, expected), correct=exact and nonzero,
+        metrics={"exact": exact, "nonzero": nonzero, "frozen_resolution_capture": True}),),
+        settings=settings, device=device, flush=flush)
+    return GpuProbeMeasurement(label=label, latency_us=measurement.latency_us,
+                               correct=measurement.correct, metrics=measurement.metrics)
 
 
 class _DsaIndexerProbe:
@@ -749,7 +711,7 @@ class DsaIndexerGenerator(MeasuredPolicyGenerator):
                 num_q_heads=32,
                 num_idx_heads=1,
                 max_q_rows=4,
-                max_k_rows=0,
+                max_k_rows=32_768,
                 top_k=2_048,
                 page_size=64,
                 score_mode="dsa",
@@ -763,7 +725,7 @@ class DsaIndexerGenerator(MeasuredPolicyGenerator):
                 num_q_heads=32,
                 num_idx_heads=1,
                 max_q_rows=6,
-                max_k_rows=0,
+                max_k_rows=32_768,
                 top_k=512,
                 page_size=64,
                 score_mode="dsa",
@@ -805,7 +767,7 @@ class DsaIndexerGenerator(MeasuredPolicyGenerator):
                 num_q_heads=1,
                 num_idx_heads=4,
                 max_q_rows=4,
-                max_k_rows=0,
+                max_k_rows=8_192,
                 top_k=16,
                 page_size=64,
                 score_mode="msa",
@@ -870,7 +832,7 @@ class DsaIndexerGenerator(MeasuredPolicyGenerator):
                 num_q_heads=heads,
                 num_idx_heads=1,
                 max_q_rows=1,
-                max_k_rows=0,
+                max_k_rows=32_768,
                 top_k=512,
                 page_size=64,
                 score_mode="dsa",

@@ -104,10 +104,25 @@ MTP_FEEDBACK_POLICY = ComponentPolicy(
     query_fields=frozenset(MtpFeedbackQuery.__dataclass_fields__),
     config_fields=frozenset(MtpFeedbackConfig.__dataclass_fields__),
     encode_query=_encode,
-    decode_profile=MtpFeedbackConfig.from_profile,
+    decode_profile=lambda query, device, payload: MtpFeedbackConfig.from_profile(payload),
     heuristic=_heuristic,
     validate_config=_validate,
 )
 
 
 __all__ = ["MTP_FEEDBACK_POLICY", "MtpFeedbackConfig", "MtpFeedbackQuery"]
+
+
+from b12x.policy.problem import define_problem
+
+TUNING_PROBLEM = define_problem(
+    policy=MTP_FEEDBACK_POLICY, query_type=MtpFeedbackQuery, config_type=MtpFeedbackConfig,
+    axes=('max_tokens', 'hidden_size', 'streams'),
+    family=('dtype',),
+    constraints=(),
+    environment=(),
+    model_fields=('hidden_size', 'streams'),
+    decisions={'backend': ('cutedsl',), 'norm_block_h': None, 'norm_block_s': None, 'norm_num_warps': (1, 2, 4, 8)},
+    ordered=('norm_block_h', 'norm_block_s', 'norm_num_warps'),
+    derived_config_fields=(),
+)

@@ -5,7 +5,8 @@ from __future__ import annotations
 import gc
 from collections.abc import Sequence
 from contextlib import AbstractContextManager
-from dataclasses import dataclass, field
+from b12x.policy.generation.replay import PreparedCandidate, capture_warmed_graph, measure_prepared_candidates
+
 
 from b12x.policy.components import HYPERCONNECTION, MHC, MTP_FEEDBACK
 from b12x.policy.generation.attention_corpus import (
@@ -21,7 +22,6 @@ from b12x.policy.generation.sweep import (
 
 from .gpu_workers import (
     _l2_flush_fn,
-    _median_of_group_medians,
 )
 
 _NORM_SEQUENCE_TOKEN_CAPACITIES = (
@@ -184,80 +184,49 @@ class _HyperConnectionSession(_GpuSession):
         del case
         return self._CANDIDATES
 
-    def measure(
-        self,
-        case: SweepCase,
-        candidates: tuple[SweepCandidate, ...],
-    ) -> tuple[SweepMeasurement, ...]:
+    def measure(self, case, candidates):
         import torch
-
+        from dataclasses import replace
         from b12x.norm.hyperconnection._policy import HyperConnectionConfig
         from b12x.policy import PolicyContext, PolicyMode
-        from benchmarks.benchmark_hyperconnection import (
-            Profile,
-            _graph_samples_us,
-            _make_case,
-        )
+        from benchmarks.benchmark_hyperconnection import Profile, _make_case, build_plan_binding, _validate_outputs
 
         device = torch.device("cuda", self._context.device_ordinal)
         settings = self._context.settings
         profile = Profile(tokens=int(case.query["max_tokens"]))
-        base_policy = PolicyContext.for_device(
-            device,
-            mode=PolicyMode.HEURISTIC_ONLY,
-        )
-        flush = _l2_flush_fn(device, enabled=settings.cold_l2)
-        measurements = []
+        base_policy = PolicyContext.for_device(device, mode=PolicyMode.HEURISTIC_ONLY)
+        fixture = _make_case(profile, seed=settings.seed + int(case.case_id[-8:], 16),
+                             device=device, policy=base_policy)
+        expected = fixture.reference("full_chain")
+        prepared = []
         for candidate in candidates:
             try:
                 config = HyperConnectionConfig.from_profile(candidate.config)
-                policy = base_policy.with_override(HYPERCONNECTION, config)
-                active = _make_case(
-                    profile,
-                    seed=settings.seed + int(candidate.candidate_id[-8:], 16),
-                    device=device,
-                    policy=policy,
-                )
-                samples, graph_contract, correctness = _graph_samples_us(
-                    active,
-                    "full_chain",
-                    warmup=settings.warmup,
-                    samples=settings.groups * settings.repetitions,
-                    l2_flush=flush,
-                )
-                measurements.append(
-                    SweepMeasurement(
-                        candidate=candidate,
-                        latency_us=_median_of_group_medians(
-                            tuple(samples),
-                            groups=settings.groups,
-                            repetitions=settings.repetitions,
-                        ),
-                        correct=(
-                            correctness.get("status") == "passed"
-                            and graph_contract.get(
-                                "replay_allocation_delta_bytes"
-                            )
-                            == 0
-                        ),
-                        metrics={
-                            "operator": "full_chain",
-                            "replay_allocation_bytes": graph_contract[
-                                "replay_allocation_delta_bytes"
-                            ],
-                        },
-                    )
-                )
-            except Exception as exc:  # noqa: BLE001 - failed configs survive
-                measurements.append(
-                    SweepMeasurement(
-                        candidate=candidate,
-                        latency_us=None,
-                        correct=False,
-                        error=f"{type(exc).__name__}: {exc}",
-                    )
-                )
-        return tuple(measurements)
+                plan, binding = build_plan_binding(device=device, tokens=profile.tokens,
+                    policy=base_policy.with_override(HYPERCONNECTION, config))
+                active = replace(fixture, plan=plan, binding=binding)
+                def run(active=active):
+                    return active.launch("full_chain")
+                for _ in range(settings.warmup):
+                    run()
+                torch.cuda.synchronize(device)
+                graph, outputs = capture_warmed_graph(run, device=device)
+                addresses = tuple(t.data_ptr() for t in outputs)
+                for _ in range(3):
+                    for output in outputs:
+                        output.fill_(float("nan"))
+                    graph.replay()
+                    torch.cuda.synchronize(device)
+                    _validate_outputs(operator="full_chain", actual=outputs, expected=expected)
+                stable = addresses == tuple(t.data_ptr() for t in outputs)
+                prepared.append(PreparedCandidate(candidate=candidate, graph=graph, correct=stable,
+                    owners=(active, outputs), metrics={"operator": "full_chain", "stable_addresses": stable,
+                        "frozen_resolution_capture": True, "poison_replays": 3}))
+            except Exception as exc:
+                prepared.append(SweepMeasurement(candidate=candidate, latency_us=None, correct=False,
+                                                 error=f"{type(exc).__name__}: {exc}"))
+        return measure_prepared_candidates(prepared, settings=settings, device=device,
+                                           flush=_l2_flush_fn(device, enabled=settings.cold_l2))
 
 
 class _MtpFeedbackSession(_GpuSession):
@@ -277,75 +246,58 @@ class _MtpFeedbackSession(_GpuSession):
         del case
         return self._CANDIDATES
 
-    def measure(
-        self,
-        case: SweepCase,
-        candidates: tuple[SweepCandidate, ...],
-    ) -> tuple[SweepMeasurement, ...]:
+    def measure(self, case, candidates):
         import torch
-
-        from b12x.policy import PolicyContext, PolicyMode
+        from b12x.sequence import mtp_feedback as mtp
         from b12x.sequence.mtp_feedback._policy import MtpFeedbackConfig
-        from benchmarks.benchmark_mtp_feedback import Profile, _benchmark_profile
+        from b12x.policy import PolicyContext, PolicyMode
+        from benchmarks.benchmark_mtp_feedback import Profile, _make_binding, _comparison_metrics, _require_correct
 
         device = torch.device("cuda", self._context.device_ordinal)
         settings = self._context.settings
         tokens = int(case.query["max_tokens"])
         profile = Profile(name=f"profile-m{tokens}", phase="mixed", tokens=tokens)
-        base_policy = PolicyContext.for_device(
-            device,
-            mode=PolicyMode.HEURISTIC_ONLY,
-        )
-        flush = _l2_flush_fn(device, enabled=settings.cold_l2)
-        measurements = []
+        base_policy = PolicyContext.for_device(device, mode=PolicyMode.HEURISTIC_ONLY)
+        fixture = _make_binding(profile, seed=settings.seed + int(case.case_id[-8:], 16), device=device,
+                                capacity_tokens=tokens, policy=base_policy)
+        inputs = {name: getattr(fixture, name) for name in ("token_embedding", "multi_state", "token_norm_weight",
+                   "state_norm_weight", "embedding_fc_weight", "hidden_fc_weight")}
+        reference = mtp.reference.feedback(**inputs, eps=1e-6)
+        if not bool(torch.isfinite(reference).all()) or not bool(torch.count_nonzero(reference)):
+            raise ValueError("MTP reference must be finite and nonzero")
+        prepared = []
         for candidate in candidates:
             try:
                 config = MtpFeedbackConfig.from_profile(candidate.config)
-                policy = base_policy.with_override(MTP_FEEDBACK, config)
-                result = _benchmark_profile(
-                    profile,
-                    seed=settings.seed + int(candidate.candidate_id[-8:], 16),
-                    device=device,
-                    eps=1.0e-6,
-                    warmup=settings.warmup,
-                    samples=settings.groups * settings.repetitions,
-                    l2_flush=flush,
-                    capacity_tokens=tokens,
-                    policy=policy,
-                )
-                timings = result["timings"]
-                correctness = result["correctness"]
-                storage = result["storage"]
-                measurements.append(
-                    SweepMeasurement(
-                        candidate=candidate,
-                        latency_us=float(
-                            timings["cuda_graph_replay"]["median_us"]
-                        ),
-                        correct=bool(
-                            correctness["passed"]
-                            and storage["graph_replay_allocation_delta_bytes"] == 0
-                        ),
-                        metrics={
-                            "cosine": correctness[
-                                "graph_replay_after_output_poison"
-                            ]["cosine"],
-                            "replay_allocation_bytes": storage[
-                                "graph_replay_allocation_delta_bytes"
-                            ],
-                        },
-                    )
-                )
-            except Exception as exc:  # noqa: BLE001 - failed configs survive
-                measurements.append(
-                    SweepMeasurement(
-                        candidate=candidate,
-                        latency_us=None,
-                        correct=False,
-                        error=f"{type(exc).__name__}: {exc}",
-                    )
-                )
-        return tuple(measurements)
+                plan = mtp.plan(fixture.plan.caps, policy=base_policy.with_override(MTP_FEEDBACK, config))
+                spec, = plan.scratch_specs()
+                scratch = torch.empty(spec.shape, dtype=spec.dtype, device=device)
+                output = torch.empty_like(fixture.output)
+                binding = mtp.bind(plan, scratch=scratch, output=output, tokens=tokens, **inputs)
+                def run(binding=binding):
+                    return mtp.run(binding, eps=1e-6)
+                for _ in range(settings.warmup):
+                    run()
+                torch.cuda.synchronize(device)
+                graph, _ = capture_warmed_graph(run, device=device)
+                pointers = (output.data_ptr(), scratch.data_ptr())
+                for _ in range(3):
+                    output.fill_(float("nan"))
+                    scratch.fill_(0xFF)
+                    graph.replay()
+                    torch.cuda.synchronize(device)
+                    metrics = _comparison_metrics(output, reference)
+                    _require_correct("MTP production graph", metrics)
+                stable = pointers == (output.data_ptr(), scratch.data_ptr())
+                prepared.append(PreparedCandidate(candidate=candidate, graph=graph, correct=stable,
+                    owners=(binding, output, scratch), aggregation="median",
+                    metrics={"cosine": metrics["cosine"], "stable_addresses": stable,
+                             "frozen_resolution_capture": True, "poison_replays": 3}))
+            except Exception as exc:
+                prepared.append(SweepMeasurement(candidate=candidate, latency_us=None, correct=False,
+                                                 error=f"{type(exc).__name__}: {exc}"))
+        return measure_prepared_candidates(prepared, settings=settings, device=device,
+                                           flush=_l2_flush_fn(device, enabled=settings.cold_l2))
 
 
 class _MhcSession(_GpuSession):
@@ -436,7 +388,7 @@ class _MhcSession(_GpuSession):
             mode=PolicyMode.HEURISTIC_ONLY,
         )
         flush = _l2_flush_fn(device, enabled=settings.cold_l2)
-        prepared: dict[str, _PreparedMhcCandidate] = {}
+        prepared: dict[str, PreparedCandidate] = {}
         failures: dict[str, SweepMeasurement] = {}
         for candidate in candidates:
             try:
@@ -505,9 +457,7 @@ class _MhcSession(_GpuSession):
                 for _ in range(settings.warmup):
                     run()
                 torch.cuda.synchronize(device)
-                graph = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(graph):
-                    run()
+                graph, _ = capture_warmed_graph(run, device=device)
                 for actual in (output, y, post, comb):
                     actual.fill_(float("nan"))
                 allocated_before = torch.cuda.memory_allocated(device)
@@ -535,10 +485,10 @@ class _MhcSession(_GpuSession):
                     bool(torch.count_nonzero(actual).item())
                     for actual in (output, y, post, comb)
                 )
-                prepared[candidate.candidate_id] = _PreparedMhcCandidate(
+                prepared[candidate.candidate_id] = PreparedCandidate(
                     candidate=candidate,
                     graph=graph,
-                    retained=(scratch, output, y, post, comb, binding),
+                    owners=(scratch, output, y, post, comb, binding),
                     correct=(
                         finite
                         and nonzero
@@ -565,59 +515,9 @@ class _MhcSession(_GpuSession):
                     error=f"{type(exc).__name__}: {exc}",
                 )
 
-        active = list(prepared.values())
-        if not active:
-            return tuple(failures[candidate.candidate_id] for candidate in candidates)
-        recorded_events = []
-        for group in range(settings.groups):
-            offset = group % len(active)
-            ordered = active[offset:] + active[:offset]
-            if group % 2:
-                ordered.reverse()
-            for item in ordered:
-                for _ in range(settings.repetitions):
-                    if flush is not None:
-                        flush()
-                    start = torch.cuda.Event(enable_timing=True)
-                    end = torch.cuda.Event(enable_timing=True)
-                    start.record()
-                    item.graph.replay()
-                    end.record()
-                    recorded_events.append((item, start, end))
-        torch.cuda.synchronize(device)
-        for item, start, end in recorded_events:
-            item.samples.append(float(start.elapsed_time(end)) * 1_000.0)
-
-        measurements = []
-        for candidate in candidates:
-            failed = failures.get(candidate.candidate_id)
-            if failed is not None:
-                measurements.append(failed)
-                continue
-            item = prepared[candidate.candidate_id]
-            measurements.append(
-                SweepMeasurement(
-                    candidate=candidate,
-                    latency_us=_median_of_group_medians(
-                        tuple(item.samples),
-                        groups=settings.groups,
-                        repetitions=settings.repetitions,
-                    ),
-                    correct=item.correct,
-                    metrics=item.metrics,
-                )
-            )
-        return tuple(measurements)
-
-
-@dataclass
-class _PreparedMhcCandidate:
-    candidate: SweepCandidate
-    graph: object
-    retained: tuple[object, ...]
-    correct: bool
-    metrics: dict[str, object]
-    samples: list[float] = field(default_factory=list)
+        return measure_prepared_candidates(
+            (failures[c.candidate_id] if c.candidate_id in failures else prepared[c.candidate_id] for c in candidates),
+            settings=settings, device=device, flush=flush)
 
 
 class _OneCaseFactory:
@@ -634,11 +534,30 @@ class _OneCaseFactory:
 class HyperConnectionGenerator(DiscreteSweepGenerator):
     """Race production HyperConnection launch geometry."""
 
+    @staticmethod
+    def validate_region_decision(inputs, device, decision):
+        from b12x.norm.hyperconnection._policy import TUNING_PROBLEM
+
+        query = TUNING_PROBLEM.query_from_inputs(inputs)
+        if ((query.dtype, query.hidden_size, query.streams, query.lowrank) != ("bfloat16", 2560, 4, 320)
+                or query.max_tokens <= 0):
+            raise ValueError("HyperConnection fixtures require positive capacity and BF16 geometry H=2560, streams=4, lowrank=320")
+        TUNING_PROBLEM.lower(query, device, decision)
+
+    @staticmethod
+    def cases_for_tuning_queries(queries):
+        from b12x.policy.problem import stable_identity
+
+        for query in queries:
+            HyperConnectionGenerator.validate_region_decision(query, None, _HyperConnectionSession._CANDIDATES[0].config)
+            yield SweepCase.create(group_id=f"shape-{stable_identity(query)[:24]}", query=query)
+
     def __init__(self, *, cases: Sequence[SweepCase] | None = None) -> None:
         super().__init__(
             component_id=HYPERCONNECTION,
             query_schema_version=1,
             config_schema_version=1,
+            candidate_contract_version=2,
             query_fields=(
                 "dtype",
                 "max_tokens",
@@ -659,11 +578,30 @@ class HyperConnectionGenerator(DiscreteSweepGenerator):
 class MtpFeedbackGenerator(DiscreteSweepGenerator):
     """Race production MTP feedback normalization launch geometry."""
 
+    @staticmethod
+    def validate_region_decision(inputs, device, decision):
+        from b12x.sequence.mtp_feedback._policy import TUNING_PROBLEM
+
+        query = TUNING_PROBLEM.query_from_inputs(inputs)
+        if ((query.dtype, query.hidden_size, query.streams) != ("bfloat16", 2560, 4)
+                or query.max_tokens <= 0):
+            raise ValueError("MTP feedback fixtures require positive capacity and BF16 geometry H=2560, streams=4")
+        TUNING_PROBLEM.lower(query, device, decision)
+
+    @staticmethod
+    def cases_for_tuning_queries(queries):
+        from b12x.policy.problem import stable_identity
+
+        for query in queries:
+            MtpFeedbackGenerator.validate_region_decision(query, None, _MtpFeedbackSession._CANDIDATES[0].config)
+            yield SweepCase.create(group_id=f"shape-{stable_identity(query)[:24]}", query=query)
+
     def __init__(self, *, cases: Sequence[SweepCase] | None = None) -> None:
         super().__init__(
             component_id=MTP_FEEDBACK,
             query_schema_version=1,
             config_schema_version=1,
+            candidate_contract_version=2,
             query_fields=("dtype", "max_tokens", "hidden_size", "streams"),
             range_fields=frozenset({"max_tokens"}),
             cases=_mtp_feedback_cases() if cases is None else cases,
@@ -677,6 +615,26 @@ class MtpFeedbackGenerator(DiscreteSweepGenerator):
 
 class MhcGenerator(DiscreteSweepGenerator):
     """Race production mHC post/pre backends and TF32 projection geometry."""
+
+    @staticmethod
+    def validate_region_decision(inputs, device, decision):
+        from b12x.norm.mhc._policy import TUNING_PROBLEM
+
+        query = TUNING_PROBLEM.query_from_inputs(inputs)
+        if ((query.hidden_size, query.split_k) not in ((4096, 64), (7168, 112))
+                or query.dtype != "bfloat16" or query.max_tokens <= 0):
+            raise ValueError("mHC fixtures require positive BF16 capacity and supported hidden-width/split-K geometry")
+        config = TUNING_PROBLEM.lower(query, device, decision)
+        if query.max_tokens < 384 and config.backend != "native":
+            raise ValueError("mHC production candidates use the native backend below 384 tokens")
+
+    @staticmethod
+    def cases_for_tuning_queries(queries):
+        from b12x.policy.problem import stable_identity
+
+        for query in queries:
+            MhcGenerator.validate_region_decision(query, None, _MHC_NATIVE_CANDIDATE.config)
+            yield SweepCase.create(group_id=f"shape-{stable_identity(query)[:24]}", query=query)
 
     def __init__(self, *, cases: Sequence[SweepCase] | None = None) -> None:
         super().__init__(

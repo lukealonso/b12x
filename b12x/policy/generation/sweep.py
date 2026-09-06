@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import time
 from collections import defaultdict
 from collections.abc import Callable, Mapping, Sequence
 from copy import copy
@@ -22,6 +23,8 @@ from .contracts import (
 )
 from .reducer import DecisionRecord, build_axis_tree, decision_node_to_dict
 from .store import CheckpointStore
+from .observations import ObservationStore, measure_observation
+from .selection import reduce_scenarios
 
 
 def _stable_id(value: Mapping[str, object], *, length: int = 16) -> str:
@@ -79,17 +82,26 @@ class SweepCandidate:
 
     config: FrozenMapping
     candidate_id: str
+    decision: FrozenMapping | None = None
+    equivalent_decisions: tuple[FrozenMapping, ...] = ()
 
     @classmethod
-    def create(cls, config: Mapping[str, object]) -> "SweepCandidate":
+    def create(cls, config: Mapping[str, object], *, decision: Mapping[str, object] | None = None) -> "SweepCandidate":
         frozen = FrozenMapping(config)
-        return cls(config=frozen, candidate_id=_stable_id(frozen))
+        return cls(config=frozen, candidate_id=_stable_id(frozen),
+                   decision=None if decision is None else FrozenMapping(decision))
 
     def __post_init__(self) -> None:
         if not self.config:
             raise ValueError("sweep candidates require a non-empty config")
         if self.candidate_id != _stable_id(self.config):
             raise ValueError("sweep candidate ID does not match its config")
+        if self.equivalent_decisions:
+            if self.decision is None:
+                raise ValueError("execution-equivalent aliases require an independent decision")
+            decisions = (self.decision, *self.equivalent_decisions)
+            if len({ _stable_id(item) for item in decisions }) != len(decisions):
+                raise ValueError("execution-equivalent decisions must be unique")
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -101,6 +113,7 @@ class SweepMeasurement:
     correct: bool
     metrics: FrozenMapping = FrozenMapping()
     error: str | None = None
+    selection_eligible: bool = True
 
     def __post_init__(self) -> None:
         if not isinstance(self.metrics, FrozenMapping):
@@ -113,11 +126,16 @@ class SweepMeasurement:
             raise ValueError("latency_us must be finite and positive")
         if not isinstance(self.correct, bool):
             raise TypeError("correct must be a boolean")
+        if type(self.selection_eligible) is not bool:
+            raise TypeError("selection_eligible must be a boolean")
         if self.error is not None and not self.error:
             raise ValueError("measurement errors must be non-empty")
 
-    def passes(self) -> bool:
+    def qualified(self) -> bool:
         return self.error is None and self.latency_us is not None and self.correct
+
+    def passes(self) -> bool:
+        return self.qualified() and self.selection_eligible
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -127,6 +145,9 @@ class SweepMeasurement:
             "correct": self.correct,
             "metrics": self.metrics.to_dict(),
             "error": self.error,
+            "selection_eligible": self.selection_eligible,
+            "kernel_decision": None if self.candidate.decision is None else self.candidate.decision.to_dict(),
+            "equivalent_decisions": [item.to_dict() for item in self.candidate.equivalent_decisions],
         }
 
     @classmethod
@@ -134,7 +155,12 @@ class SweepMeasurement:
         raw_config = value.get("config")
         if not isinstance(raw_config, Mapping):
             raise TypeError("measurement config must be an object")
-        candidate = SweepCandidate.create(raw_config)
+        candidate = SweepCandidate.create(raw_config, decision=value.get("kernel_decision"))
+        from dataclasses import replace
+
+        candidate = replace(candidate, equivalent_decisions=tuple(
+            FrozenMapping(item) for item in value.get("equivalent_decisions", ())
+        ))
         if value.get("candidate_id") != candidate.candidate_id:
             raise ValueError("checkpoint candidate ID does not match its config")
         latency = value.get("latency_us")
@@ -151,6 +177,7 @@ class SweepMeasurement:
             correct=correct,
             metrics=FrozenMapping(raw_metrics),
             error=None if error is None else str(error),
+            selection_eligible=value.get("selection_eligible", True),
         )
 
 
@@ -161,6 +188,7 @@ class _CachedSweepMeasurements:
     measurements: tuple[SweepMeasurement, ...]
     checkpoint_schema_version: int
     candidate_contract_version: int | None
+    observation_key: str | None = None
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -238,6 +266,9 @@ class DiscreteSweepGenerator:
         self._subset_reuse_contract_versions = tuple(subset_reuse_contract_versions)
         self._nearest_range_bounds = dict(nearest_range_bounds or {})
         self._candidate_tie_breaker = candidate_tie_breaker
+        self._fresh_cases = 0
+        self._measurement_seconds = 0.0
+        self._storage_seconds = 0.0
         if not self._cases:
             raise ValueError(f"{component_id} requires at least one sweep case")
         if not self._query_fields or len(self._query_fields) != len(
@@ -260,6 +291,10 @@ class DiscreteSweepGenerator:
             raise ValueError("subset reuse requires positive, earlier candidate contracts")
         if not frozenset(self._nearest_range_bounds) <= self._range_fields:
             raise ValueError("nearest range fields must also be range_fields")
+
+    def measurement_context(self, context: GenerationContext) -> GenerationContext:
+        """Bind component-specific execution dependencies before checkpoint lookup."""
+        return context
 
     def estimate(self, context: GenerationContext) -> WorkEstimate:
         del context
@@ -354,7 +389,7 @@ class DiscreteSweepGenerator:
                 and set(candidate_ids) <= set(cached.candidate_ids)
             )
         )
-        if can_reuse:
+        if can_reuse and cached.observation_key is None:
             by_id = {item.candidate.candidate_id: item for item in cached.measurements}
             reused = tuple(by_id[candidate_id] for candidate_id in candidate_ids)
             checkpoints.save(
@@ -369,22 +404,45 @@ class DiscreteSweepGenerator:
             )
             return reused
 
-        measurements = session.measure(case, candidates)
+        def measure():
+            measurements = session.measure(case, candidates)
+            if [item.candidate.candidate_id for item in measurements] != candidate_ids:
+                raise ValueError("measurement sessions must preserve the requested candidate order")
+            return {"measurements": [item.to_dict() for item in measurements]}
+
+        observed = measure_observation(
+            context=context, component_id=self.component_id,
+            inputs=FrozenMapping({"group_id": case.group_id, "query": case.query.to_dict(),
+                                  "scenario": case.scenario, "metadata": case.metadata.to_dict()}),
+            candidates=tuple(candidate.config for candidate in candidates),
+            oracle_contract=f"{self.component_id}:{self._candidate_contract_version}",
+            store=ObservationStore(checkpoints.observations_path),
+            measure=measure,
+        )
+        measurements = tuple(SweepMeasurement.from_dict(item) for item in observed.result["measurements"])
+        self._measurement_seconds += observed.measurement_seconds
+        self._storage_seconds += observed.storage_seconds
+        self._fresh_cases += observed.fresh
         measured_ids = [item.candidate.candidate_id for item in measurements]
         if measured_ids != candidate_ids:
             raise ValueError(
                 "measurement sessions must preserve the requested candidate order"
             )
+        payload = self._checkpoint_payload(
+            case=case, generation=context.checkpoint_metadata(),
+            candidate_ids=candidate_ids, measurements=measurements,
+        )
+        started = time.monotonic()
+        if observed.identity is not None:
+            payload.pop("measurements")
+            payload["schema_version"] = 3
+            payload["observation_key"] = observed.identity.key
         checkpoints.save(
             self.component_id,
             case.case_id,
-            self._checkpoint_payload(
-                case=case,
-                generation=context.checkpoint_metadata(),
-                candidate_ids=candidate_ids,
-                measurements=measurements,
-            ),
+            payload,
         )
+        self._storage_seconds += time.monotonic() - started
         return measurements
 
     def _load_checkpoint(
@@ -402,11 +460,11 @@ class DiscreteSweepGenerator:
         if (
             cached is None
             or type(schema_version) is not int
-            or schema_version not in (1, 2)
+            or schema_version not in (1, 2, 3)
             or not context.checkpoint_metadata_matches(cached.get("generation"))
             or cached.get("case_id") != case.case_id
             or (
-                schema_version == 2
+                schema_version in (2, 3)
                 and (
                     type(contract_version) is not int
                     or contract_version not in (
@@ -420,6 +478,22 @@ class DiscreteSweepGenerator:
         raw_candidate_ids = cached.get("candidate_ids")
         raw_measurements = cached.get("measurements")
         raw_generation = cached.get("generation")
+        observation_key = cached.get("observation_key")
+        if schema_version == 3:
+            if not isinstance(observation_key, str):
+                raise ValueError("sweep checkpoint requires an observation reference")
+            stored = ObservationStore(checkpoints.observations_path).load_key(observation_key)
+            if stored is None:
+                return None
+            identity = stored["identity"]
+            inputs = {"group_id": case.group_id, "query": case.query.to_dict(),
+                      "scenario": case.scenario, "metadata": case.metadata.to_dict()}
+            if (identity.get("generation") != raw_generation or identity.get("inputs") != inputs
+                    or identity.get("component_id") != self.component_id
+                    or identity.get("cohort") != context.measurement_cohort
+                    or identity.get("oracle_contract") != f"{self.component_id}:{contract_version}"):
+                raise ValueError("sweep checkpoint references a different measurement identity")
+            raw_measurements = stored["result"].get("measurements")
         if not isinstance(raw_candidate_ids, list) or not all(
             isinstance(candidate_id, str) for candidate_id in raw_candidate_ids
         ):
@@ -433,6 +507,8 @@ class DiscreteSweepGenerator:
         )
         candidate_ids = tuple(raw_candidate_ids)
         measured_ids = tuple(item.candidate.candidate_id for item in measurements)
+        if schema_version == 3 and identity.get("candidates") != [item.candidate.config.to_dict() for item in measurements]:
+            raise ValueError("sweep observations differ from their production candidate cohort")
         if measured_ids != candidate_ids:
             raise ValueError("sweep checkpoint measurements do not match candidate IDs")
         if len(candidate_ids) != len(set(candidate_ids)):
@@ -443,8 +519,9 @@ class DiscreteSweepGenerator:
             measurements=measurements,
             checkpoint_schema_version=int(schema_version),
             candidate_contract_version=(
-                cast(int, contract_version) if schema_version == 2 else None
+                cast(int, contract_version) if schema_version in (2, 3) else None
             ),
+            observation_key=observation_key,
         )
 
     def _checkpoint_is_current(
@@ -452,7 +529,7 @@ class DiscreteSweepGenerator:
         cached: _CachedSweepMeasurements | None,
     ) -> bool:
         return (
-            cached is not None and cached.checkpoint_schema_version == 2
+            cached is not None and cached.checkpoint_schema_version in (2, 3)
             and cached.candidate_contract_version == self._candidate_contract_version
         )
 
@@ -490,6 +567,10 @@ class DiscreteSweepGenerator:
         other sources before building a planner; :meth:`generate` builds the
         planner from these records alone.
         """
+        context = self.measurement_context(context)
+        self._fresh_cases = 0
+        self._measurement_seconds = 0.0
+        self._storage_seconds = 0.0
         cases_by_group: dict[str, list[SweepCase]] = defaultdict(list)
         for case in self._cases:
             cases_by_group[case.group_id].append(case)
@@ -590,46 +671,17 @@ class DiscreteSweepGenerator:
         records: list[DecisionRecord] = []
         winner_counts: dict[str, int] = defaultdict(int)
         for grouped in grouped_results.values():
-            by_candidate: dict[str, list[SweepMeasurement]] = defaultdict(list)
-            for _case, measurements in grouped:
-                for measurement in measurements:
-                    if measurement.passes():
-                        by_candidate[measurement.candidate.candidate_id].append(
-                            measurement
-                        )
-            required_measurements = len(grouped)
-            robust: list[tuple[float, SweepCandidate]] = []
-            for candidate_measurements in by_candidate.values():
-                if len(candidate_measurements) != required_measurements:
-                    continue
-                score = math.exp(
-                    sum(
-                        math.log(float(item.latency_us))
-                        for item in candidate_measurements
-                    )
-                    / len(candidate_measurements)
-                )
-                robust.append((score, candidate_measurements[0].candidate))
-            if not robust:
+            scores = self.reduce_measurements(tuple(measurements for _, measurements in grouped))
+            if not scores.eligible_candidates:
                 raise RuntimeError(
                     "no candidate passed every scenario for query "
                     f"{grouped[0][0].query.to_dict()}"
                 )
-            _, winner = min(
-                robust,
-                key=lambda item: (
-                    item[0],
-                    (
-                        self._candidate_tie_breaker(item[1])
-                        if self._candidate_tie_breaker is not None
-                        else item[1].candidate_id
-                    ),
-                ),
-            )
+            winner = scores.select(self._candidate_tie_breaker)
             records.append(
                 DecisionRecord(
                     query=grouped[0][0].query,
-                    config=winner.config,
+                    config=self.profile_config(grouped[0][0].query, winner),
                 )
             )
             winner_counts[winner.candidate_id] += 1
@@ -652,14 +704,33 @@ class DiscreteSweepGenerator:
             evidence={
                 "winner_query_counts": dict(sorted(winner_counts.items())),
                 "gpu_measurement_cases": len(measured),
+                "fresh_measurement_cases": self._fresh_cases,
+                "reused_measurement_cases": len(measured) - self._fresh_cases,
+                "measurement_seconds": self._measurement_seconds,
+                "storage_seconds": self._storage_seconds,
                 "profile_cases": len(measured),
                 "candidate_race_cases": race_cases,
                 "single_candidate_qualification_cases": qualification_cases,
+                **({"external_dependencies": context.provenance.to_dict()["external_dependencies"]}
+                   if "external_dependencies" in context.provenance else {}),
             },
             completed_work_units=self.estimate(context).work_units,
         )
 
-    def build_planner(self, records: Sequence[DecisionRecord]):
+    def reduce_measurements(self, scenarios):
+        return reduce_scenarios(scenarios, qualified=lambda item: item.qualified(),
+                                selectable=lambda item: item.selection_eligible)
+
+    def tuning_inputs(self, query):
+        return query
+
+    def decision_for_candidate(self, query, candidate):
+        return candidate.config if candidate.decision is None else candidate.decision
+
+    def profile_config(self, query, candidate):
+        return candidate.config
+
+    def build_planner(self, records: Sequence[DecisionRecord], *, device=None):
         """Reduce decision records to this component's axis-tree planner."""
         return build_axis_tree(
             tuple(records),
@@ -682,7 +753,7 @@ class DiscreteSweepGenerator:
                 "query_schema_version": self.query_schema_version,
                 "config_schema_version": self.config_schema_version,
                 "coverage": outcome.coverage,
-                "planner": decision_node_to_dict(self.build_planner(outcome.records), compact=True),
+                "planner": decision_node_to_dict(self.build_planner(outcome.records, device=context.device), compact=True),
             },
             evidence=outcome.evidence,
             completed_work_units=outcome.completed_work_units,

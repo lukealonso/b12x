@@ -7484,15 +7484,7 @@ def _plan_full_rotation_w4a16_launches(
                 _DEFAULT_MAX_SHARED_MEM,
             )
         )
-        # Decode plans are deliberately exact-M: the unified API's measured
-        # speedup over the retired Trellis wrapper comes from specializing the
-        # small live shapes instead of always launching its M=32 capacity
-        # kernel.  Large prefill plans retain one capacity launch.
-        fused_token_counts = (
-            tuple(range(1, capacity_tokens + 1))
-            if capacity_tokens <= 32
-            else (capacity_tokens,)
-        )
+        fused_token_counts = (capacity_tokens,)
 
         def compile_fused(token_count: int) -> object:
             return compile_w4a16_fused_moe(
@@ -7505,8 +7497,7 @@ def _plan_full_rotation_w4a16_launches(
                 apply_router_weight_on_input=caps.apply_router_weight_on_input,
                 zero_fc2_output=False,
                 moe_block_size=block_size_m,
-                # Match the lazy unified path: specialize the live M while
-                # retaining the caller-owned route arena's full grid capacity.
+                # The fused kernel and route arena share the declared capacity.
                 max_m_blocks=capacity_m_blocks,
                 element_dtype="fp16",
                 fast_math=caps.w4a16_fast_math,
@@ -7597,8 +7588,6 @@ def _plan_full_rotation_w4a16_launches(
                         core_plan.device.type,
                         int(torch.cuda.current_device()),
                         route_ids_dtype,
-                        token_count,
-                        core_plan.num_topk,
                         capacity_route_slots,
                         capacity_m_blocks,
                         int(block_size_m),
@@ -8342,8 +8331,6 @@ def _prewarm_w4a16_planned_launches(
                 workspace.device.type,
                 int(torch.cuda.current_device()),
                 torch.int32,
-                token_count,
-                workspace.num_topk,
                 workspace.packed_route_indices.numel(),
                 workspace.block_expert_ids.numel(),
                 int(block_size_m),
@@ -12329,6 +12316,8 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
             swiglu_alpha=swiglu_alpha,
             swiglu_beta=swiglu_beta,
             fused_launch=fused_launch,
+            planned_token_capacity=(binding.execution_plan.max_tokens_per_launch
+                                    if binding.execution_plan is not None else None),
             topk_sum_launch=topk_sum_launch,
             route_block_size_m=binding.route_block_size_m,
             intermediate_rotation_scales=(

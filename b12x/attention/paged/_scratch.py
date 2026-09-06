@@ -18,7 +18,8 @@ from typing import Literal
 import torch
 from torch.profiler import record_function
 
-from b12x.policy import PolicyContext
+from b12x.policy import PolicyContext, PolicyResolution
+from b12x.attention.paged._policy import GqaConfig
 
 from b12x.attention.paged.planner import (
     PagedPlan,
@@ -116,8 +117,11 @@ class B12XPagedAttentionScratchCaps:
     msa_block_sparse: bool = False
     msa_union_tile: bool | None = None
     policy_context: PolicyContext | None = None
+    kv_cache_layout: Literal["separate", "combined"] = "separate"
 
     def __post_init__(self) -> None:
+        if self.kv_cache_layout not in ("separate", "combined"):
+            raise ValueError("kv_cache_layout must be 'separate' or 'combined'")
         object.__setattr__(self, "msa_block_sparse", bool(self.msa_block_sparse))
         if (
             self.msa_block_sparse
@@ -386,6 +390,7 @@ def plan_decode_graph_scratch_envelope(
             num_cache_pages=1,
             use_cuda_graph=True,
             copy_runtime_metadata=copy_runtime_metadata,
+            kv_cache_layout=kv_cache_layout,
         )
         bucket_nbytes = int(_paged_attention_scratch_layout(bucket_caps).nbytes)
         if bucket_nbytes > envelope_nbytes:
@@ -1885,6 +1890,7 @@ class B12XPagedAttentionScratchPlan:
     _use_regular_decode_graph_replay: bool = False
     _q2k_indices_data_ptr: int | None = None
     _decode_graph_replay_state_captured: bool = False
+    policy_resolution: PolicyResolution[GqaConfig] | None = None
 
     def _mark_decode_graph_replay_state_captured(
         self,
@@ -2232,8 +2238,10 @@ class B12XPagedAttentionScratchPlan:
             max_partial_rows=self.caps.max_partial_rows,
             force_split_kv=force_split_kv,
             policy=self.caps.policy_context,
+            kv_cache_layout=self.caps.kv_cache_layout,
         )
         decode_chunk_pages_lut = capacity.chunk_pages_lut
+        self.policy_resolution = capacity.policy_resolution
         max_chunks_per_req = capacity.max_chunks_per_request
         # Chunk policy is not monotone in the effective page count.  Materialize
         # the exact LUT row that needs the most chunks rather than assuming the

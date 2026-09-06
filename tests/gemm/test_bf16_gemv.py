@@ -103,3 +103,34 @@ def test_noncontiguous_x():
     w = torch.randn(96, 2048, device=device, dtype=torch.bfloat16)
     y = op(x, w)
     _assert_matches_f32_ref(y, x.contiguous(), w)
+
+
+@cuda_required
+@pytest.mark.parametrize("columns", (112, 256))
+def test_live_rows_reuse_one_callable_without_capture_fallback(monkeypatch, columns):
+    from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
+    from b12x.gemm import bf16_gemv
+    from b12x.gemm.bf16_gemv import _kernel
+
+    weight = torch.randn(columns, 1024, device="cuda", dtype=torch.bfloat16)
+    source = torch.randn(8, 1024, device="cuda", dtype=torch.bfloat16)
+    bf16_gemv.precompile(weight)
+    callable_at_capacity = _kernel.get_cached_bf16_gemv_small_n(8, columns, 1024)
+    def forbidden_fallback(*args, **kwargs):
+        raise AssertionError("a supported warmed GEMV may not substitute F.linear")
+    monkeypatch.setattr(torch.nn.functional, "linear", forbidden_fallback)
+    freeze_kernel_resolution("live GEMV rows must reuse the warmed model geometry")
+    try:
+        for rows in range(1, 9):
+            assert _kernel.get_cached_bf16_gemv_small_n(rows, columns, 1024) is callable_at_capacity
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                output = bf16_gemv.mm(source[:rows], weight)
+            output.fill_(torch.nan)
+            allocated = torch.cuda.memory_allocated()
+            graph.replay()
+            torch.cuda.synchronize()
+            assert torch.cuda.memory_allocated() == allocated
+            _assert_matches_f32_ref(output, source[:rows], weight)
+    finally:
+        unfreeze_kernel_resolution()

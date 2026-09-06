@@ -143,7 +143,7 @@ BF16_VOCAB_PROJECTION_POLICY = ComponentPolicy(
     query_fields=frozenset(Bf16VocabProjectionQuery.__dataclass_fields__),
     config_fields=frozenset(Bf16VocabProjectionConfig.__dataclass_fields__),
     encode_query=_encode,
-    decode_profile=Bf16VocabProjectionConfig.from_profile,
+    decode_profile=lambda query, device, payload: Bf16VocabProjectionConfig.from_profile(payload),
     heuristic=_heuristic,
     validate_config=_validate,
 )
@@ -156,3 +156,20 @@ __all__ = [
     "MAX_IN_FEATURES",
     "MIN_TRITON_OUT_FEATURES",
 ]
+
+
+from b12x.policy.problem import define_problem
+
+TUNING_PROBLEM = define_problem(
+    policy=BF16_VOCAB_PROJECTION_POLICY, query_type=Bf16VocabProjectionQuery, config_type=Bf16VocabProjectionConfig,
+    axes=('max_tokens', 'in_features', 'out_features'),
+    family=('dtype',),
+    constraints=(),
+    environment=(),
+    model_fields=('in_features', 'out_features'),
+    decisions={'backend': ('torch', 'triton'), 'algorithm': ('torch', 'row', 'loop'),
+               'block_k': None, 'num_warps': (0, 1, 2, 4, 8)},
+    ordered=('block_k', 'num_warps'),
+    axis_domains={name: (1, 1) for name in ('max_tokens', 'in_features', 'out_features')},
+    derived_config_fields=(),
+)

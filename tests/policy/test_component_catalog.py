@@ -18,6 +18,7 @@ from b12x.policy import (
     validate_component_profile_contract,
 )
 from b12x.policy.generation import ComponentGeneratorRegistry
+from b12x.policy.catalog import list_generation_components
 from b12x.policy.generation.moe_corpus import COMMON_PREFILL_TOKEN_CAPACITIES
 from b12x.policy.generation.providers import register_builtin_generators
 
@@ -40,7 +41,13 @@ def test_profiled_policies_generators_and_embedded_profile_stay_in_lockstep() ->
     register_builtin_generators(generator_registry)
     profile = EMBEDDED_REGISTRY.get("nvidia.gb10.48sm")
 
-    assert generator_registry.component_ids() == expected_ids
+    assert generator_registry.component_ids() == tuple(
+        item.component_id for item in list_generation_components()
+    )
+    assert {
+        item.component_id for item in generator_registry.select(None)
+        if item.artifact_kind == "runtime_profile"
+    } == set(expected_ids)
     assert tuple(component.component_id for component in profile.components) == (
         expected_ids
     )
@@ -269,3 +276,36 @@ def test_every_profile_generator_has_real_gpu_measurement_work() -> None:
         generator = registration.create_generator()
         assert generator.component_id == registration.component_id
         assert "precomputed" not in type(generator).__module__
+
+
+def test_api_aliases_share_the_registered_production_entry_points():
+    import importlib
+    from b12x.policy.catalog import API_ALIASES
+
+    owners = {item.op_qualname for item in list_generation_components()}
+    for alias in API_ALIASES:
+        assert alias.owner_op in owners
+        public = importlib.import_module("b12x." + alias.op_qualname)
+        owner = importlib.import_module("b12x." + alias.owner_op)
+        for name in alias.entry_points:
+            assert getattr(public, name) is getattr(owner, name)
+        assert set(alias.recipes) <= set(public.META.recipes)
+
+
+def test_qualification_factories_validate_fields_and_do_not_enable_region_dispatch():
+    import pytest
+    from b12x.policy.catalog import QUALIFICATION_COMPONENTS
+    from b12x.policy.generation.program import QualifiedSearchGenerator
+
+    for registration in QUALIFICATION_COMPONENTS:
+        generator = registration.create_generator()
+        assert generator.artifact_kind == "qualification"
+        assert {task.kind for task in generator.measurement_program} == {generator.measurement_kind}
+        query = generator._cases[0].query.to_dict()
+        assert generator.cases_for_tuning_queries([query])[0].query.to_dict() == query
+        with pytest.raises((TypeError, ValueError)):
+            generator.cases_for_tuning_queries([{**query, "max_rows": True}])
+        with pytest.raises((TypeError, ValueError)):
+            generator.cases_for_tuning_queries([{**query, "max_rows": 0}])
+        with pytest.raises(ValueError, match="do not emit runtime dispatch regions"):
+            QualifiedSearchGenerator(generator, None)

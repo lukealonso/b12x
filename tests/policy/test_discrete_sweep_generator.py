@@ -17,6 +17,7 @@ from b12x.policy.generation import (
 )
 from b12x.policy.generation.progress import NullProgressReporter
 from b12x.policy.serialization import profile_from_dict
+from b12x.policy.types import FrozenMapping
 
 _DEVICE = DeviceIdentity(
     vendor="nvidia",
@@ -24,6 +25,112 @@ _DEVICE = DeviceIdentity(
     sm_count=48,
     product_name="Synthetic GPU",
 )
+
+
+def test_shared_observations_survive_stage_checkpoint_removal(tmp_path):
+    calls, candidate_calls, session_calls = [], [], []
+    generator = DiscreteSweepGenerator(
+        component_id="test.attention", query_schema_version=1, config_schema_version=1,
+        query_fields=("family", "rows"), range_fields=frozenset({"rows"}), cases=_cases(),
+        benchmark_factory=_Factory(calls, candidate_calls, session_calls), coverage={},
+    )
+    context = GenerationContext(
+        device=_DEVICE, device_ordinal=0, work_dir=tmp_path, source_revision="source",
+        settings=GenerationSettings(), provenance=FrozenMapping({
+            "source_sha256": "content", "physical_device": "GPU-a", "toolchain": {"cutlass": "4.6.2"},
+        }),
+    )
+    checkpoints = CheckpointStore(tmp_path / "checkpoints")
+    first = generator.generate(context, progress=NullProgressReporter(), checkpoints=checkpoints)
+    assert first.evidence["fresh_measurement_cases"] == 4
+    assert first.evidence["reused_measurement_cases"] == 0
+    for case in _cases():
+        checkpoint = checkpoints.load(generator.component_id, case.case_id)
+        assert checkpoint["schema_version"] == 3
+        assert "observation_key" in checkpoint and "measurements" not in checkpoint
+        checkpoints._path(generator.component_id, case.case_id).unlink()
+    second = generator.generate(context, progress=NullProgressReporter(), checkpoints=checkpoints)
+    assert second.component == first.component
+    assert len(calls) == 4
+    assert second.evidence["fresh_measurement_cases"] == 0
+    assert second.evidence["reused_measurement_cases"] == 4
+    third = generator.generate(context, progress=NullProgressReporter(), checkpoints=checkpoints)
+    assert third.component == first.component
+    assert len(session_calls) == 2
+
+    changed = replace(context, provenance=FrozenMapping({
+        **context.provenance.to_dict(), "physical_device": "GPU-b",
+    }))
+    fourth = generator.generate(changed, progress=NullProgressReporter(), checkpoints=checkpoints)
+    assert fourth.evidence["fresh_measurement_cases"] == 4
+    assert len(calls) == 8
+
+
+@pytest.mark.parametrize("search", (False, True))
+def test_external_binary_identity_invalidates_sweep_and_search_observations(tmp_path, search):
+    import hashlib
+    from types import SimpleNamespace
+
+    from b12x.policy.generation.engine import DiscreteSearch
+    from b12x.policy.generation.search import SearchBudget, SearchStrategy
+    from b12x.policy.problem import define_problem
+
+    binary = tmp_path / "dependency.so"
+    binary.write_bytes(b"dependency implementation one")
+    calls, candidate_calls, session_calls = [], [], []
+    generator = DiscreteSweepGenerator(
+        component_id="test.attention", query_schema_version=1, config_schema_version=1,
+        query_fields=("family", "rows"), range_fields=frozenset({"rows"}), cases=_cases(),
+        benchmark_factory=_Factory(calls, candidate_calls, session_calls), coverage={},
+    )
+    def measurement_context(context):
+        provenance = context.provenance.to_dict()
+        dependencies = {**provenance.get("external_dependencies", {}),
+                        "dependency": {"sha256": hashlib.sha256(binary.read_bytes()).hexdigest()}}
+        return replace(context, provenance=FrozenMapping({**provenance, "external_dependencies": dependencies}))
+
+    generator.measurement_context = measurement_context
+    context = GenerationContext(
+        device=_DEVICE, device_ordinal=0, work_dir=tmp_path, source_revision="source",
+        settings=GenerationSettings(), provenance=FrozenMapping({
+            "source_sha256": "content", "physical_device": "GPU-a", "toolchain": {"cutlass": "4.6.2"},
+            "external_dependencies": {"upstream": {"sha256": "upstream-binary"}},
+        }),
+    )
+    assert generator.measurement_context(context).provenance["external_dependencies"]["upstream"] == FrozenMapping(
+        {"sha256": "upstream-binary"})
+    checkpoints = CheckpointStore(tmp_path / "checkpoints")
+
+    @dataclass(frozen=True)
+    class Query:
+        family: str
+        rows: int
+
+    @dataclass(frozen=True)
+    class Config:
+        backend: str
+
+    problem = define_problem(policy=SimpleNamespace(component_id=generator.component_id),
+                             query_type=Query, config_type=Config, axes=("rows",), family=("family",),
+                             decisions={"backend": ("left", "right")})
+
+    def run():
+        if search:
+            with DiscreteSearch(generator, problem, context, checkpoints) as adapter:
+                adapter.search(strategy=SearchStrategy.EXHAUSTIVE, budget=SearchBudget(queries=10))
+        else:
+            result = generator.generate(context, progress=NullProgressReporter(), checkpoints=checkpoints)
+            assert result.evidence["external_dependencies"] == generator.measurement_context(
+                context).provenance.to_dict()["external_dependencies"]
+
+    run()
+    run()
+    assert len(calls) == 4
+    binary.write_bytes(b"dependency implementation two")
+    run()
+    assert len(calls) == 8
+    run()
+    assert len(calls) == 8
 
 
 class _Session(AbstractContextManager["_Session"]):
@@ -262,24 +369,24 @@ def test_discrete_sweep_reduces_scenarios_and_resumes(tmp_path) -> None:
         progress=NullProgressReporter(),
         checkpoints=checkpoints,
     )
-    assert len(calls) == first_call_count
-    assert len(candidate_calls) == first_call_count
-    assert len(session_calls) == 1
+    assert len(calls) == 2 * first_call_count
+    assert len(candidate_calls) == 2 * first_call_count
+    assert len(session_calls) == 2
     checkpoint = checkpoints.load("test.attention", _cases()[0].case_id)
     assert checkpoint is not None
     generation = checkpoint["generation"]
     assert isinstance(generation, dict)
-    assert generation["source_revision"] == "abc123"
-    assert generation["settings"] == context.settings.to_dict()
+    assert generation["source_revision"] == "def456"
+    assert generation["settings"] == source_changed_context.settings.to_dict()
 
     generator.generate(
         source_changed_context,
         progress=NullProgressReporter(),
         checkpoints=checkpoints,
     )
-    assert len(calls) == first_call_count
-    assert len(candidate_calls) == first_call_count
-    assert len(session_calls) == 1
+    assert len(calls) == 2 * first_call_count
+    assert len(candidate_calls) == 2 * first_call_count
+    assert len(session_calls) == 2
 
     changed_context = replace(
         source_changed_context,
@@ -290,9 +397,9 @@ def test_discrete_sweep_reduces_scenarios_and_resumes(tmp_path) -> None:
         progress=NullProgressReporter(),
         checkpoints=checkpoints,
     )
-    assert len(calls) == 2 * first_call_count
-    assert len(candidate_calls) == 2 * first_call_count
-    assert len(session_calls) == 2
+    assert len(calls) == 3 * first_call_count
+    assert len(candidate_calls) == 3 * first_call_count
+    assert len(session_calls) == 3
 
     changed_contract = DiscreteSweepGenerator(
         component_id="test.attention",
@@ -310,9 +417,9 @@ def test_discrete_sweep_reduces_scenarios_and_resumes(tmp_path) -> None:
         progress=NullProgressReporter(),
         checkpoints=checkpoints,
     )
-    assert len(calls) == 3 * first_call_count
-    assert len(candidate_calls) == 3 * first_call_count
-    assert len(session_calls) == 3
+    assert len(calls) == 4 * first_call_count
+    assert len(candidate_calls) == 4 * first_call_count
+    assert len(session_calls) == 4
     profile = profile_from_dict(
         {
             "profile_id": "nvidia.synthetic.48sm",
@@ -331,3 +438,40 @@ def test_discrete_sweep_reduces_scenarios_and_resumes(tmp_path) -> None:
     assert component is not None
     assert component.lookup({"family": "a", "rows": 1}).config["backend"] == "left"
     assert component.lookup({"family": "a", "rows": 4}).config["backend"] == "right"
+
+
+def test_shared_search_adapter_preserves_all_scenarios_and_production_candidates(tmp_path):
+    from types import SimpleNamespace
+    from b12x.policy.problem import define_problem
+    from b12x.policy.generation.engine import DiscreteSearch
+    from b12x.policy.generation.search import SearchBudget, SearchStrategy
+
+    @dataclass(frozen=True)
+    class Query:
+        family: str
+        rows: int
+
+    @dataclass(frozen=True)
+    class Config:
+        backend: str
+
+    problem = define_problem(policy=SimpleNamespace(component_id='test.attention'), query_type=Query,
+                             config_type=Config, axes=('rows',), family=('family',),
+                             decisions={'backend': ('left', 'right')})
+    calls, candidate_calls, session_calls = [], [], []
+    generator = DiscreteSweepGenerator(
+        component_id='test.attention', query_schema_version=1, config_schema_version=1,
+        query_fields=('family', 'rows'), range_fields=frozenset({'rows'}), cases=_cases(),
+        benchmark_factory=_Factory(calls, candidate_calls, session_calls), coverage={},
+    )
+    context = GenerationContext(device=_DEVICE, device_ordinal=0, work_dir=tmp_path,
+                                source_revision='source', settings=GenerationSettings())
+    checkpoints = CheckpointStore(tmp_path/'checkpoints')
+    with DiscreteSearch(generator, problem, context, checkpoints) as adapter:
+        outcome = adapter.search(strategy=SearchStrategy.EXHAUSTIVE, budget=SearchBudget(queries=10))
+        winners = {m.point.query['rows']: adapter.configs[m.winner]['backend'] for m in outcome.measurements}
+    assert outcome.exhausted_domain
+    assert winners == {1: 'left', 4: 'right'}
+    assert len(calls) == 4
+    assert len(session_calls) == 1
+    assert all(len(m.candidate_ids) == 2 for m in outcome.measurements)

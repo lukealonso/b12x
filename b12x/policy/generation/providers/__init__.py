@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-from b12x.policy.catalog import list_profiled_components
+from b12x.policy.catalog import list_generation_components
 from b12x.policy.generation.registry import ComponentGeneratorRegistry
 
 
 def register_builtin_generators(registry: ComponentGeneratorRegistry) -> None:
-    for registration in list_profiled_components():
+    for registration in list_generation_components():
         registry.register(registration.create_generator())
 
 

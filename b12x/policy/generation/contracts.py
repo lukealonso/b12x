@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
-from b12x.policy.types import DeviceIdentity
+from b12x.policy.types import DeviceIdentity, FrozenMapping
 
 JsonObject = Mapping[str, object]
 
@@ -22,6 +22,7 @@ class GenerationSettings:
     seed: int = 20260828
     minimum_cosine: float = 0.998
     cold_l2: bool = True
+    timing_clock: str = "cuda_event"
     max_candidate_seconds: float = 2.0
 
     def __post_init__(self) -> None:
@@ -30,6 +31,8 @@ class GenerationSettings:
                 raise ValueError(f"{name} must be positive")
         if not -1.0 <= self.minimum_cosine <= 1.0:
             raise ValueError("minimum_cosine must be in [-1, 1]")
+        if self.timing_clock not in ("cuda_event", "globaltimer"):
+            raise ValueError("timing_clock must be cuda_event or globaltimer")
         if self.max_candidate_seconds <= 0:
             raise ValueError("max_candidate_seconds must be positive")
 
@@ -41,6 +44,7 @@ class GenerationSettings:
             "seed": self.seed,
             "minimum_cosine": self.minimum_cosine,
             "cold_l2": self.cold_l2,
+            "timing_clock": self.timing_clock,
             "max_candidate_seconds": self.max_candidate_seconds,
         }
 
@@ -54,9 +58,18 @@ class GenerationContext:
     work_dir: Path
     source_revision: str
     settings: GenerationSettings
+    provenance: FrozenMapping = FrozenMapping()
+    accepted_physical_devices: tuple[str, ...] = ()
+    measurement_cohort: str = "initial"
+
+    def __post_init__(self) -> None:
+        if not self.measurement_cohort:
+            raise ValueError("generation requires a nonempty measurement cohort")
 
     def checkpoint_metadata(self) -> dict[str, object]:
         return {
+            **self.provenance.to_dict(),
+            "measurement_cohort": self.measurement_cohort,
             "source_revision": self.source_revision,
             "device": {
                 "vendor": self.device.vendor,
@@ -68,40 +81,24 @@ class GenerationContext:
         }
 
     def checkpoint_metadata_matches(self, value: object) -> bool:
-        """Return whether measurements can be resumed in this context.
+        """Require identical source, toolchain, protocol, and an assigned GPU.
 
-        Source revision is retained for provenance, but is not a measurement
-        input. Case IDs, candidate IDs, checkpoint schema, device identity, and
-        timing settings independently invalidate incompatible measurements.
-        A cached sampling protocol may exceed the requested sampling strength.
+        A coordinator may reduce records from its explicitly assigned physical
+        GPUs. Raw observation identities always retain the measuring GPU UUID.
         """
 
         if not isinstance(value, Mapping):
             return False
         expected = self.checkpoint_metadata()
-        if value.get("device") != expected["device"]:
+        if set(value) != set(expected):
             return False
-        cached_settings = value.get("settings")
-        requested_settings = expected["settings"]
-        if not isinstance(cached_settings, Mapping):
-            return False
-        if set(cached_settings) != set(requested_settings):
-            return False
-        if any(
-            cached_settings[field] != requested_settings[field]
-            for field in ("seed", "cold_l2")
-        ):
-            return False
-        return all(
-            cached_settings[field] >= requested_settings[field]
-            for field in (
-                "warmup",
-                "repetitions",
-                "groups",
-                "minimum_cosine",
-                "max_candidate_seconds",
-            )
-        )
+        for name, requested in expected.items():
+            if name == "physical_device" and self.accepted_physical_devices:
+                if value[name] not in self.accepted_physical_devices:
+                    return False
+            elif value[name] != requested:
+                return False
+        return True
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -145,10 +142,18 @@ class ComponentGenerationResult:
     component: JsonObject
     evidence: JsonObject
     completed_work_units: int
+    completion_reason: str = "exhaustive"
+    qualification: JsonObject | None = None
 
     def __post_init__(self) -> None:
         if self.completed_work_units < 0:
             raise ValueError("completed_work_units cannot be negative")
+        if self.completion_reason not in {"exhaustive", "qualified", "budget_exhausted"}:
+            raise ValueError("unknown component completion reason")
+        if self.completion_reason == "qualified" and (
+            self.qualification is None or self.qualification.get("status") != "qualified"
+        ):
+            raise ValueError("qualified completion requires a passing independent qualification report")
 
 
 @runtime_checkable

@@ -2433,7 +2433,8 @@ def plan_indexer_scratch(
             num_q_heads=caps.num_q_heads,
             num_idx_heads=caps.num_idx_heads,
             max_q_rows=caps.max_q_rows,
-            max_k_rows=0 if caps.max_k_rows is None else caps.max_k_rows,
+            max_k_rows=(int(caps.max_page_table_width) * caps.page_size
+                        if caps.source_layout == INDEXER_SOURCE_LAYOUT_PAGED else int(caps.max_k_rows)),
             top_k=caps.topk,
             page_size=caps.page_size,
             score_mode=caps.score_mode,

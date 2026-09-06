@@ -322,6 +322,7 @@ def _trace_nvfp4_route(
     swiglu_alpha: float | None = None,
     swiglu_beta: float | None = None,
     quant_scale_math: str = "direct_division",
+    w13_layout: str | None = None,
 ) -> MoERouteTrace:
     activation, swiglu_limit, swiglu_alpha, swiglu_beta = (
         _normalize_reference_swiglu_params(
@@ -350,7 +351,7 @@ def _trace_nvfp4_route(
     up_out = None
     if is_gated:
         w13_sf = unswizzle_block_scale(w1_blockscale_eid, 2 * I_tp, K // block_size)
-        gate_rows, up_rows = _gated_row_slices(activation, I_tp)
+        gate_rows, up_rows = _gated_row_slices(activation, I_tp, w13_layout=w13_layout)
         up_dequant = _apply_block_scales(
             _dequant_fp4(w1_fp4_eid[up_rows], I_tp, K, fp4_lut),
             w13_sf[up_rows],
@@ -454,6 +455,7 @@ def trace_moe_reference_nvfp4_route(
     swiglu_alpha: float | None = None,
     swiglu_beta: float | None = None,
     quant_scale_math: str = "direct_division",
+    w13_layout: str | None = None,
 ) -> MoERouteTrace:
     activation, swiglu_limit, swiglu_alpha, swiglu_beta = (
         _normalize_reference_swiglu_params(
@@ -510,6 +512,7 @@ def trace_moe_reference_nvfp4_route(
         swiglu_alpha=swiglu_alpha,
         swiglu_beta=swiglu_beta,
         quant_scale_math=quant_scale_math,
+        w13_layout=w13_layout,
     )
 
 
@@ -937,11 +940,13 @@ def moe_reference_nvfp4(
     swiglu_alpha: float | None = None,
     swiglu_beta: float | None = None,
     quant_scale_math: str = "direct_division",
+    w13_layout: str | None = None,
 ) -> torch.Tensor:
     """Evaluate the routed NVFP4 reference on the GPU.
 
     ``quant_scale_math`` selects the floating-point evaluation order used by
-    activation quantization.  The dynamic kernel uses direct division while
+    activation quantization. ``w13_layout`` declares FC1 gate/up ordering;
+    omission retains the activation-specific layout. The dynamic kernel uses direct division while
     the micro kernel computes a reciprocal once and multiplies each value;
     callers comparing against micro must request ``"reciprocal_multiply"``.
     """
@@ -983,6 +988,7 @@ def moe_reference_nvfp4(
                 swiglu_alpha=swiglu_alpha,
                 swiglu_beta=swiglu_beta,
                 quant_scale_math=quant_scale_math,
+                w13_layout=w13_layout,
             )
             assert trace.expert_idx == eid
             output[t] += trace.routed_out_accum

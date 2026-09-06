@@ -49,6 +49,7 @@ def generate_profile_artifact(
     checkpoints = CheckpointStore(context.work_dir / "checkpoints")
     components: list[Mapping[str, object]] = []
     component_evidence: dict[str, object] = {}
+    api_evidence: dict[str, object] = {}
     for generator, estimate in zip(generators, estimates, strict=True):
         progress.start_component(estimate)
         result = generator.generate(
@@ -56,7 +57,11 @@ def generate_profile_artifact(
             progress=progress,
             checkpoints=checkpoints,
         )
-        if result.completed_work_units != estimate.work_units:
+        if result.completion_reason == "budget_exhausted":
+            raise ValueError(f"generator {generator.component_id!r} exhausted its budget without qualification")
+        if result.completed_work_units > estimate.work_units or (
+            result.completion_reason == "exhaustive" and result.completed_work_units != estimate.work_units
+        ):
             raise ValueError(
                 f"generator {generator.component_id!r} completed "
                 f"{result.completed_work_units} work units, expected "
@@ -93,8 +98,25 @@ def generate_profile_artifact(
                 f"generator {generator.component_id!r} reported precomputed "
                 "results; generated profiles require real GPU measurements"
             )
-        components.append(component)
+        kind = getattr(generator, "artifact_kind", "runtime_profile")
+        if kind == "runtime_profile":
+            components.append(component)
+        elif kind == "qualification":
+            api_evidence[generator.component_id] = {
+                "query_schema_version": generator.query_schema_version,
+                "config_schema_version": generator.config_schema_version,
+                **result.evidence,
+            }
+            progress.finish_component(generator.component_id)
+            continue
+        else:
+            raise ValueError(f"unknown generator artifact kind {kind!r}")
         component_evidence[generator.component_id] = result.evidence
+        if result.qualification is not None:
+            component_evidence[generator.component_id] = {
+                **result.evidence, "qualification": result.qualification,
+                "completion_reason": result.completion_reason,
+            }
         progress.finish_component(generator.component_id)
 
     identity = context.device
@@ -121,7 +143,9 @@ def generate_profile_artifact(
         "evidence": {
             "device_ordinal": context.device_ordinal,
             "settings": context.settings.to_dict(),
+            "generation": context.checkpoint_metadata(),
             "components": component_evidence,
+            "api_qualifications": api_evidence,
         },
     }
 
@@ -208,6 +232,10 @@ def merge_profile_artifacts(
         raise TypeError("artifact component evidence must be an object")
     evidence.update(update_evidence)
     evidence["components"] = {**base_components, **update_components}
+    evidence["api_qualifications"] = {
+        **base.get("evidence", {}).get("api_qualifications", {}),
+        **update_evidence.get("api_qualifications", {}),
+    }
     return {
         "schema_version": int(update.get("schema_version", 1)),
         "profile": merged_profile,

@@ -2625,6 +2625,9 @@ def compile(
     **kwargs: Any,
 ) -> Any:
     import cutlass.cute as cute
+    from .runtime_control import report_compilation_request
+
+    report_compilation_request(func, compile_spec)
 
     global _DISK_CACHE_HITS
     global _COMPILE_MISSES

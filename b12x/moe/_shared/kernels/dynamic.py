@@ -1119,6 +1119,26 @@ class MoEDynamicKernelBackend:
     def _get_layoutSFB_TV(self, tiled_mma):
         return self._dense_cls._get_layoutSFB_TV(self, tiled_mma)
 
+    @cute.jit
+    def _copy_fc1_sfb(self, source, destination, thr_mma, tidx, k_block):
+        layout = self._thrfrg_SFB(source.layout, thr_mma)
+        tensor = cute.make_tensor(source.iterator, layout)
+        thread = thr_mma.thr_layout_vmnk.get_flat_coord(tidx)
+        partition = tensor[(thread[0], (thread[2], thread[3])), (None, None)]
+        partition = cute.group_modes(cute.flatten(partition), 0, 2)
+        partition = cute.group_modes(partition, 1, 3)
+        partition = cute.make_tensor(
+            partition.iterator,
+            cute.make_layout(
+                (partition.shape[0], *partition.shape[1]),
+                stride=(partition.stride[0], *partition.stride[1]),
+            ),
+        )
+        cute.autovec_copy(
+            cute.filter_zeros(partition[None, None, k_block]),
+            cute.filter_zeros(destination[None, None, k_block]),
+        )
+
     def _setup_attributes(self):
         import cutlass.utils.blackwell_helpers as sm120_utils
 
@@ -1172,9 +1192,9 @@ class MoEDynamicKernelBackend:
             # Swapped FC1: intermediate (self._fc1_int_tile wide) rides the MMA
             # M-role, tokens the N-role -- so a sub-64 int tile is legal and the
             # gate-half weight SF rides the sub-128 M-atom slice (dense.py
-            # pattern). Same atom_shape -> identical warp count, so the CTA
-            # thread/barrier structure is unchanged. FC2 keeps self.tiled_mma
-            # (normal orientation over the 128-wide K contraction).
+            # pattern). Distribute the same MMA warps over the swapped tile;
+            # each M warp requires sixteen intermediate rows. FC2 keeps its
+            # normal orientation over the 128-wide K contraction.
             #
             # The token N-role must be a multiple of the fixed sm120 N
             # permutation atom (8,2,2)=32; a smaller tile (tile_shape_mnk[0] is
@@ -1188,6 +1208,8 @@ class MoEDynamicKernelBackend:
                 self._fc1_tok_tile,
                 self.tile_shape_mnk[2],
             )
+            fc1_m_warps = min(self.atom_shape[0], self._fc1_int_tile // 16)
+            self.fc1_atom_shape = (fc1_m_warps, self.num_mma_warps // fc1_m_warps, 1)
             fc1_perm = sm120_utils.get_permutation_mnk(
                 self.fc1_tile_shape_mnk,
                 self.sf_vec_size,
@@ -1195,14 +1217,14 @@ class MoEDynamicKernelBackend:
             )
             self.fc1_tiled_mma = cute.make_tiled_mma(
                 mma_op,
-                atom_layout,
+                cute.make_layout(self.fc1_atom_shape),
                 permutation_mnk=fc1_perm,
             )
             self.fc1_num_m_tiles = self.fc1_tile_shape_mnk[0] // (
-                16 * self.atom_shape[0]
+                16 * self.fc1_atom_shape[0]
             )
             self.fc1_num_n_tiles = self.fc1_tile_shape_mnk[1] // (
-                8 * self.atom_shape[1]
+                8 * self.fc1_atom_shape[1]
             )
 
         sfa_smem = sm120_make_smem_layout_sfa(
@@ -4454,6 +4476,15 @@ class MoEDynamicKernelBackend:
                 thr_mma_fc1,
                 tidx,
             )
+            if cutlass.const_expr(self.fc1_atom_shape[1] > 2):
+                # Four N warps group N/K modes; expose them for MMA indexing.
+                tCrSFB_sw = cute.make_tensor(
+                    tCrSFB_sw.iterator,
+                    cute.make_layout(
+                        (tCrSFB_sw.shape[0], *tCrSFB_sw.shape[1]),
+                        stride=(tCrSFB_sw.stride[0], *tCrSFB_sw.stride[1]),
+                    ),
+                )
             # swapped acc: [int-32 M-role, token N-role]
             tCgC_sw = thr_mma_fc1.partition_C(
                 cute.make_identity_tensor(
@@ -4499,7 +4530,10 @@ class MoEDynamicKernelBackend:
             crA_sw = thr_ld_A_sw.retile(tCrA_sw)
             crB_sw = thr_ld_B_sw.retile(tCrB_sw)
             crSFA_sw = thr_ld_SFA_sw.retile(tCrSFA_sw)
-            crSFB_sw = thr_ld_SFB_sw.retile(tCrSFB_sw)
+            if cutlass.const_expr(self.fc1_atom_shape[1] > 2):
+                crSFB_sw = tCrSFB_sw
+            else:
+                crSFB_sw = thr_ld_SFB_sw.retile(tCrSFB_sw)
 
         # ===================================================================
         # Per-warp setup for the consumer steady state
@@ -4975,9 +5009,10 @@ class MoEDynamicKernelBackend:
                             sSFA_fc1, _tok_nslice, (_tok_tile_idx, 0, None)
                         )
                         _csB = thr_ld_B_sw.partition_S(sA_part_sw_t)
-                        _fz_csSFB = cute.filter_zeros(
-                            thr_ld_SFB_sw.partition_S(sSFA_fc1_t)
-                        )
+                        if cutlass.const_expr(self.fc1_atom_shape[1] <= 2):
+                            _fz_csSFB = cute.filter_zeros(
+                                thr_ld_SFB_sw.partition_S(sSFA_fc1_t)
+                            )
 
                         cons_state.reset_count()
                         for _kt in range(fc1_k_tile_cnt):
@@ -4990,11 +5025,17 @@ class MoEDynamicKernelBackend:
                                     _csB[None, None, _kb, _i],
                                     crB_sw[None, None, _kb],
                                 )
-                                cute.copy(
-                                    smem_copy_SFB_sw,
-                                    _fz_csSFB[None, None, _kb, _i],
-                                    fz_crSFB_sw[None, None, _kb],
-                                )
+                                if cutlass.const_expr(self.fc1_atom_shape[1] > 2):
+                                    self._copy_fc1_sfb(
+                                        sSFA_fc1_t[None, None, _i],
+                                        tCrSFB_sw, thr_mma_fc1, tidx, _kb,
+                                    )
+                                else:
+                                    cute.copy(
+                                        smem_copy_SFB_sw,
+                                        _fz_csSFB[None, None, _kb, _i],
+                                        fz_crSFB_sw[None, None, _kb],
+                                    )
                                 for _s in cutlass.range_constexpr(n_sub):
                                     # gate sub _s = atom-lo (sB/sSFB) at within-atom
                                     # sub gate_lo_sub+_s while that stays < n_sub,
@@ -5063,11 +5104,17 @@ class MoEDynamicKernelBackend:
                                     _csB[None, None, _kb, _i],
                                     crB_sw[None, None, _kb],
                                 )
-                                cute.copy(
-                                    smem_copy_SFB_sw,
-                                    _fz_csSFB[None, None, _kb, _i],
-                                    fz_crSFB_sw[None, None, _kb],
-                                )
+                                if cutlass.const_expr(self.fc1_atom_shape[1] > 2):
+                                    self._copy_fc1_sfb(
+                                        sSFA_fc1_t[None, None, _i],
+                                        tCrSFB_sw, thr_mma_fc1, tidx, _kb,
+                                    )
+                                else:
+                                    cute.copy(
+                                        smem_copy_SFB_sw,
+                                        _fz_csSFB[None, None, _kb, _i],
+                                        fz_crSFB_sw[None, None, _kb],
+                                    )
                                 for _s in cutlass.range_constexpr(n_sub):
                                     _csA_s = thr_ld_A_sw.partition_S(
                                         cute.local_tile(

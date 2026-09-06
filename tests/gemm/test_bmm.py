@@ -132,7 +132,8 @@ def test_public_contract_is_generic() -> None:
         "is_bmm_supported",
     }
     assert callable(gemm.mm)
-    assert gemm.mm is gemm.blockscaled.mm
+    from b12x._lib.dense_gemm import dense_gemm
+    assert gemm.mm is dense_gemm
     assert callable(gemm.bmm)
     assert not hasattr(gemm.bmm, "mm")
     assert not hasattr(gemm, "Weight")
@@ -278,9 +279,11 @@ def test_cuda_graph_replays_fresh_input_into_stable_output(
 
 
 @pytest.mark.parametrize("b_major", ["n", "k"])
-def test_capture_compile_miss_raises(packed_rhs, b_major: str) -> None:
+def test_capture_compile_miss_raises(packed_rhs, b_major: str, monkeypatch) -> None:
+    from b12x.gemm._shared import mxfp8_bmm
+    monkeypatch.setattr(mxfp8_bmm, "_LAUNCH_CACHE", {})
     rhs = packed_rhs[b_major]
-    m = 13  # deliberately absent from WARM_M_VALUES
+    m = 13
     k = K_N_MAJOR if b_major == "n" else K_K_MAJOR
     n = N_N_MAJOR if b_major == "n" else N_K_MAJOR_OUT
     lhs = torch.zeros(BATCH, m, k, device="cuda", dtype=torch.bfloat16)
@@ -452,3 +455,35 @@ def test_torch_compile_preserves_out_mutation_for_fresh_buffers(
         returned = compiled(lhs, out)
         assert returned is out
         assert torch.equal(out, expected)
+
+
+@pytest.mark.parametrize("b_major", ["n", "k"])
+def test_live_rows_reuse_one_callable_under_frozen_resolution(packed_rhs, b_major):
+    from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
+    from b12x.gemm._shared import mxfp8_bmm
+
+    rhs = packed_rhs[b_major]
+    decoded = _logical_b(rhs, b_major)
+    k, n = decoded.shape[1:]
+    source = torch.randn(BATCH, 32, k, device="cuda", dtype=torch.bfloat16)
+    backing = torch.empty(BATCH, 32, n, device="cuda", dtype=torch.bfloat16)
+    gemm.bmm(source, rhs, backing, **_spec(b_major))
+    callables = {key: id(value.compiled) for key, value in mxfp8_bmm._LAUNCH_CACHE.items()}
+    freeze_kernel_resolution("all live row counts must reuse the warmed BMM capacity")
+    try:
+        for m in (1, 3, 13, 17, 31, 32):
+            lhs, out = source[:, :m], backing[:, :m]
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                gemm.bmm(lhs, rhs, out, **_spec(b_major))
+            backing.fill_(torch.nan)
+            allocated = torch.cuda.memory_allocated()
+            graph.replay()
+            torch.cuda.synchronize()
+            assert torch.cuda.memory_allocated() == allocated
+            assert torch.isnan(backing[:, m:]).all()
+            expected = torch.bmm(lhs.float(), decoded.float()).to(out.dtype)
+            torch.testing.assert_close(out, expected, rtol=2e-2, atol=2e-2)
+    finally:
+        unfreeze_kernel_resolution()
+    assert {key: id(value.compiled) for key, value in mxfp8_bmm._LAUNCH_CACHE.items()} == callables

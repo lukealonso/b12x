@@ -703,26 +703,7 @@ def plan(caps: Caps, *, policy: PolicyContext | None = None) -> Plan:
     policy.require_device(caps.device)
     resolution = policy.resolve(
         QSA_POLICY,
-        QsaQuery(
-            q_dtype=str(caps.dtype).removeprefix("torch."),
-            kv_dtype=str(caps.kv_dtype).removeprefix("torch."),
-            q_heads=caps.q_heads,
-            kv_heads=caps.kv_heads,
-            head_dim=caps.head_dim,
-            index_heads=caps.index_heads,
-            index_kv_heads=caps.index_kv_heads,
-            index_head_dim=caps.index_head_dim,
-            index_rotary_dim=caps.index_rotary_dim,
-            main_page_size=caps.main_page_size,
-            max_batch=caps.max_batch,
-            max_q_rows=caps.max_q_rows,
-            max_seq_len=caps.max_seq_len,
-            max_speculative_tokens=caps.max_speculative_tokens,
-            compress_ratio=caps.compress_ratio,
-            budget=caps.budget,
-            position_axes=caps.position_axes,
-            mrope_interleaved=caps.mrope_interleaved,
-        ),
+        QsaQuery.from_caps(caps),
     )
     (
         layout,

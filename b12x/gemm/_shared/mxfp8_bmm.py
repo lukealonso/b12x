@@ -84,9 +84,9 @@ _STAGES = 3
 _CTA_THREADS = 128  # 4 warps; each warp owns a 32-wide N slice of the tile.
 _MAX_M = 32
 _KERNEL_ID = "gemm.bmm.mxfp8"
-_KERNEL_VERSION = 1
+_KERNEL_VERSION = 3
 _MLA_QUERY_KERNEL_ID = "gemm.mla_query_projection.mxfp8"
-_MLA_QUERY_KERNEL_VERSION = 1
+_MLA_QUERY_KERNEL_VERSION = 3
 _MLA_QUERY_ROPE_DIM = 64
 
 
@@ -444,7 +444,7 @@ def round_f32x2_to_bf16_then_scale_e4m3x2(
 
 
 class _Mxfp8Kernel:
-    """One CTA per (batch item, n-tile); 128 threads; cp.async pipeline.
+    """One CTA per (batch item, row tile, n-tile); 128-thread cp.async pipeline.
 
     Shared memory per stage (16B-aligned regions, no dynamic smem):
       [B tile: 8 KiB fp8 bytes] [A tile: tile_m*128 B bf16] [scales: 256 B]
@@ -458,7 +458,7 @@ class _Mxfp8Kernel:
         *,
         b_major: _BMajor | int,
         groups: int,
-        m: int,
+        max_rows: int,
         n: int,
         k: int,
         tile_n: int = _TILE_N,
@@ -471,8 +471,8 @@ class _Mxfp8Kernel:
             raise ValueError(f"unsupported MXFP8 B-major axis {b_major!r}") from exc
         if int(groups) < 1:
             raise ValueError(f"BMM batch count must be positive, got {groups}")
-        if not (1 <= int(m) <= _MAX_M):
-            raise ValueError(f"MXFP8 BMM supports 1 <= M <= {_MAX_M}, got {m}")
+        if not (1 <= int(max_rows) <= _MAX_M):
+            raise ValueError(f"MXFP8 BMM supports 1 <= M <= {_MAX_M}, got {max_rows}")
         if tile_n != 128 or tile_k != 64:
             raise ValueError("MXFP8 BMM tile config requires tile_n=128, tile_k=64")
         if stages not in (2, 3):
@@ -481,7 +481,7 @@ class _Mxfp8Kernel:
         self.b_major = b_major
         self.b_major_n = b_major is _BMajor.N
         self.groups = int(groups)
-        self.m = int(m)
+        self.max_rows = int(max_rows)
         self.gemm_n = int(n)
         self.gemm_k = int(k)
         self.tile_n = int(tile_n)
@@ -501,7 +501,7 @@ class _Mxfp8Kernel:
             raise ValueError("stages-1 must not exceed k_tiles")
         self.grid_x = self.groups * self.n_tiles
 
-        self.tile_m = 16 if self.m <= 16 else 32
+        self.tile_m = 16
         self.m_blocks = self.tile_m // 16
         self.n_warps = self.cta_threads // 32  # 4: each owns 32 N columns
         if self.n_warps * 32 != self.tile_n:
@@ -551,7 +551,7 @@ class _Mxfp8Kernel:
         return (
             int(self.b_major),
             self.groups,
-            self.m,
+            self.max_rows,
             self.gemm_n,
             self.gemm_k,
             self.tile_m,
@@ -566,6 +566,7 @@ class _Mxfp8Kernel:
     @cute.jit
     def __call__(
         self,
+        m: Int32,
         a_ptr: cute.Pointer,  # bf16 A [G, M, K]
         b_ptr: cute.Pointer,  # u8 values [G,K,N] or [G,N,K]
         s_ptr: cute.Pointer,  # u8 scales, physical inner axis / 32
@@ -582,7 +583,7 @@ class _Mxfp8Kernel:
     ):
         a_span = (
             Int64(self.groups - 1) * a_stride_g
-            + Int64(self.m - 1) * a_stride_m
+            + Int64(m - 1) * a_stride_m
             + Int64(self.gemm_k)
         )
         b_span = (
@@ -597,7 +598,7 @@ class _Mxfp8Kernel:
         )
         c_span = (
             Int64(self.groups - 1) * c_stride_g
-            + Int64(self.m - 1) * c_stride_m
+            + Int64(m - 1) * c_stride_m
             + Int64(self.gemm_n)
         )
         a_flat = cute.make_tensor(
@@ -613,6 +614,7 @@ class _Mxfp8Kernel:
             s_ptr, layout=cute.make_layout((s_span,), stride=(1,))
         )
         self.kernel(
+            m,
             a_flat,
             b_flat,
             s_flat,
@@ -626,7 +628,7 @@ class _Mxfp8Kernel:
             c_stride_g,
             c_stride_m,
         ).launch(
-            grid=(self.grid_x, 1, 1),
+            grid=(self.grid_x, (m + self.tile_m - 1) // self.tile_m, 1),
             block=[self.cta_threads, 1, 1],
             stream=stream,
         )
@@ -636,6 +638,7 @@ class _Mxfp8Kernel:
     @cute.kernel
     def kernel(
         self,
+        m: Int32,
         a_flat: cute.Tensor,
         b_flat: cute.Tensor,
         s_flat: cute.Tensor,
@@ -676,6 +679,7 @@ class _Mxfp8Kernel:
         # Pipeline prologue: fill stages-1 buffers (one commit per stage).
         for s in cutlass.range_constexpr(self.stages - 1):
             self._stage_tile(
+                m,
                 a_flat,
                 b_flat,
                 s_flat,
@@ -706,6 +710,7 @@ class _Mxfp8Kernel:
             nkt = kt + Int32(self.stages - 1)
             if nkt < Int32(self.k_tiles):
                 self._stage_tile(
+                    m,
                     a_flat,
                     b_flat,
                     s_flat,
@@ -726,11 +731,12 @@ class _Mxfp8Kernel:
                 cute.arch.cp_async_commit_group()
             kt += Int32(1)
 
-        self._store_output(c_flat, tid, group, jt, acc, c_stride_g, c_stride_m)
+        self._store_output(m, c_flat, tid, group, jt, acc, c_stride_g, c_stride_m)
 
     @cute.jit
     def _stage_tile(
         self,
+        m: Int32,
         a_flat: cute.Tensor,
         b_flat: cute.Tensor,
         s_flat: cute.Tensor,
@@ -791,6 +797,8 @@ class _Mxfp8Kernel:
             cp_async4_shared_global(dst, get_ptr_as_int64(b_flat, src))
 
         # ---- A tile: tile_m rows x tile_k bf16 = a_units int4 units. ----
+        _, row_tile, _ = cute.arch.block_idx()
+        row_base = Int32(row_tile) * Int32(self.tile_m)
         for i in cutlass.range_constexpr(self.a_units // self.cta_threads):
             u = Int32(i * self.cta_threads) + tid
             row = u // Int32(self.a_units_per_row)
@@ -801,25 +809,16 @@ class _Mxfp8Kernel:
                 + Int32(self.a_off)
                 + (row * Int32(self.a_units_per_row) + col_sw) * Int32(16)
             )
-            if cutlass.const_expr(self.m < self.tile_m):
-                if row < Int32(self.m):
-                    src = (
-                        group64 * a_stride_g
-                        + Int64(row) * a_stride_m
-                        + kt64 * Int64(self.tile_k)
-                        + Int64(col) * Int64(8)
-                    )
-                    cp_async4_shared_global(dst, get_ptr_as_int64(a_flat, src))
-                else:
-                    st_shared_v4_u32(dst, Uint32(0), Uint32(0), Uint32(0), Uint32(0))
-            else:
+            if row_base + row < m:
                 src = (
                     group64 * a_stride_g
-                    + Int64(row) * a_stride_m
+                    + Int64(row_base + row) * a_stride_m
                     + kt64 * Int64(self.tile_k)
                     + Int64(col) * Int64(8)
                 )
                 cp_async4_shared_global(dst, get_ptr_as_int64(a_flat, src))
+            else:
+                st_shared_v4_u32(dst, Uint32(0), Uint32(0), Uint32(0), Uint32(0))
 
         # ---- Scales. ----
         if cutlass.const_expr(not self.b_major_n):
@@ -999,6 +998,7 @@ class _Mxfp8Kernel:
     @cute.jit
     def _store_output(
         self,
+        m: Int32,
         c_flat: cute.Tensor,
         tid: Int32,
         group: Int32,
@@ -1009,8 +1009,7 @@ class _Mxfp8Kernel:
     ):
         """f32 acc -> bf16 pairs -> u32 stores into the strided C view.
 
-        C rows beyond M are never written; with compile-time M the
-        predicates fold away for full tiles.  Column pairs are contiguous (C
+        C rows beyond the runtime M are never written. Column pairs are contiguous (C
         inner dim contiguous by contract) so every store is one aligned u32.
         """
         lane = tid & Int32(31)
@@ -1019,19 +1018,21 @@ class _Mxfp8Kernel:
         t = lane - g * Int32(4)
         col0 = jt * Int32(self.tile_n) + warp * Int32(32) + t * Int32(2)
         c_group = Int64(group) * c_stride_g
+        _, row_tile, _ = cute.arch.block_idx()
+        row_base = Int32(row_tile) * Int32(self.tile_m)
 
         for mb in cutlass.range_constexpr(self.m_blocks):
-            row0 = Int32(16 * mb) + g
+            row0 = row_base + Int32(16 * mb) + g
             row1 = row0 + Int32(8)
             for jj in cutlass.range_constexpr(4):
                 col = col0 + Int32(8 * jj)
-                if row0 < Int32(self.m):
+                if row0 < m:
                     off = c_group + Int64(row0) * c_stride_m + Int64(col)
                     st_global_u32(
                         get_ptr_as_int64(c_flat, off),
                         pack_f32x2_to_bfloat2_rn(acc[mb, jj, 0], acc[mb, jj, 1]),
                     )
-                if row1 < Int32(self.m):
+                if row1 < m:
                     off = c_group + Int64(row1) * c_stride_m + Int64(col)
                     st_global_u32(
                         get_ptr_as_int64(c_flat, off),
@@ -1059,6 +1060,7 @@ class _Mxfp8MlaQueryKernel(_Mxfp8Kernel):
     @cute.jit
     def __call__(
         self,
+        m: Int32,
         a_ptr: cute.Pointer,  # bf16 A [H, M, K]
         b_ptr: cute.Pointer,  # u8 values [H,K,N]
         s_ptr: cute.Pointer,  # u8 scales [H,K,N/32]
@@ -1079,7 +1081,7 @@ class _Mxfp8MlaQueryKernel(_Mxfp8Kernel):
     ):
         a_span = (
             Int64(self.groups - 1) * a_stride_g
-            + Int64(self.m - 1) * a_stride_m
+            + Int64(m - 1) * a_stride_m
             + Int64(self.gemm_k)
         )
         b_span = (
@@ -1093,12 +1095,12 @@ class _Mxfp8MlaQueryKernel(_Mxfp8Kernel):
             + Int64(self.scale_cols)
         )
         q_pe_span = (
-            Int64(self.m - 1) * q_pe_stride_m
+            Int64(m - 1) * q_pe_stride_m
             + Int64(self.groups - 1) * q_pe_stride_g
             + Int64(_MLA_QUERY_ROPE_DIM)
         )
         out_span = (
-            Int64(self.m - 1) * out_stride_m
+            Int64(m - 1) * out_stride_m
             + Int64(self.groups - 1) * out_stride_g
             + Int64(self.gemm_n + _MLA_QUERY_ROPE_DIM)
         )
@@ -1121,6 +1123,7 @@ class _Mxfp8MlaQueryKernel(_Mxfp8Kernel):
             out_ptr, layout=cute.make_layout((out_span,), stride=(1,))
         )
         self.kernel_mla_query(
+            m,
             a_flat,
             b_flat,
             s_flat,
@@ -1138,7 +1141,7 @@ class _Mxfp8MlaQueryKernel(_Mxfp8Kernel):
             out_stride_m,
             out_stride_g,
         ).launch(
-            grid=(self.grid_x, 1, 1),
+            grid=(self.grid_x, (m + self.tile_m - 1) // self.tile_m, 1),
             block=[self.cta_threads, 1, 1],
             stream=stream,
         )
@@ -1146,6 +1149,7 @@ class _Mxfp8MlaQueryKernel(_Mxfp8Kernel):
     @cute.kernel
     def kernel_mla_query(
         self,
+        m: Int32,
         a_flat: cute.Tensor,
         b_flat: cute.Tensor,
         s_flat: cute.Tensor,
@@ -1188,6 +1192,7 @@ class _Mxfp8MlaQueryKernel(_Mxfp8Kernel):
 
         for stage in cutlass.range_constexpr(self.stages - 1):
             self._stage_tile(
+                m,
                 a_flat,
                 b_flat,
                 s_flat,
@@ -1214,6 +1219,7 @@ class _Mxfp8MlaQueryKernel(_Mxfp8Kernel):
             next_kt = kt + Int32(self.stages - 1)
             if next_kt < Int32(self.k_tiles):
                 self._stage_tile(
+                    m,
                     a_flat,
                     b_flat,
                     s_flat,
@@ -1235,6 +1241,7 @@ class _Mxfp8MlaQueryKernel(_Mxfp8Kernel):
             kt += Int32(1)
 
         self._store_mla_query_output(
+            m,
             q_pe_flat,
             q_scale,
             out_flat,
@@ -1251,6 +1258,7 @@ class _Mxfp8MlaQueryKernel(_Mxfp8Kernel):
     @cute.jit
     def _store_mla_query_output(
         self,
+        m: Int32,
         q_pe_flat: cute.Tensor,
         q_scale: cute.Tensor,
         out_flat: cute.Tensor,
@@ -1269,6 +1277,8 @@ class _Mxfp8MlaQueryKernel(_Mxfp8Kernel):
         lane_in_group = lane - lane_group * Int32(4)
         col0 = jt * Int32(self.tile_n) + warp * Int32(32) + lane_in_group * Int32(2)
         out_group = Int64(group) * out_stride_g
+        _, row_tile, _ = cute.arch.block_idx()
+        row_base = Int32(row_tile) * Int32(self.tile_m)
 
         inv_scale = Float32(1.0)
         if cutlass.const_expr(self.output_fp8):
@@ -1277,11 +1287,11 @@ class _Mxfp8MlaQueryKernel(_Mxfp8Kernel):
             )
 
         for mb in cutlass.range_constexpr(self.m_blocks):
-            row0 = Int32(16 * mb) + lane_group
+            row0 = row_base + Int32(16 * mb) + lane_group
             row1 = row0 + Int32(8)
             for jj in cutlass.range_constexpr(4):
                 col = col0 + Int32(8 * jj)
-                if row0 < Int32(self.m):
+                if row0 < m:
                     off = Int64(row0) * out_stride_m + out_group + Int64(col)
                     if cutlass.const_expr(self.output_fp8):
                         st_global_u16(
@@ -1295,7 +1305,7 @@ class _Mxfp8MlaQueryKernel(_Mxfp8Kernel):
                             get_ptr_as_int64(out_flat, off),
                             pack_f32x2_to_bfloat2_rn(acc[mb, jj, 0], acc[mb, jj, 1]),
                         )
-                if row1 < Int32(self.m):
+                if row1 < m:
                     off = Int64(row1) * out_stride_m + out_group + Int64(col)
                     if cutlass.const_expr(self.output_fp8):
                         st_global_u16(
@@ -1312,11 +1322,12 @@ class _Mxfp8MlaQueryKernel(_Mxfp8Kernel):
 
         # Exactly one N tile copies the 64-d RoPE suffix for this head.
         if jt == Int32(0):
-            pair_count = self.m * (_MLA_QUERY_ROPE_DIM // 2)
+            pair_count = m * Int32(_MLA_QUERY_ROPE_DIM // 2)
+            pair_capacity = self.tile_m * (_MLA_QUERY_ROPE_DIM // 2)
             for iteration in cutlass.range_constexpr(
-                (pair_count + self.cta_threads - 1) // self.cta_threads
+                (pair_capacity + self.cta_threads - 1) // self.cta_threads
             ):
-                pair_idx = Int32(iteration * self.cta_threads) + tid
+                pair_idx = row_base * Int32(_MLA_QUERY_ROPE_DIM // 2) + Int32(iteration * self.cta_threads) + tid
                 if pair_idx < Int32(pair_count):
                     row = pair_idx // Int32(_MLA_QUERY_ROPE_DIM // 2)
                     pair = pair_idx - row * Int32(_MLA_QUERY_ROPE_DIM // 2)
@@ -1361,26 +1372,21 @@ _QUALIFIED_GEOMETRIES = {
 }
 
 
-def _tile_m_for_m(m: int) -> int:
-    return 16 if int(m) <= 16 else 32
-
-
 def _compile(
     *,
     b_major: _BMajor,
     groups: int,
-    m: int,
     n: int,
     k: int,
     device: torch.device,
 ) -> _Mxfp8Launch:
     device_index = int(device.index if device.index is not None else 0)
-    tile_m = _tile_m_for_m(m)
+    tile_m = 16
     cache_key = (
         _KERNEL_ID,
         int(b_major),
         int(groups),
-        int(m),
+        _MAX_M,
         int(n),
         int(k),
         device_index,
@@ -1393,15 +1399,15 @@ def _compile(
     if torch.cuda.is_current_stream_capturing():
         raise RuntimeError(
             "BMM MXFP8 compile miss during CUDA-graph capture for "
-            f"b_major={b_major.name.lower()}, B={groups}, M={m}, N={n}, K={k}. "
-            "Precompile every graph-visible M with prewarm(..., m_values=...) "
+            f"b_major={b_major.name.lower()}, B={groups}, capacity={_MAX_M}, N={n}, K={k}. "
+            "Prewarm the model geometry with prewarm(..., m_values=...) "
             "before capture."
         )
 
     kernel = _Mxfp8Kernel(
         b_major=b_major,
         groups=groups,
-        m=m,
+        max_rows=_MAX_M,
         n=n,
         k=k,
         tile_n=_TILE_N,
@@ -1419,6 +1425,7 @@ def _compile(
     # and C needs 4-byte alignment for paired BF16 stores.
     compiled = b12x_compile(
         kernel,
+        Int32(_MAX_M),
         dummy(cutlass.BFloat16),
         dummy(cutlass.Uint8),
         dummy(cutlass.Uint8, align=4),
@@ -1444,7 +1451,7 @@ def _compile(
             ("b_major", b_major.name.lower()),
             ("sf_axis", b_major.name.lower()),
             ("groups", int(groups)),
-            ("m", int(m)),
+            ("max_rows", _MAX_M),
             ("n", int(n)),
             ("k", int(k)),
             ("tile_m", int(tile_m)),
@@ -1464,19 +1471,18 @@ def _compile_mla_query_projection(
     *,
     b_major: _BMajor,
     groups: int,
-    m: int,
     n: int,
     k: int,
     output_fp8: bool,
     device: torch.device,
 ) -> _Mxfp8Launch:
     device_index = int(device.index if device.index is not None else 0)
-    tile_m = _tile_m_for_m(m)
+    tile_m = 16
     cache_key = (
         _MLA_QUERY_KERNEL_ID,
         int(b_major),
         int(groups),
-        int(m),
+        _MAX_M,
         int(n),
         int(k),
         bool(output_fp8),
@@ -1490,8 +1496,8 @@ def _compile_mla_query_projection(
     if torch.cuda.is_current_stream_capturing():
         raise RuntimeError(
             "MLA query compile miss during CUDA-graph capture for "
-            f"B={groups}, M={m}, N={n}, K={k}, output_fp8={output_fp8}. "
-            "Precompile every graph-visible M with "
+            f"B={groups}, capacity={_MAX_M}, N={n}, K={k}, output_fp8={output_fp8}. "
+            "Precompile the model geometry with "
             "prewarm_mla_query_projection(...)."
         )
 
@@ -1499,7 +1505,7 @@ def _compile_mla_query_projection(
         output_fp8=output_fp8,
         b_major=b_major,
         groups=groups,
-        m=m,
+        max_rows=_MAX_M,
         n=n,
         k=k,
         tile_n=_TILE_N,
@@ -1514,6 +1520,7 @@ def _compile_mla_query_projection(
     output_align = 2 if output_fp8 else 4
     compiled = b12x_compile(
         kernel,
+        Int32(_MAX_M),
         dummy(cutlass.BFloat16),
         dummy(cutlass.Uint8),
         dummy(cutlass.Uint8, align=4),
@@ -1541,7 +1548,7 @@ def _compile_mla_query_projection(
             ("output_dtype", "float8_e4m3fn" if output_fp8 else "bfloat16"),
             ("b_major", b_major.name.lower()),
             ("groups", int(groups)),
-            ("m", int(m)),
+            ("max_rows", _MAX_M),
             ("n", int(n)),
             ("k", int(k)),
             ("rope_dim", int(_MLA_QUERY_ROPE_DIM)),
@@ -1787,7 +1794,7 @@ def _run(
         b_major=b_major,
         sf_axis=sf_axis,
     )
-    launch = _compile(b_major=major, groups=groups, m=m, n=n, k=k, device=a.device)
+    launch = _compile(b_major=major, groups=groups, n=n, k=k, device=a.device)
 
     if stream is not None:
         launch_stream = (
@@ -1803,6 +1810,7 @@ def _run(
         else torch.cuda.current_stream(a.device).cuda_stream
     )
     launch.compiled(
+        Int32(m),
         make_ptr(
             cutlass.BFloat16, a.data_ptr(), cute.AddressSpace.gmem, assumed_align=16
         ),
@@ -1984,7 +1992,6 @@ def _run_mla_query_projection(
     launch = _compile_mla_query_projection(
         b_major=major,
         groups=groups,
-        m=m,
         n=n,
         k=k,
         output_fp8=output_fp8,
@@ -2009,6 +2016,7 @@ def _run_mla_query_projection(
     )
     output_dtype = cutlass.Float8E4M3FN if output_fp8 else cutlass.BFloat16
     launch.compiled(
+        Int32(m),
         make_ptr(
             cutlass.BFloat16, a.data_ptr(), cute.AddressSpace.gmem, assumed_align=16
         ),

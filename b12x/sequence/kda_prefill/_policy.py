@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from b12x.policy import ComponentPolicy
 from b12x.policy.components import KDA_PREFILL
@@ -40,6 +40,20 @@ class WorkspaceRecord:
 WORKSPACE_RECORD_BYTES = WorkspaceRecord.BYTES
 # Prepared-tile bytes one window may occupy; two windows stay L2 resident.
 WINDOW_BYTES_BUDGET = 36 << 20
+RECURRENCE_SHARED_LIMIT = 99 * 1024
+
+
+def recurrence_shared_bytes(config: "KdaPrefillConfig") -> int:
+    """Size of the recurrence kernel's aligned SmemAllocator allocations."""
+    def align(value: int, boundary: int) -> int:
+        return -(-value // boundary) * boundary
+
+    size = align(4 * (config.window_tiles + 1), 128)
+    size += config.stages * (WorkspaceRecord.V + config.v_split * 32)
+    size = align(size, 128) + CHUNK_TOKENS * config.v_split * 2
+    warps = (config.v_split // 16) * config.k_split
+    size = align(size, 128) + (2 * warps * 256 if config.k_split > 1 else 4) * 4
+    return align(size, 8) + 2 * config.stages * 8
 
 
 def tiles_capacity(max_tokens: int, max_seqs: int) -> int:
@@ -147,6 +161,9 @@ def _validate(query: KdaPrefillQuery, config: KdaPrefillConfig, device) -> None:
     del device
     if config.backend != BACKEND:
         raise ValueError(f"unsupported {KDA_PREFILL} backend {config.backend!r}")
+    for name in ("v_split", "k_split", "stages", "window_tiles"):
+        if type(getattr(config, name)) is not int:
+            raise TypeError(f"{KDA_PREFILL} {name} must be an integer")
     if config.v_split not in V_SPLIT_CHOICES:
         raise ValueError(
             f"unsupported {KDA_PREFILL} v_split {config.v_split!r}; expected one "
@@ -166,6 +183,12 @@ def _validate(query: KdaPrefillQuery, config: KdaPrefillConfig, device) -> None:
         raise ValueError(f"{KDA_PREFILL} v_split x k_split exceeds the thread limit")
     if isinstance(config.window_tiles, bool) or int(config.window_tiles) < 1:
         raise ValueError(f"{KDA_PREFILL} window_tiles must be a positive integer")
+    shared_bytes = recurrence_shared_bytes(replace(
+        config, window_tiles=min(config.window_tiles, tiles_capacity(query.max_tokens, query.max_seqs)),
+    ))
+    if shared_bytes > RECURRENCE_SHARED_LIMIT:
+        raise ValueError(f"{KDA_PREFILL} requires {shared_bytes} shared-memory bytes, "
+                         f"exceeding the SM12x limit {RECURRENCE_SHARED_LIMIT}")
     if query.head_dim != 128:
         raise ValueError(f"{KDA_PREFILL} requires head_dim 128, got {query.head_dim}")
     if query.model_dtype != "bfloat16" or query.state_dtype != "float32":
@@ -193,7 +216,7 @@ KDA_PREFILL_POLICY = ComponentPolicy(
     ),
     config_fields=frozenset({"backend", "v_split", "k_split", "stages", "window_tiles"}),
     encode_query=KdaPrefillQuery.profile_fields,
-    decode_profile=KdaPrefillConfig.from_profile,
+    decode_profile=lambda query, device, payload: KdaPrefillConfig.from_profile(payload),
     heuristic=_heuristic,
     validate_config=_validate,
 )
@@ -213,3 +236,20 @@ __all__ = [
     "default_window_tiles",
     "tiles_capacity",
 ]
+
+
+from b12x.policy.problem import define_problem
+
+TUNING_PROBLEM = define_problem(
+    policy=KDA_PREFILL_POLICY, query_type=KdaPrefillQuery, config_type=KdaPrefillConfig,
+    axes=('heads', 'head_dim', 'max_tokens', 'max_seqs'),
+    family=('model_dtype', 'state_dtype', 'qk_l2norm', 'checkpoint_export'),
+    constraints=(),
+    environment=(),
+    model_fields=('heads', 'head_dim'),
+    decisions={'backend': (BACKEND,), 'v_split': V_SPLIT_CHOICES, 'k_split': K_SPLIT_CHOICES,
+               'stages': STAGE_CHOICES, 'window_tiles': None},
+    ordered=('v_split', 'k_split', 'stages', 'window_tiles'),
+    axis_domains={name: (1, 1) for name in ('heads', 'head_dim', 'max_tokens', 'max_seqs')},
+    derived_config_fields=(),
+)

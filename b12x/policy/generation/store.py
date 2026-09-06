@@ -23,8 +23,10 @@ def _safe_part(value: str) -> str:
 class CheckpointStore:
     """Namespaced JSON checkpoints with atomic replacement."""
 
-    def __init__(self, root: Path) -> None:
+    def __init__(self, root: Path, *, observations_path: Path | None = None) -> None:
         self.root = Path(root)
+        self.observations_path = (self.root.parent / "observations.sqlite3"
+                                  if observations_path is None else Path(observations_path))
 
     def _path(self, component_id: str, key: str) -> Path:
         component = _safe_part(component_id)

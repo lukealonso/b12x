@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from b12x.policy import (
     GQA_ATTENTION,
@@ -10,6 +10,10 @@ from b12x.policy import (
     DeviceIdentity,
     FrozenMapping,
 )
+
+
+WORKSPACE_LIMITS = (("requested_max_work_items", "max_work_items"),
+                    ("requested_max_partial_rows", "max_partial_rows"))
 
 
 def _compress_lut(values: tuple[int, ...]) -> tuple[tuple[int, int], ...]:
@@ -93,8 +97,13 @@ class GqaQuery:
             "cache_tokens": self.cache_tokens,
             "window_left": self.window_left,
             "requested_graph_ctas_per_sm": self.requested_graph_ctas_per_sm,
+            "requested_max_work_items": self.requested_max_work_items,
+            "requested_max_partial_rows": self.requested_max_partial_rows,
             "force_split_kv": self.force_split_kv,
         }
+
+    def cache_fields(self) -> dict[str, object]:
+        return self.profile_fields()
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -209,16 +218,62 @@ class GqaConfig:
         )
 
 
+@dataclass(frozen=True, kw_only=True)
+class GqaDecision:
+    """Independent inputs to deterministic decode schedule construction."""
+
+    graph_ctas_per_sm: int | None
+    force_split_kv: bool | None
+
+    @classmethod
+    def from_profile(cls, payload: FrozenMapping) -> "GqaDecision":
+        if set(payload) != {"graph_ctas_per_sm", "force_split_kv"}:
+            raise ValueError("GQA decisions require graph_ctas_per_sm and force_split_kv")
+        ctas, split = payload["graph_ctas_per_sm"], payload["force_split_kv"]
+        if ctas is not None and (type(ctas) is not int or ctas <= 0):
+            raise ValueError("GQA decision CTA residency must be a positive integer or null")
+        if split is not None and type(split) is not bool:
+            raise TypeError("GQA decision split choice must be a boolean or null")
+        return cls(graph_ctas_per_sm=ctas, force_split_kv=split)
+
+    def to_dict(self) -> dict[str, object]:
+        return {"graph_ctas_per_sm": self.graph_ctas_per_sm,
+                "force_split_kv": self.force_split_kv}
+
+    def materialize(self, query: GqaQuery, device: DeviceIdentity | None) -> GqaConfig:
+        if query.mode != "decode" or query.query_len != 1:
+            raise ValueError("GQA decode decisions require mode=decode and query_len=1")
+        selected = replace(
+            query,
+            requested_graph_ctas_per_sm=(query.requested_graph_ctas_per_sm
+                                        if query.requested_graph_ctas_per_sm is not None
+                                        else self.graph_ctas_per_sm),
+            force_split_kv=(query.force_split_kv if query.force_split_kv is not None
+                            else self.force_split_kv),
+        )
+        bounded = any(getattr(query, field) is not None for field, _ in WORKSPACE_LIMITS)
+        if bounded:
+            unrestricted = replace(selected, **{field: None for field, _ in WORKSPACE_LIMITS})
+            config = _heuristic(unrestricted, device)
+            if any(getattr(query, field) is not None and getattr(query, field) < getattr(config, requirement)
+                   for field, requirement in WORKSPACE_LIMITS):
+                config = _heuristic(selected, device)
+        else:
+            config = _heuristic(selected, device)
+        _validate(query, config, device)
+        return config
+
+
 def _heuristic(
     query: GqaQuery,
-    _device: DeviceIdentity | None,
+    device: DeviceIdentity | None,
 ) -> GqaConfig:
     import torch
 
-    from .planner import _plan_decode_graph_capacity_heuristic
+    from .planner import _plan_decode_graph_config_heuristic
 
-    capacity = _plan_decode_graph_capacity_heuristic(
-        device=query.device,
+    return _plan_decode_graph_config_heuristic(
+        device=device if device is not None else query.device,
         q_dtype=getattr(torch, query.q_dtype),
         kv_dtype=getattr(torch, query.kv_dtype),
         num_q_heads=query.q_heads,
@@ -235,7 +290,6 @@ def _heuristic(
         max_partial_rows=query.requested_max_partial_rows,
         force_split_kv=query.force_split_kv,
     )
-    return GqaConfig.from_capacity(capacity)
 
 
 def _validate(
@@ -304,13 +358,16 @@ def _validate(
         raise ValueError("paged GQA profile exceeds requested partial-row capacity")
     if query.force_split_kv is False and config.max_chunks_per_request != 1:
         raise ValueError("paged GQA direct-only query selected a split profile")
-    lut = config.chunk_pages_lut()
-    maximum_chunks = max(
-        (page_count + chunk_pages - 1) // chunk_pages
-        for page_count, chunk_pages in enumerate(lut, start=1)
-    )
-    if maximum_chunks > config.max_chunks_per_request:
-        raise ValueError("paged GQA LUT exceeds max_chunks_per_request")
+    previous_end = 0
+    for end, chunk_pages in config.base_chunk_pages_runs:
+        if (type(end) is not int or type(chunk_pages) is not int
+                or end <= previous_end or end > config.max_effective_kv_pages or chunk_pages <= 0):
+            raise ValueError("invalid paged GQA chunk-pages run table")
+        previous_end = end
+    if previous_end != config.max_effective_kv_pages:
+        raise ValueError("paged GQA chunk-pages runs do not cover the capacity")
+    # Reconstruction takes max(base, ceil(pages / max_chunks)), which bounds
+    # ceil(pages / chunk_pages) by max_chunks for every page without expansion.
     direct_work = query.batch_size * config.query_tiles_per_request
     if config.max_work_items < direct_work:
         raise ValueError("paged GQA profile cannot hold the direct schedule")
@@ -318,8 +375,8 @@ def _validate(
 
 GQA_POLICY = ComponentPolicy(
     component_id=GQA_ATTENTION,
-    query_schema_version=2,
-    config_schema_version=2,
+    query_schema_version=3,
+    config_schema_version=3,
     query_fields=frozenset(
         {
             "mode",
@@ -336,28 +393,34 @@ GQA_POLICY = ComponentPolicy(
             "cache_tokens",
             "window_left",
             "requested_graph_ctas_per_sm",
+            "requested_max_work_items",
+            "requested_max_partial_rows",
             "force_split_kv",
         }
     ),
-    config_fields=frozenset(
-        {
-            "graph_ctas_per_sm",
-            "cta_tile_q",
-            "query_tiles_per_request",
-            "architecture_max_chunks_per_request",
-            "max_chunks_per_request",
-            "max_work_items",
-            "max_partial_rows",
-            "max_effective_kv_pages",
-            "worst_page_count",
-            "base_chunk_pages_runs",
-        }
-    ),
+    config_fields=frozenset({"graph_ctas_per_sm", "force_split_kv"}),
     encode_query=GqaQuery.profile_fields,
-    decode_profile=GqaConfig.from_profile,
+    decode_profile=lambda query, device, payload: GqaDecision.from_profile(payload).materialize(query, device),
     heuristic=_heuristic,
     validate_config=_validate,
+    encode_cache_query=GqaQuery.cache_fields,
 )
 
 
-__all__ = ["GQA_POLICY", "GqaConfig", "GqaQuery"]
+__all__ = ["GQA_POLICY", "GqaConfig", "GqaDecision", "GqaQuery"]
+
+
+from b12x.policy.problem import define_problem
+
+TUNING_PROBLEM = define_problem(
+    policy=GQA_POLICY, query_type=GqaQuery, config_type=GqaConfig,
+    axes=('q_heads', 'kv_heads', 'head_dim_qk', 'head_dim_vo', 'batch_size', 'query_len', 'cache_tokens'),
+    family=('mode', 'q_dtype', 'kv_dtype', 'page_size', 'kv_cache_layout', 'window_left'),
+    constraints=('requested_graph_ctas_per_sm', 'requested_max_work_items', 'requested_max_partial_rows', 'force_split_kv'),
+    environment=('device',),
+    model_fields=('q_heads', 'kv_heads', 'head_dim_qk', 'head_dim_vo', 'page_size', 'kv_cache_layout', 'window_left'),
+    decisions={'graph_ctas_per_sm': None, 'force_split_kv': (None, False, True)},
+    ordered=('graph_ctas_per_sm',),
+    materialize_decision=lambda query, device, payload: GqaDecision.from_profile(payload).materialize(query, device),
+    derived_config_fields=('cta_tile_q', 'query_tiles_per_request', 'architecture_max_chunks_per_request', 'max_chunks_per_request', 'max_work_items', 'max_partial_rows', 'max_effective_kv_pages', 'worst_page_count', 'base_chunk_pages_runs'),
+)

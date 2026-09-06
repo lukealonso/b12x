@@ -29,3 +29,17 @@ PleConfig = BackendConfig
 
 
 __all__ = ["PLE_POLICY", "PleConfig", "PleQuery"]
+
+
+from b12x.policy.problem import define_problem
+
+TUNING_PROBLEM = define_problem(
+    policy=PLE_POLICY, query_type=PleQuery, config_type=PleConfig,
+    axes=('max_tokens', 'max_seqs', 'max_speculative_tokens', 'streams', 'hidden_size', 'kernel_size', 'dilation'),
+    family=('mode', 'dtype'),
+    constraints=(),
+    environment=(),
+    model_fields=('streams', 'hidden_size', 'kernel_size', 'dilation'),
+    decisions={'backend': ('triton',)},
+    derived_config_fields=(),
+)

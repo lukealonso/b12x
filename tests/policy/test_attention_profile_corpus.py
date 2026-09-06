@@ -9,9 +9,9 @@ from benchmarks.benchmark_qsa import PROFILES as QSA_PROFILES
 from b12x.policy import (
     EMBEDDED_REGISTRY,
     DeviceIdentity,
-    list_profiled_components,
     profile_from_dict,
 )
+from b12x.policy.catalog import list_generation_components
 from b12x.policy.generation import (
     CheckpointStore,
     GenerationContext,
@@ -118,7 +118,7 @@ def test_builtin_registry_covers_every_top_level_component() -> None:
     register_builtin_generators(registry)
 
     assert registry.component_ids() == tuple(
-        str(item.component_id) for item in list_profiled_components()
+        str(item.component_id) for item in list_generation_components()
     )
 
 

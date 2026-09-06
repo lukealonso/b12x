@@ -59,7 +59,11 @@ def _build_node(
     range_fields: frozenset[str],
     nearest_range_bounds: Mapping[str, MatchRange],
     evidence: str | None,
+    terminal_fields: frozenset[str],
+    terminal_factory: Callable[[Sequence[DecisionRecord]], DecisionNode] | None,
 ) -> DecisionNode:
+    if terminal_factory is not None and frozenset(fields) <= terminal_fields:
+        return terminal_factory(records)
     if not fields:
         configs = {record.config for record in records}
         if len(configs) != 1:
@@ -79,6 +83,8 @@ def _build_node(
             range_fields=range_fields,
             nearest_range_bounds=nearest_range_bounds,
             evidence=evidence,
+            terminal_fields=terminal_fields,
+            terminal_factory=terminal_factory,
         )
         for value, group in grouped.items()
     }
@@ -150,6 +156,8 @@ def build_axis_tree(
     range_fields: frozenset[str] = frozenset(),
     nearest_range_bounds: Mapping[str, tuple[int, int] | MatchRange] | None = None,
     evidence: str | None = None,
+    terminal_fields: frozenset[str] = frozenset(),
+    terminal_factory: Callable[[Sequence[DecisionRecord]], DecisionNode] | None = None,
 ) -> DecisionNode:
     """Build a deterministic tree without extrapolating across unswept gaps."""
 
@@ -160,6 +168,9 @@ def build_axis_tree(
         raise ValueError("field_order must be non-empty and unique")
     if not range_fields <= frozenset(field_order):
         raise ValueError("range_fields must be present in field_order")
+    if terminal_fields:
+        if terminal_factory is None or set(field_order[-len(terminal_fields):]) != terminal_fields:
+            raise ValueError("terminal fields require a factory and must end the field order")
     normalized_nearest_bounds = {
         field: bounds if isinstance(bounds, MatchRange) else MatchRange(*bounds)
         for field, bounds in (nearest_range_bounds or {}).items()
@@ -185,6 +196,8 @@ def build_axis_tree(
         range_fields=range_fields,
         nearest_range_bounds=normalized_nearest_bounds,
         evidence=evidence,
+        terminal_fields=terminal_fields,
+        terminal_factory=terminal_factory,
     )
 
 

@@ -31,6 +31,7 @@ from .contracts import (
     WorkEstimate,
 )
 from .registry import ComponentGeneratorRegistry
+from .provenance import capture_measurement_provenance
 from .sharding import measurement_partitions, select_measurement_partitions
 from .store import CheckpointStore
 
@@ -56,6 +57,8 @@ class _MeasurementTask:
     work_dir: Path
     source_revision: str
     settings: GenerationSettings
+    accepted_physical_devices: tuple[str, ...] = ()
+    measurement_cohort: str = "initial"
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -170,6 +173,9 @@ def _run_task(task: _MeasurementTask) -> _MeasurementResult:
         work_dir=task.work_dir,
         source_revision=task.source_revision,
         settings=task.settings,
+        provenance=capture_measurement_provenance(detected.ordinal),
+        accepted_physical_devices=task.accepted_physical_devices,
+        measurement_cohort=task.measurement_cohort,
     )
     estimate = generator.estimate(context)
     if (
@@ -246,6 +252,8 @@ def run_parallel_measurements(
                     work_dir=context.work_dir,
                     source_revision=context.source_revision,
                     settings=context.settings,
+                    accepted_physical_devices=context.accepted_physical_devices,
+                    measurement_cohort=context.measurement_cohort,
                 ),
             )
             futures[future] = partition

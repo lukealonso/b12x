@@ -99,3 +99,30 @@ def test_diagram_rejects_excessive_depth():
         node = ExactDecisionNode(f"axis{index}", ((0, node),))
     with pytest.raises(ValueError, match="maximum decision-tree depth"):
         _planner_node(encode_planner_dag(node), name="planner")
+
+
+def test_indexed_exact_nodes_preserve_scalar_types_and_default_misses():
+    from b12x.policy.types import ExactDecisionNode, ProfileLeaf
+    leaves = tuple(ProfileLeaf.create(name=str(i), config={'backend': str(i)}) for i in range(5))
+    node = ExactDecisionNode(field='x', branches=tuple(zip((1, True, '1', None), leaves[:4], strict=True)), default=leaves[4])
+    for value, expected in node.branches:
+        assert node.lookup({'x': value}) is expected
+    for query in ({}, {'x': []}, {'x': {}}, {'x': 1.0}, {'x': float('nan')}):
+        assert node.lookup(query) is leaves[4]
+
+
+def test_indexed_ranges_preserve_unsorted_intervals_gaps_and_inclusive_bounds():
+    import pytest
+    from b12x.policy.types import MatchRange, ProfileLeaf, RangeDecisionNode
+    leaf = ProfileLeaf.create(name='hit', config={'backend': 'hit'})
+    default = ProfileLeaf.create(name='default', config={'backend': 'default'})
+    intervals = ((100, 102), (-10, -5), (10, 15), (20, 20))
+    node = RangeDecisionNode(field='x', branches=tuple((MatchRange(*pair), leaf) for pair in intervals), default=default)
+    for value in range(-15, 108):
+        expected = leaf if any(low <= value <= high for low, high in intervals) else default
+        assert node.lookup({'x': value}) is expected
+    for value in (True, False, 10., [], '10', None):
+        assert node.lookup({'x': value}) is default
+    assert node.lookup({}) is default
+    with pytest.raises(ValueError, match='overlap'):
+        RangeDecisionNode(field='x', branches=node.branches + ((MatchRange(15, 18), leaf),))

@@ -93,7 +93,7 @@ VARLEN_ATTENTION_POLICY = ComponentPolicy(
     query_fields=frozenset(VarlenAttentionQuery.__dataclass_fields__),
     config_fields=frozenset(VarlenAttentionConfig.__dataclass_fields__),
     encode_query=_encode,
-    decode_profile=VarlenAttentionConfig.from_profile,
+    decode_profile=lambda query, device, payload: VarlenAttentionConfig.from_profile(payload),
     heuristic=_heuristic,
     validate_config=_validate,
 )
@@ -104,3 +104,20 @@ __all__ = [
     "VarlenAttentionConfig",
     "VarlenAttentionQuery",
 ]
+
+
+from b12x.policy.problem import define_problem
+
+TUNING_PROBLEM = define_problem(
+    policy=VARLEN_ATTENTION_POLICY, query_type=VarlenAttentionQuery, config_type=VarlenAttentionConfig,
+    axes=('batch_size', 'q_heads', 'kv_heads', 'q_head_dim', 'v_head_dim', 'query_rows', 'kv_rows', 'max_seqlen_q', 'max_seqlen_k'),
+    family=('variant', 'dtype', 'causal'),
+    constraints=(),
+    environment=(),
+    model_fields=('q_heads', 'kv_heads', 'q_head_dim', 'v_head_dim'),
+    decisions={'tile_m': (32, 64, 128), 'tile_n': (32, 48, 64, 128)},
+    ordered=('tile_m', 'tile_n'),
+    axis_domains={name: (1, 1) for name in ('batch_size', 'q_heads', 'kv_heads', 'q_head_dim', 'v_head_dim',
+                                          'query_rows', 'kv_rows', 'max_seqlen_q', 'max_seqlen_k')},
+    derived_config_fields=(),
+)

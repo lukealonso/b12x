@@ -80,7 +80,7 @@ def _heuristic(
 
 
 def _validate(
-    _query: DsaIndexerQuery,
+    query: DsaIndexerQuery,
     config: DsaIndexerConfig,
     _device: DeviceIdentity | None,
 ) -> None:
@@ -93,16 +93,20 @@ def _validate(
             f"unsupported {DSA_INDEXER} fused_merge {config.fused_merge!r}; "
             f"expected one of {FUSED_MERGE_CHOICES}"
         )
+    if query.max_k_rows <= 0 or query.page_size <= 0:
+        raise ValueError("DSA policy requires positive planned K capacity for both paged and contiguous layouts")
+    if query.source_layout == "paged" and query.max_k_rows % query.page_size:
+        raise ValueError("paged DSA policy K capacity must contain complete planned pages")
 
 
 DSA_INDEXER_POLICY = ComponentPolicy(
     component_id=DSA_INDEXER,
-    query_schema_version=1,
+    query_schema_version=2,
     config_schema_version=1,
     query_fields=frozenset(DsaIndexerQuery.__dataclass_fields__),
     config_fields=frozenset(DsaIndexerConfig.__dataclass_fields__),
     encode_query=_encode,
-    decode_profile=DsaIndexerConfig.from_profile,
+    decode_profile=lambda query, device, payload: DsaIndexerConfig.from_profile(payload),
     heuristic=_heuristic,
     validate_config=_validate,
 )
@@ -117,3 +121,18 @@ __all__ = [
     "FUSED_MERGE_COOPERATIVE",
     "FUSED_MERGE_SERIAL",
 ]
+
+
+from b12x.policy.problem import define_problem
+
+TUNING_PROBLEM = define_problem(
+    policy=DSA_INDEXER_POLICY, query_type=DsaIndexerQuery, config_type=DsaIndexerConfig,
+    axes=('num_q_heads', 'num_idx_heads', 'max_q_rows', 'max_k_rows', 'top_k'),
+    family=('source_layout', 'mode', 'dtype', 'kv_dtype', 'page_size', 'score_mode', 'shared_page_table'),
+    constraints=(),
+    environment=(),
+    model_fields=('num_q_heads', 'num_idx_heads', 'page_size'),
+    decisions={'backend': (_BACKEND,), 'fused_merge': FUSED_MERGE_CHOICES},
+    derived_config_fields=(),
+    axis_domains={name: (1, 1) for name in ('num_q_heads', 'num_idx_heads', 'max_q_rows', 'max_k_rows', 'top_k')},
+)

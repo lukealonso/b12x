@@ -49,6 +49,13 @@ runtime-policy and generator registrations. Package loading rejects an embedded
 profile that omits a registered component. The component schema is validated
 before a matching config is returned; invalid matching data fails closed.
 
+The embedded assets have two logical IDs: `nvidia.gb10.48sm` and
+`nvidia.rtx.pro.6000.blackwell`. The RTX asset owns exact normalized Workstation,
+Server, and Max-Q product aliases with matching capability and SM count.
+Qualification metadata names Max-Q as the measured representative; accepting
+an alias does not imply that SKU was measured. Unknown identities use the
+component heuristic in AUTO mode.
+
 One-shot `gemm.blockscaled` participates through the separate catalog inventory
 `ONESHOT_COMPONENTS`. Its `gemm.blockscaled_precision` policy resolves static
 weight geometry during prewarm; live M selects a precision route from
@@ -92,6 +99,14 @@ preplanned = PolicyContext.for_device(
 `B12X_POLICY_MODE=auto|heuristic-only|preplanned-only` selects the default
 context used when an integration omits an explicit policy. Explicit contexts and
 component config overrides still take precedence.
+
+For paged decode graphs, pass the same KV layout to `decode_graph_capacity`
+and `paged.Caps(kv_cache_layout=...)`. The default is `separate`; views into an
+interleaved K/V pool use `combined`. Feed the selected work-item and partial-row
+capacities into the scratch caps before graph preparation. Nonbinding limits
+reuse the profile's identical schedule, and the prepared scratch plan retains
+`policy_resolution`. Limits that exclude that schedule require a separately
+covered query or the AUTO heuristic. Graph binding and replay perform no lookup.
 
 ## Inspecting model selections
 
@@ -207,14 +222,19 @@ write competing profile files.
 Every selected GPU must report the same product name, compute capability, and SM
 count. Completed cases use the same shared checkpoint directory as a single-GPU
 run. After an interruption, rerun the command with the same `--work-dir`; the
-number or ordinals of identical GPUs may change without invalidating completed
-measurements.
+CUDA ordinals may change; physical GPU UUIDs remain part of measurement
+identity. Parallel reduction accepts records only from the assigned GPUs.
 
-Checkpoints use one compact JSON file per measurement case, with atomic
-replacement and independent writes from measurement workers. Existing indented
-JSON checkpoints remain readable. Resume does not rewrite compatible records
-solely to change formatting. These files are local working evidence; embedded
-profiles contain the shared decision DAG rather than the measurement corpus.
+Discrete sweeps store paired candidate observations once in
+`observations.sqlite3`, using compressed, content-addressed records and SQLite
+transactions for concurrent GPU workers. Compact JSON case checkpoints retain
+observation references. The observation identity binds source contents,
+toolchain, physical GPU, query and scenario inputs, ordered candidates, timing
+protocol, oracle contract, and measurement cohort. Search stages may reuse an
+identical observation; independent confirmation uses a separate cohort.
+Historical JSON remains readable, but missing or mismatched provenance prevents
+qualification reuse. Embedded profiles contain the decision DAG and selected
+configurations, without the measurement corpus.
 See [representation and generation measurements](gpu-policy-efficiency.md).
 
 No `--components` argument is needed for a full device profile; the default is
@@ -231,25 +251,14 @@ Completed MoE geometries resume entirely from checkpoint metadata. Candidate
 enumeration and eligibility run on the host; a CUDA worker and expert weights
 are created lazily only when a race checkpoint is missing.
 
-Checkpoint compatibility is based on checkpoint schema, device identity,
-measurement case and candidate IDs, and timing settings. `source_revision` is
-provenance rather than a measurement input, so committing an identical source
-tree or extending a corpus does not discard unrelated measurements. A cached
-sampling protocol may satisfy a weaker requested protocol, but not the reverse.
-Precision-selection providers additionally bind measurements to source and
-toolchain fingerprints. Dense GEMM includes that identity in its case IDs; MoE
-stores `precision_source_toolchain_sha256`. The MoE fingerprint includes the
-generation package, so generation-source changes invalidate its automatic
-precision measurements even when the checkpoint encoding remains compatible.
-Discrete sweep checkpoints also carry a component-owned candidate-contract
-version. A fully compatible allocation group skips session setup and candidate
-enumeration even after unrelated source changes or a commit. Providers must
-bump that version when candidate enumeration or eligibility changes; case IDs
-independently invalidate corpus changes. Legacy checkpoints receive one
-candidate-ID comparison before being upgraded to this contract.
-Fixed-backend qualifications similarly persist the ordered probe case IDs and
-the qualified config, so changing either invalidates only that component's
-checkpoint.
+Checkpoint compatibility requires identical source revision, source contents,
+toolchain, device identity, measurement cohort, and timing settings. A source or
+protocol change invalidates qualification reuse. Case IDs independently bind
+the measured corpus, and candidate-contract versions bind enumeration and
+eligibility. A fully compatible allocation group skips session preparation.
+Fixed-backend probes also bind their ordered case IDs and serialized config.
+MoE precision races retain their component-owned paired-sample and independent
+confirmation contracts.
 
 GQA candidate contract 2 races distinct decode schedules and workspace layouts.
 CTA budgets that produce identical tile geometry, chunk-page tables, chunk

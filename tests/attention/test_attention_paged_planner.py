@@ -27,6 +27,20 @@ from b12x.attention.paged._scratch import (
 )
 
 
+def _use_mocked_policy_device(monkeypatch):
+    from b12x.policy import context
+    from b12x.policy.device import DetectedDevice
+    from b12x.policy.types import DeviceIdentity
+
+    def detected(device):
+        return DetectedDevice(ordinal=torch.device(device).index, identity=DeviceIdentity(
+            vendor="nvidia", product_name="Synthetic GPU",
+            compute_capability=torch.cuda.get_device_capability(device),
+            sm_count=torch.cuda.get_device_properties(device).multi_processor_count))
+
+    monkeypatch.setattr(context, "detect_device", detected)
+
+
 def _make_inputs(
     *,
     q_seqlens: list[int],
@@ -692,10 +706,11 @@ def test_extend_graph_capacity_buckets_match_laguna_full_geometry(
     total_q_capacity: int,
     expected_work_items: int,
 ) -> None:
+    _use_mocked_policy_device(monkeypatch)
     monkeypatch.setattr(
         torch.cuda,
         "get_device_properties",
-        lambda _device: SimpleNamespace(multi_processor_count=188),
+        lambda _device: SimpleNamespace(multi_processor_count=188, major=12, minor=0, name="Synthetic GPU"),
     )
     monkeypatch.setattr(
         torch.cuda,
@@ -727,10 +742,11 @@ def test_extend_graph_capacity_buckets_match_laguna_full_geometry(
 def test_extend_graph_capacity_includes_batch_packing_and_window_span(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _use_mocked_policy_device(monkeypatch)
     monkeypatch.setattr(
         torch.cuda,
         "get_device_properties",
-        lambda _device: SimpleNamespace(multi_processor_count=188),
+        lambda _device: SimpleNamespace(multi_processor_count=188, major=12, minor=0, name="Synthetic GPU"),
     )
 
     capacity = plan_extend_graph_capacity(
@@ -779,10 +795,11 @@ def test_verify_graph_capacity_matches_laguna_geometry(
     expected_chunk_pages: int,
     expected_partial_rows: int,
 ) -> None:
+    _use_mocked_policy_device(monkeypatch)
     monkeypatch.setattr(
         torch.cuda,
         "get_device_properties",
-        lambda _device: SimpleNamespace(multi_processor_count=188),
+        lambda _device: SimpleNamespace(multi_processor_count=188, major=12, minor=0, name="Synthetic GPU"),
     )
 
     capacity = plan_verify_graph_capacity(
@@ -837,10 +854,11 @@ def test_verify_graph_capacity_reserves_exact_laguna_split_rectangle(
     expected_chunks_per_request: int,
     expected_partial_rows: int,
 ) -> None:
+    _use_mocked_policy_device(monkeypatch)
     monkeypatch.setattr(
         torch.cuda,
         "get_device_properties",
-        lambda _device: SimpleNamespace(multi_processor_count=188),
+        lambda _device: SimpleNamespace(multi_processor_count=188, major=12, minor=0, name="Synthetic GPU"),
     )
     monkeypatch.setattr(
         torch.cuda,
@@ -874,6 +892,7 @@ def test_decode_graph_scratch_envelope_covers_every_batch_layout(
     # Pin the architecture budget so this regression is deterministic on both
     # DGX Spark and workstation Blackwell.  This Laguna-like geometry has a
     # larger mid-batch split layout than its batch-256 direct layout.
+    _use_mocked_policy_device(monkeypatch)
     monkeypatch.setattr(
         torch.cuda,
         "get_device_properties",
@@ -881,6 +900,7 @@ def test_decode_graph_scratch_envelope_covers_every_batch_layout(
             multi_processor_count=159,
             major=12,
             minor=0,
+            name="Synthetic GPU",
         ),
     )
     geometry = dict(
@@ -936,10 +956,11 @@ def test_decode_graph_scratch_envelope_covers_every_batch_layout(
 def test_decode_graph_scratch_envelope_applies_direct_only_storage_cap(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _use_mocked_policy_device(monkeypatch)
     monkeypatch.setattr(
         torch.cuda,
         "get_device_properties",
-        lambda _device: SimpleNamespace(multi_processor_count=159),
+        lambda _device: SimpleNamespace(multi_processor_count=159, major=12, minor=0, name="Synthetic GPU"),
     )
     monkeypatch.setattr(
         torch.cuda,
@@ -1135,10 +1156,11 @@ def test_decode_graph_chunk_pages_uses_finer_fp8_minimax_bs1_splits() -> None:
 def test_decode_graph_bf16_gqa8_bs1_scales_capacity_budgets_with_sms(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _use_mocked_policy_device(monkeypatch)
     monkeypatch.setattr(
         torch.cuda,
         "get_device_properties",
-        lambda _device: SimpleNamespace(multi_processor_count=48),
+        lambda _device: SimpleNamespace(multi_processor_count=48, major=12, minor=0, name="Synthetic GPU"),
     )
     monkeypatch.setattr(
         torch.cuda,
@@ -1202,7 +1224,7 @@ def test_decode_graph_bf16_gqa8_bs1_scales_capacity_budgets_with_sms(
     monkeypatch.setattr(
         torch.cuda,
         "get_device_properties",
-        lambda _device: SimpleNamespace(multi_processor_count=188),
+        lambda _device: SimpleNamespace(multi_processor_count=188, major=12, minor=0, name="Synthetic GPU"),
     )
     monkeypatch.setattr(
         torch.cuda,
@@ -1234,10 +1256,11 @@ def test_decode_graph_bf16_gqa8_bs1_scales_capacity_budgets_with_sms(
 def test_decode_graph_fp8_gqa8_bs1_scales_capacity_budgets_with_sms(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _use_mocked_policy_device(monkeypatch)
     monkeypatch.setattr(
         torch.cuda,
         "get_device_properties",
-        lambda _device: SimpleNamespace(multi_processor_count=48),
+        lambda _device: SimpleNamespace(multi_processor_count=48, major=12, minor=0, name="Synthetic GPU"),
     )
     monkeypatch.setattr(
         torch.cuda,
@@ -1301,7 +1324,7 @@ def test_decode_graph_fp8_gqa8_bs1_scales_capacity_budgets_with_sms(
     monkeypatch.setattr(
         torch.cuda,
         "get_device_properties",
-        lambda _device: SimpleNamespace(multi_processor_count=188),
+        lambda _device: SimpleNamespace(multi_processor_count=188, major=12, minor=0, name="Synthetic GPU"),
     )
     monkeypatch.setattr(
         torch.cuda,
@@ -1333,6 +1356,7 @@ def test_decode_graph_fp8_gqa8_bs1_scales_capacity_budgets_with_sms(
 def test_decode_graph_page128_laguna_keeps_adaptive_one_wave_grid(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _use_mocked_policy_device(monkeypatch)
     kwargs = dict(
         q_dtype=torch.bfloat16,
         kv_dtype=torch.float8_e4m3fn,
@@ -1357,7 +1381,7 @@ def test_decode_graph_page128_laguna_keeps_adaptive_one_wave_grid(
     monkeypatch.setattr(
         torch.cuda,
         "get_device_properties",
-        lambda _device: SimpleNamespace(multi_processor_count=188),
+        lambda _device: SimpleNamespace(multi_processor_count=188, major=12, minor=0, name="Synthetic GPU"),
     )
     monkeypatch.setattr(
         torch.cuda,
@@ -1406,10 +1430,11 @@ def test_decode_graph_page128_laguna_gqa6_uses_measured_chunk_budget(
     max_request_chunks: int,
     total_work_items: int,
 ) -> None:
+    _use_mocked_policy_device(monkeypatch)
     monkeypatch.setattr(
         torch.cuda,
         "get_device_properties",
-        lambda _device: SimpleNamespace(multi_processor_count=188),
+        lambda _device: SimpleNamespace(multi_processor_count=188, major=12, minor=0, name="Synthetic GPU"),
     )
     monkeypatch.setattr(
         torch.cuda,
@@ -1446,6 +1471,7 @@ def test_decode_graph_page128_laguna_gqa6_preserves_uneven_work_budget(
     max_request_chunks: int,
     total_work_items: int,
 ) -> None:
+    _use_mocked_policy_device(monkeypatch)
     monkeypatch.setattr(
         torch.cuda,
         "get_device_properties",
@@ -1543,6 +1569,7 @@ def test_sm12x_h256_decode_uses_one_wave_only_when_it_fills_most_sms(
     sm_count: int,
     expected_chunks: dict[int, int],
 ) -> None:
+    _use_mocked_policy_device(monkeypatch)
     monkeypatch.setenv("B12X_POLICY_MODE", "heuristic-only")
     monkeypatch.setattr(
         torch.cuda,

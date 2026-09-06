@@ -9,6 +9,7 @@ from pathlib import Path
 import subprocess
 import sys
 import time
+from unittest.mock import patch
 
 import torch
 
@@ -16,6 +17,8 @@ from b12x.policy.device import detect_device
 from b12x.policy.generation.attention_corpus import gqa_cases
 from b12x.policy.generation.contracts import GenerationContext, GenerationSettings
 from b12x.policy.generation.providers import gpu_workers
+from b12x.policy.generation import replay
+from b12x.policy.generation.timing import cuda_event_samples_us
 from benchmarks.benchmark_profile_timing import compare_timing, snapshot
 
 
@@ -55,7 +58,7 @@ def main():
         "cases": [],
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    original = gpu_workers._cuda_event_samples_us
+    original = replay.measure_prepared_candidates
     factory = gpu_workers.GqaBenchmarkFactory()
     for case in cases:
         row = {"case_id": case.case_id, "query": case.query.to_dict(),
@@ -64,23 +67,23 @@ def main():
         args.output.write_text(json.dumps(report, indent=2) + "\n")
         print(json.dumps({"stage": "qualify_and_compare", "case_id": case.case_id}), flush=True)
 
-        def observe(run, *, count, device, flush=None):
-            baseline = original(run, count=count, device=device, flush=flush)
-            row["timing"].append(compare_timing(
-                run, count=count, device=device, flush=flush,
-                rounds=args.rounds, sample=original,
-                include_outer=args.outer_graph,
-            ))
-            return baseline
+        def observe(prepared, *, settings, device, flush=None):
+            prepared = tuple(prepared)
+            for item in prepared:
+                if isinstance(item, replay.PreparedCandidate):
+                    row["timing"].append({"candidate_id": item.candidate.candidate_id, **compare_timing(
+                        item.graph.replay, count=settings.groups * settings.repetitions,
+                        device=device, flush=flush, rounds=args.rounds, sample=cuda_event_samples_us,
+                        include_outer=args.outer_graph)})
+            return original(prepared, settings=settings, device=device, flush=flush)
 
-        gpu_workers._cuda_event_samples_us = observe
         started = time.perf_counter()
-        try:
-            with factory(case.group_id, (case,), context) as session:
-                candidates = session.candidates(case)
-                measurements = session.measure(case, candidates)
-        finally:
-            gpu_workers._cuda_event_samples_us = original
+        with factory(case.group_id, (case,), context) as session, \
+                patch.object(gpu_workers, "measure_prepared_candidates", observe):
+            candidates = session.candidates(case)
+            measurements = session.measure(case, candidates)
+        if len(row["timing"]) != sum(item.correct for item in measurements):
+            raise RuntimeError("GQA prepared-candidate timing coverage is incomplete")
         row["total_seconds"] = time.perf_counter() - started
         row["qualification"] = [item.to_dict() for item in measurements]
         row["after"] = snapshot(args.device)

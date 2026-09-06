@@ -7,12 +7,12 @@ import hashlib
 import math
 import multiprocessing
 import os
-import statistics
 import traceback
 from collections.abc import Callable
 from contextlib import AbstractContextManager, contextmanager, suppress
 from dataclasses import dataclass, replace
 from multiprocessing.connection import Connection
+
 
 from b12x.policy.generation.contracts import GenerationContext
 from b12x.policy.generation.moe_corpus import (
@@ -162,6 +162,12 @@ def _packed_weights(
         dtype=torch.uint8,
         device=device,
     )
+    if geometry.recipe.quant_mode in {"nvfp4", "nvfp4_auto"}:
+        seed = int.from_bytes(hashlib.sha256(repr(geometry.key).encode()).digest()[:8], "little") % (2**63 - 1)
+        generator = torch.Generator(device=device).manual_seed(seed)
+        for weight in (w13, w2):
+            weight.random_(0, 256, generator=generator)
+            weight.bitwise_and_(0x88).bitwise_or_(0x11)
     scale_group = 32 if source_format == "fp4_e8m0_k32" else 16
     if source_format == "fp4_e8m0_k32":
         scale_dtype = getattr(torch, "float8_e8m0fnu", torch.uint8)
@@ -535,49 +541,6 @@ def _is_fatal_accelerator_error(exc: Exception) -> bool:
     return accelerator_error is not None and isinstance(exc, accelerator_error)
 
 
-def _median_of_group_medians(
-    samples: tuple[float, ...],
-    *,
-    groups: int,
-    repetitions: int,
-) -> float:
-    medians = [
-        statistics.median(samples[start : start + repetitions])
-        for start in range(0, groups * repetitions, repetitions)
-    ]
-    return float(statistics.median(medians))
-
-
-def _bounded_repetitions(settings, *, pilot_us: float) -> int:
-    budget_us = float(settings.max_candidate_seconds) * 1_000_000.0
-    budgeted = int(budget_us / (max(float(pilot_us), 1.0) * settings.groups))
-    return max(1, min(settings.repetitions, budgeted))
-
-
-def _cuda_event_samples_us(
-    run,
-    *,
-    count: int,
-    device: object,
-    flush=None,
-) -> tuple[float, ...]:
-    import torch
-
-    starts = tuple(torch.cuda.Event(enable_timing=True) for _ in range(count))
-    ends = tuple(torch.cuda.Event(enable_timing=True) for _ in range(count))
-    for start, end in zip(starts, ends, strict=True):
-        if flush is not None:
-            flush()
-        start.record()
-        run()
-        end.record()
-    torch.cuda.synchronize(device)
-    return tuple(
-        float(start.elapsed_time(end)) * 1_000.0
-        for start, end in zip(starts, ends, strict=True)
-    )
-
-
 def _l2_flush_fn(device: object, *, enabled: bool):
     if not enabled:
         return None
@@ -602,6 +565,7 @@ def _l2_flush_fn(device: object, *, enabled: bool):
 class _CandidateResult:
     measurement: MoeMeasurement
     reference_output: object | None
+    prepared: object | None = None
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -1271,18 +1235,9 @@ class _MoeGeometrySession(AbstractContextManager["_MoeGeometrySession"]):
 
         run()
         torch.cuda.synchronize(self._device)
-        graph = torch.cuda.CUDAGraph()
-        if self._geometry.recipe.quant_mode == "nvfp4_auto":
-            import b12x
-            b12x.freeze_kernel_resolution("MoE precision candidate graph capture")
-            try:
-                with torch.cuda.graph(graph):
-                    run()
-            finally:
-                b12x.unfreeze_kernel_resolution()
-        else:
-            with torch.cuda.graph(graph):
-                run()
+        from b12x.policy.generation.replay import capture_warmed_graph
+
+        graph, _ = capture_warmed_graph(run, device=self._device)
         torch.cuda.synchronize(self._device)
         prepared = _PreparedCandidate(
             run=run,
@@ -1300,7 +1255,7 @@ class _MoeGeometrySession(AbstractContextManager["_MoeGeometrySession"]):
         self._prepared_candidates[candidate.candidate_id] = prepared
         return prepared
 
-    def _measure_candidate(
+    def _qualify_candidate(
         self,
         *,
         case: MoeSweepCase,
@@ -1340,52 +1295,28 @@ class _MoeGeometrySession(AbstractContextManager["_MoeGeometrySession"]):
                     prepared.output,
                     comparison,
                 )
-                start = torch.cuda.Event(enable_timing=True)
-                end = torch.cuda.Event(enable_timing=True)
-                start.record()
-                prepared.graph.replay()
-                end.record()
-                end.synchronize()
-                timed_repetitions = _bounded_repetitions(
-                    settings,
-                    pilot_us=float(start.elapsed_time(end)) * 1_000.0,
-                )
-                allocated_before = torch.cuda.memory_allocated(self._device)
-                samples_us = _cuda_event_samples_us(
-                    prepared.graph.replay,
-                    count=settings.groups * timed_repetitions,
-                    device=self._device,
-                    flush=self._flush,
-                )
-                allocated_after = torch.cuda.memory_allocated(self._device)
                 correct = (
                     finite
+                    and output_nonzero > 0
                     and cosine >= settings.minimum_cosine
                     and graph_cosine >= settings.minimum_cosine
                     and relative_norm_error
                     <= _maximum_relative_norm_error(self._geometry)
-                    and allocated_after <= allocated_before
                 )
                 graph_cosine_metric = (
                     graph_cosine if math.isfinite(graph_cosine) else None
                 )
                 cross_cosine_metric = cosine if math.isfinite(cosine) else None
                 return _CandidateResult(
+                    prepared=prepared,
                     measurement=MoeMeasurement(
                         candidate=candidate,
-                        latency_us=_median_of_group_medians(
-                            tuple(samples_us),
-                            groups=settings.groups,
-                            repetitions=timed_repetitions,
-                        ),
+                        latency_us=None,
                         cosine=(cosine if correct else None),
                         error=(
                             None if correct else "graph replay correctness gate failed"
                         ),
                         metrics={
-                            "allocation_delta_bytes": (
-                                allocated_after - allocated_before
-                            ),
                             "comparison": (
                                 "eager_self"
                                 if reference_output is None
@@ -1500,7 +1431,10 @@ class _MoeGeometrySession(AbstractContextManager["_MoeGeometrySession"]):
         ):
             return None
         from b12x.moe._shared.kernels.reference import moe_reference_nvfp4
+        from b12x.moe.fused_moe import _impl
 
+        normalized_key = (weights.w1_fp4.data_ptr(), weights.w1_blockscale.data_ptr())
+        w13_layout = "w13" if normalized_key in _impl._W13_NORMALIZED_STORAGES else weights.w13_layout
         return moe_reference_nvfp4(
             x,
             weights.w1_fp4,
@@ -1518,6 +1452,7 @@ class _MoeGeometrySession(AbstractContextManager["_MoeGeometrySession"]):
             self._geometry.intermediate_size,
             activation=self._geometry.activation,
             quant_scale_math="reciprocal_multiply",
+            w13_layout=w13_layout,
         )
 
     def measure(
@@ -1527,6 +1462,9 @@ class _MoeGeometrySession(AbstractContextManager["_MoeGeometrySession"]):
         *,
         correctness: bool = False,
     ) -> tuple[MoeMeasurement, ...]:
+        from dataclasses import replace
+        from b12x.policy.generation.replay import PreparedCandidate, measure_prepared_candidates
+
         if self._geometry.recipe.quant_mode == "nvfp4_auto":
             from .moe_precision import measure_precision
             return measure_precision(self, case, candidates)
@@ -1549,8 +1487,9 @@ class _MoeGeometrySession(AbstractContextManager["_MoeGeometrySession"]):
             if reference_output is not None
             else None
         )
+        prepared_race = []
         for candidate in eligible:
-            result = self._measure_candidate(
+            result = self._qualify_candidate(
                 case=case,
                 candidate=candidate,
                 inputs=inputs,
@@ -1558,9 +1497,21 @@ class _MoeGeometrySession(AbstractContextManager["_MoeGeometrySession"]):
                 reference_kind=reference_kind,
             )
             measurements_by_id[candidate.candidate_id] = result.measurement
+            if result.prepared is not None:
+                prepared_race.append(PreparedCandidate(candidate=candidate, graph=result.prepared.graph,
+                    correct=result.measurement.error is None, metrics=dict(result.measurement.metrics),
+                    owners=(result.prepared,), owns_graph=False))
             if reference_output is None and result.reference_output is not None:
                 reference_output = result.reference_output
                 reference_kind = "cross_candidate"
+        timings = measure_prepared_candidates(prepared_race, settings=self._context.settings,
+                                               device=self._device, flush=self._flush)
+        for timed in timings:
+            previous = measurements_by_id[timed.candidate.candidate_id]
+            measurements_by_id[timed.candidate.candidate_id] = replace(previous,
+                latency_us=timed.latency_us, cosine=previous.cosine if timed.correct else None,
+                error=previous.error or (None if timed.correct else "replay allocation qualification failed"),
+                metrics={**timed.metrics, "allocation_delta_bytes": timed.metrics["replay_allocation_bytes"]})
         return tuple(
             measurements_by_id.get(
                 candidate.candidate_id,
@@ -1593,9 +1544,10 @@ def _moe_geometry_worker(
 ) -> None:
     try:
         import torch
+        from b12x.policy.generation.census import collect_compilation_requests
 
         torch.cuda.set_device(context.device_ordinal)
-        with _MoeGeometrySession(geometry, context) as session:
+        with collect_compilation_requests() as compilation_requests, _MoeGeometrySession(geometry, context) as session:
             connection.send(
                 {
                     "ok": True,
@@ -1640,6 +1592,7 @@ def _moe_geometry_worker(
                             "measurements": [
                                 measurement.to_dict() for measurement in measurements
                             ],
+                            "compilation_requests": list(compilation_requests.values()),
                         }
                     )
                 else:
@@ -1857,6 +1810,9 @@ class _MoeProcessSession(AbstractContextManager["_MoeProcessSession"]):
         def parse_measurements(
             response: dict[str, object],
         ) -> tuple[MoeMeasurement, ...]:
+            from b12x.policy.generation.census import merge_compilation_requests
+
+            merge_compilation_requests(response.get("compilation_requests", ()))
             raw_measurements = response.get("measurements")
             if not isinstance(raw_measurements, list):
                 raise TypeError("MoE GPU worker measurement response is invalid")

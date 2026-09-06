@@ -39,7 +39,6 @@ from b12x.attention.qsa.reference import (
 )
 from benchmarks.common import (
     bench_cuda_graph,
-    capture_cuda_graph,
     make_l2_flush_fn,
     nvidia_smi_gpu_mode_snapshot,
     require_sm120,
@@ -1578,31 +1577,20 @@ def _binding_storage_bytes(prepared: PreparedCase) -> int:
     return sum(storages.values())
 
 
-def _run_case(
-    case: BenchmarkCase,
-    *,
-    args: argparse.Namespace,
-    device: torch.device,
-    l2_flush: Callable[[], None] | None,
-    case_index: int,
-    policy: PolicyContext | None = None,
-) -> dict[str, object]:
-    prepared = _prepare_case(
-        case,
-        device=device,
-        seed=args.seed + 1009 * case_index,
-        main_cache_layout=args.main_cache_layout,
-        kv_cache_dtype=args.kv_cache_dtype,
-        policy=policy,
-    )
+def _qualify_prepared_graph(prepared: PreparedCase, *, warmup: int, device: torch.device):
+    """Validate a captured production graph while retaining its storage owner."""
+    from b12x.policy.generation.replay import capture_warmed_graph
+
+    case = prepared.case
     eager_output, correctness, eager_persistent_state = _validate_correctness(prepared)
     eager_selected = prepared.binding.selected_positions[: case.rows].clone()
 
-    graph = capture_cuda_graph(
-        prepared.run,
-        warmup=args.warmup,
-        prepare=prepared.state_restore.restore,
-    )
+    for _ in range(warmup):
+        prepared.state_restore.restore()
+        prepared.run()
+    torch.cuda.synchronize(device)
+    prepared.state_restore.restore()
+    graph, _ = capture_warmed_graph(prepared.run, device=device)
     graph_addresses = {
         "output": prepared.binding.output.data_ptr(),
         "selected_positions": prepared.binding.selected_positions.data_ptr(),
@@ -1656,6 +1644,29 @@ def _run_case(
     correctness["graph_nonzero_elements"] = int(torch.count_nonzero(graph_output))
     if not correctness["graph_finite"] or not correctness["graph_nonzero_elements"]:
         raise BenchmarkFailure(f"{case.name}: invalid CUDA graph output")
+
+    return graph, correctness, graph_addresses, replay_allocation_delta
+
+
+def _run_case(
+    case: BenchmarkCase,
+    *,
+    args: argparse.Namespace,
+    device: torch.device,
+    l2_flush: Callable[[], None] | None,
+    case_index: int,
+    policy: PolicyContext | None = None,
+) -> dict[str, object]:
+    prepared = _prepare_case(
+        case,
+        device=device,
+        seed=args.seed + 1009 * case_index,
+        main_cache_layout=args.main_cache_layout,
+        kv_cache_dtype=args.kv_cache_dtype,
+        policy=policy,
+    )
+    graph, correctness, graph_addresses, replay_allocation_delta = _qualify_prepared_graph(
+        prepared, warmup=args.warmup, device=device)
 
     eager_samples = _time_eager(
         prepared.run,

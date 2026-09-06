@@ -377,7 +377,7 @@ SPARSE_MLA_GEOMETRIES = tuple(
         layout="compressed_dsv4",
         num_q_heads=heads,
         qk_head_dim=512,
-        v_head_dim=448,
+        v_head_dim=512,
         swa_width=128,
         swa_page_size=64,
         indexed_width=indexed_width,
@@ -639,6 +639,8 @@ def gqa_cases() -> tuple[SweepCase, ...]:
                                 "cache_tokens": cache_tokens,
                                 "window_left": -1,
                                 "requested_graph_ctas_per_sm": None,
+                                "requested_max_work_items": None,
+                                "requested_max_partial_rows": None,
                                 "force_split_kv": None,
                                 "kv_cache_layout": layout,
                             }
