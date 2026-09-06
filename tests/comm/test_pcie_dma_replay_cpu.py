@@ -4,7 +4,15 @@ all-gather and the column reduce-scatter of ``pcie_dma.PCIeDmaAllReduce``.
 The emulation (``pcie_dma_emulation.py``) runs the ring's own Python
 schedule per rank over host memory with the device flag protocol and the
 device add arithmetic, so these tests check protocol correctness, replay
-bookkeeping and numerics; multi-stream timing needs the GPU tests.
+bookkeeping and numerics.
+
+Program-order execution reproduces one valid serialization of the
+multi-stream schedule, which is why the values it returns are always the
+intended ones. The orderings the schedule leaves open are checked separately:
+``EmulatedRing(model=True)`` builds the happens-before graph of the streams,
+events and flags and reports every pair of overlapping accesses that the
+schedule does not order (``EmulatedRing.conflicts``). Absolute timing still
+needs the GPU tests.
 """
 
 from __future__ import annotations
@@ -83,6 +91,43 @@ def test_emulated_ring_mirrors_constructor_state() -> None:
     ring = EmulatedRing(WORLD, MAX_BYTES).rings[0]
     missing = sorted(name for name in assigned if not hasattr(ring, name))
     assert not missing, f"emulation lacks constructor attributes: {missing}"
+
+
+def test_schedule_model_reports_only_unordered_overlaps() -> None:
+    """The conflict check fires on two streams writing the same bytes with no
+    edge between them and stays silent once an event orders them."""
+    emu = EmulatedRing(2, 1 << 20, graph_replay=False, model=True)
+    buffer = torch.zeros(64, dtype=torch.uint8)
+    ptr = int(buffer.data_ptr())
+
+    def unordered(ring, rank):
+        if rank:
+            return None
+        side = torch.cuda.Stream(device=ring.device)
+        with torch.cuda.stream(side):
+            ring._kernels.host_write(ptr, 64, "side write")
+        ring._kernels.host_write(ptr, 64, "main write")
+        return None
+
+    emu.run(unordered)
+    assert [conflict.kind for conflict in emu.conflicts] == ["write-after-write"]
+
+    ordered = EmulatedRing(2, 1 << 20, graph_replay=False, model=True)
+
+    def with_event(ring, rank):
+        if rank:
+            return None
+        side = torch.cuda.Stream(device=ring.device)
+        done = torch.cuda.Event()
+        with torch.cuda.stream(side):
+            ring._kernels.host_write(ptr, 64, "side write")
+        done.record(side)
+        torch.cuda.current_stream(ring.device).wait_event(done)
+        ring._kernels.host_write(ptr, 64, "main write")
+        return None
+
+    ordered.run(with_event)
+    assert ordered.conflicts == []
 
 
 def test_flag_slot_ranges_are_disjoint_for_every_world_size() -> None:
@@ -542,6 +587,121 @@ def test_reduce_scatter_rejects_unsupported_inputs() -> None:
         ring.reduce_scatter_columns(good.float())
     with pytest.raises(ValueError, match="column reduce-scatter"):
         ring.reduce_scatter_columns(good, cols=300)
+
+
+# ---------------------------------------------------------------------------
+# Ordering: the accesses the schedule has to keep apart
+# ---------------------------------------------------------------------------
+
+# Enough rows for two pieces per shard at the 400-column consumer width, the
+# piece count the served [4608, 3584] latent partial also selects.
+ORDERING_ROWS = 1328
+# Element count divisible by world * 8, so the all-reduce takes the plain ring
+# path rather than the world-9 wire padding.
+ORDERING_AR_ROWS = 1152
+
+
+def _conflict_report(emu: EmulatedRing) -> str:
+    lines = [str(conflict) for conflict in emu.conflicts[:8]]
+    if len(emu.conflicts) > len(lines):
+        lines.append(f"... {len(emu.conflicts) - len(lines)} more")
+    return f"{len(emu.conflicts)} unordered accesses:\n" + "\n".join(lines)
+
+
+@pytest.mark.parametrize("wire", ["fp32", "bf16"])
+def test_reduce_scatter_schedule_orders_sends_against_the_partial_sums(
+    wire: str,
+) -> None:
+    """The running sums alternate between two buffers, so the payload the copy
+    engine reads for step ``k`` is the buffer the add of step ``k + 1``
+    overwrites. Nothing else in the schedule holds the main stream behind the
+    copy engine - the flag waits bind a rank only to its predecessor's copies
+    and the piece events run main -> copy engine - so the send needs an
+    explicit edge or a rank can transmit a payload it is still overwriting.
+    """
+    inputs = _inputs(ORDERING_ROWS, LATENT, seed=26, dtype=torch.bfloat16)
+    emu = EmulatedRing(WORLD, MAX_BYTES, model=True)
+
+    def three_calls(ring, rank):
+        # Eager, capture + replay, replay: the schedule of the replayed graph
+        # is the one the ring runs while serving.
+        return [
+            ring.reduce_scatter_columns(
+                inputs[rank], wire=wire, cols=LATENT_COLS
+            ).clone()
+            for _ in range(3)
+        ]
+
+    results = emu.run(three_calls)
+    expected = column_reduce_scatter_reference(inputs, WORLD, wire, cols=LATENT_COLS)
+    for rank, calls in enumerate(results):
+        for block in calls:
+            assert torch.equal(block, expected[rank])
+    assert not emu.conflicts, _conflict_report(emu)
+
+
+def test_all_reduce_and_gather_pair_schedules_reuse_nothing_unordered() -> None:
+    """Calibration for the reduce-scatter check: the two collectives that
+    already qualify on nine GPUs reuse their buffers far enough apart that the
+    schedule orders every overlapping pair."""
+    hidden = _inputs(ORDERING_AR_ROWS, HIDDEN, seed=27, dtype=torch.bfloat16)
+    firsts, seconds = _pair_inputs(ORDERING_AR_ROWS, seed=28)
+    emu = EmulatedRing(WORLD, MAX_BYTES, model=True)
+
+    def three_calls(ring, rank):
+        reduced = [ring.all_reduce(hidden[rank]).clone() for _ in range(3)]
+        gathered = [ring.all_gather_pair(firsts[rank], seconds[rank]) for _ in range(3)]
+        return reduced, [(a.clone(), b.clone()) for a, b in gathered]
+
+    results = emu.run(three_calls)
+    expected = ring_all_reduce_reference(hidden, WORLD)
+    for reduced, gathered in results:
+        for out in reduced:
+            assert torch.equal(out, expected)
+        _check_gathered(gathered, firsts, seconds)
+    assert not emu.conflicts, _conflict_report(emu)
+
+
+def test_layer_sequence_schedule_reuses_nothing_unordered() -> None:
+    """The mixed sequence on one channel: the three ops share the scratch
+    areas, the copy and flag streams and the piece events, and each op's
+    closing handshake with its neighbour is what lets the next one reuse the
+    peer scratch."""
+    rows = ORDERING_AR_ROWS
+    hidden = _inputs(rows, HIDDEN, seed=29, dtype=torch.bfloat16)
+    firsts, seconds = _pair_inputs(rows, seed=30)
+    latent = _inputs(rows, LATENT, seed=31, dtype=torch.bfloat16)
+    emu = EmulatedRing(WORLD, MAX_BYTES, model=True)
+    expected_ar = ring_all_reduce_reference(hidden, WORLD)
+    expected_rs = column_reduce_scatter_reference(latent, WORLD, "fp32", cols=LATENT_COLS)
+
+    def layers(ring, rank):
+        out = []
+        for _ in range(3):
+            reduced = ring.all_reduce(hidden[rank], borrow_output=True)
+            gathered = ring.all_gather_pair(firsts[rank], seconds[rank])
+            block = ring.reduce_scatter_columns(
+                latent[rank], wire="fp32", cols=LATENT_COLS
+            )
+            snapshot = reduced.clone()
+            out.append(
+                (
+                    snapshot,
+                    (gathered[0].clone(), gathered[1].clone()),
+                    block.clone(),
+                    ring.all_reduce(hidden[rank]).clone(),
+                )
+            )
+        return out
+
+    results = emu.run(layers)
+    for rank, rounds in enumerate(results):
+        for reduced, gathered, block, second_reduce in rounds:
+            assert torch.equal(reduced, expected_ar)
+            assert torch.equal(second_reduce, expected_ar)
+            assert torch.equal(block, expected_rs[rank])
+            _check_gathered([gathered], firsts, seconds)
+    assert not emu.conflicts, _conflict_report(emu)
 
 
 # ---------------------------------------------------------------------------
