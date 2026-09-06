@@ -226,9 +226,12 @@ def _w4a16_cross_tile_prefetch_enabled() -> bool:
     would otherwise expose in its prologue. The tile sequence, the K order
     and the fold order are unchanged (bit-identical outputs). Participates
     in the kernel cache key.
+
+    Status: research-only, default off. The digests and the timing of the
+    resulting kernel have not been measured on the device.
     """
 
-    return os.environ.get("B12X_W4A16_CROSS_TILE_PREFETCH", "1") == "1"
+    return os.environ.get("B12X_W4A16_CROSS_TILE_PREFETCH", "0") == "1"
 
 
 def _w4a16_token_major_rotation_enabled() -> bool:
@@ -240,9 +243,12 @@ def _w4a16_token_major_rotation_enabled() -> bool:
     ``M * top_k`` and FC1 gathers them through ``route // top_k``. Every
     MMA operand is the value the route-major layout holds for that route
     (bit-identical outputs). Participates in the fused kernel cache key.
+
+    Status: research-only, default off. The digests and the timing of the
+    resulting kernel have not been measured on the device.
     """
 
-    return os.environ.get("B12X_W4A16_TOKEN_MAJOR_ROTATION", "1") == "1"
+    return os.environ.get("B12X_W4A16_TOKEN_MAJOR_ROTATION", "0") == "1"
 
 
 # Shared memory the fused launch appends after a GEMM's own layout: the

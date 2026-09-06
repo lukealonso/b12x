@@ -213,6 +213,39 @@ def test_epilogue_scratch_holds_the_cross_warp_fold(
     assert g.sh_fold_size == _fold_extent_int4(g)
 
 
+def test_switches_default_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Both overlap switches stay off until the device digests are measured."""
+    monkeypatch.delenv("B12X_W4A16_CROSS_TILE_PREFETCH", raising=False)
+    monkeypatch.delenv("B12X_W4A16_TOKEN_MAJOR_ROTATION", raising=False)
+    assert not kernel._w4a16_cross_tile_prefetch_enabled()
+    assert not kernel._w4a16_token_major_rotation_enabled()
+    monkeypatch.delenv("B12X_W4A16_SMALL_M_SPLITK", raising=False)
+    g = kernel.W4A16GemmKernel(
+        size_m=4608,
+        size_n=768,
+        size_k=3584,
+        num_experts=896,
+        top_k=16,
+        mul_topk_weights=False,
+        tile_n=128,
+        tile_k=128,
+        moe_block_size=48,
+        max_m_blocks=1536,
+        element_dtype="fp16",
+        weight_layout="trellis3_t256",
+        scale_format="e4m3_k32",
+        w13_layout="trellis3_t256_proj",
+        trellis_bits=2,
+        trellis_codebook="sqg_xor_cheb_t12",
+        dual_a=True,
+        route_major_a=True,
+        schedule_whole_tiles=True,
+        dynamic_num_experts=True,
+    )
+    assert not g.cross_tile_prefetch
+    assert g.shared_words * 4 == 68_352
+
+
 def test_prefetch_requires_whole_tile_route_packed_schedule(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("B12X_W4A16_CROSS_TILE_PREFETCH", "1")
     g = kernel.W4A16GemmKernel(
