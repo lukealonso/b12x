@@ -1,4 +1,19 @@
-from b12x.moe._shared.kernels.w4a16.kernel import _candidate_tile_fits
+from __future__ import annotations
+
+import pytest
+import torch
+
+from b12x.moe._shared.kernels.w4a16.kernel import (
+    _DEFAULT_MAX_SHARED_MEM,
+    W4A16FusedMoeKernel,
+    W4A16GemmKernel,
+    _candidate_tile_fits,
+    _covering_count,
+    _select_tile_config,
+    _shared_memory_footprint,
+    _w4a16_b_unit_bytes,
+    compile_w4a16_fused_moe,
+)
 
 
 def _fits(
@@ -39,3 +54,275 @@ def test_wave_balanced_fc2_tile_is_rejected_for_fc1() -> None:
 def test_other_sub64_k_tiles_remain_unsupported() -> None:
     assert not _fits(tile_k=32, tile_n=256, cta_threads=128)
     assert not _fits(tile_k=16, tile_n=512, cta_threads=128)
+
+
+# The served Kimi-K3 QSRT trellis launch: 2-bpw SQG-XOR-Cheb-T12 experts,
+# E4M3 K/32 scales, FC1 K=3584 -> N=768 (384-channel extent, gate+up), FC2
+# K=384 -> N=3584, one pinned 128x128 CTA tile with 256 threads, and the
+# SM120 opt-in limit of 101,376 bytes minus the planner's 512-byte margin.
+_K3_TILE = dict(tile_n=128, tile_k=128, cta_threads=256)
+_K3_SMEM_LIMIT = _DEFAULT_MAX_SHARED_MEM - 512
+
+
+def _k3_footprint(block: int, **kwargs) -> int:
+    return _shared_memory_footprint(
+        cta_m_blocks=_covering_count(block, 16),
+        tile_n=128,
+        tile_k=128,
+        scale_format="e4m3_k32",
+        weight_layout="trellis3_t256",
+        **kwargs,
+    )
+
+
+def _k3_fits(block: int, *, problem_n: int, problem_k: int, **kwargs) -> bool:
+    return _candidate_tile_fits(
+        problem_n=problem_n,
+        problem_k=problem_k,
+        cta_m_blocks=_covering_count(block, 16),
+        max_shared_mem=_K3_SMEM_LIMIT,
+        scale_format="e4m3_k32",
+        weight_layout="trellis3_t256",
+        **_K3_TILE,
+        **kwargs,
+    )
+
+
+@pytest.mark.parametrize(
+    ("weight_layout", "trellis_bits", "pair_kind", "rate_axis", "expected"),
+    [
+        ("packed", 3, None, None, 16),
+        ("modelopt", 3, None, None, 16),
+        ("trellis3_t256", 2, None, None, 8),
+        ("trellis3_t256", 3, None, None, 12),
+        ("trellis3_t256", 4, None, None, 16),
+        ("trellis3_t256", 6, None, None, 24),
+        ("trellis3_t256", 3, "P33", "n", 12),
+        ("trellis3_t256", 3, "P24", "n", 12),
+        ("trellis3_t256", 3, "P43", "n", 14),
+        ("trellis3_t256", 3, "P44", "n", 16),
+        ("trellis3_t256", 3, "P33_P43", "n", 14),
+        ("trellis3_t256", 3, "PDYNAMIC", "n", 12),
+        ("trellis3_t256", 3, "P33_P43", "k", 16),
+        ("trellis3_t256", 3, "P24", "k", 16),
+    ],
+)
+def test_b_unit_bytes_matches_the_kernel_staging_layout(
+    weight_layout: str,
+    trellis_bits: int,
+    pair_kind: str | None,
+    rate_axis: str | None,
+    expected: int,
+) -> None:
+    assert (
+        _w4a16_b_unit_bytes(
+            weight_layout=weight_layout,
+            trellis_bits=trellis_bits,
+            trellis_pair_kind=pair_kind,
+            trellis_rate_axis=rate_axis,
+        )
+        == expected
+    )
+
+
+def test_footprint_b_stage_uses_the_real_trellis_width() -> None:
+    """The estimate must size the B stage exactly as the kernel stages it."""
+    two_bpw = _w4a16_b_unit_bytes(weight_layout="trellis3_t256", trellis_bits=2)
+    assert two_bpw == 8
+    # Four 128x128 B stages: 32,768 B at 4 bpw, 16,384 B at 2 bpw. The
+    # epilogue reduction buffer (cta_m x 136 x 2 B) aliases the B region, so
+    # from block 64 up it bounds the region and absorbs part of the saving.
+    for block, saving in ((48, 16_384), (64, 15_360), (96, 6_656)):
+        contract = _k3_footprint(block, weight_bits=4)
+        real = _k3_footprint(block, b_unit_bytes=two_bpw)
+        assert contract - real == saving, block
+    # Passing the 4-bpw unit width reproduces the weight_bits estimate.
+    assert _k3_footprint(64, b_unit_bytes=16) == _k3_footprint(64, weight_bits=4)
+    assert _k3_footprint(48, weight_bits=4) == 86_784
+    assert _k3_footprint(64, weight_bits=4) == 103_424
+    assert _k3_footprint(96, weight_bits=4) == 136_704
+    assert _k3_footprint(48, b_unit_bytes=8) == 70_400
+    assert _k3_footprint(64, b_unit_bytes=8) == 88_064
+    assert _k3_footprint(96, b_unit_bytes=8) == 130_048
+
+
+@pytest.mark.parametrize(
+    ("problem_n", "problem_k"),
+    [(768, 3584), (512, 3584), (3584, 384), (3584, 256)],
+)
+def test_route_block_64_fits_only_with_the_real_trellis_width(
+    problem_n: int, problem_k: int
+) -> None:
+    two_bpw = _w4a16_b_unit_bytes(weight_layout="trellis3_t256", trellis_bits=2)
+    for block, contract_fits, real_fits in ((48, True, True), (64, False, True), (96, False, False)):
+        assert (
+            _k3_fits(block, problem_n=problem_n, problem_k=problem_k, weight_bits=4)
+            is contract_fits
+        ), block
+        assert (
+            _k3_fits(
+                block,
+                problem_n=problem_n,
+                problem_k=problem_k,
+                weight_bits=4,
+                b_unit_bytes=two_bpw,
+            )
+            is real_fits
+        ), block
+
+
+def test_fit_width_does_not_change_residency_planning() -> None:
+    """``fit_b_unit_bytes`` only gates the fit; the tile choice and planned
+    blocks per SM come from ``weight_bits`` as before."""
+    two_bpw = _w4a16_b_unit_bytes(weight_layout="trellis3_t256", trellis_bits=2)
+    for block in (32, 48, 64):
+        for problem_m, problem_n, problem_k, top_k in (
+            (4608, 768, 3584, 16),
+            (4608 * 16, 3584, 384, 1),
+        ):
+            common = dict(
+                problem_m=problem_m,
+                problem_n=problem_n,
+                problem_k=problem_k,
+                top_k=top_k,
+                moe_block_size=block,
+                sms=188,
+                max_shared_mem=_DEFAULT_MAX_SHARED_MEM,
+                scale_format="e4m3_k32",
+                weight_layout="trellis3_t256",
+                weight_bits=4,
+            )
+            assert _select_tile_config(**common) == _select_tile_config(
+                **common, fit_b_unit_bytes=two_bpw
+            )
+
+
+def _k3_gemm_kernel(block: int, *, size_n: int, size_k: int, **kwargs) -> W4A16GemmKernel:
+    return W4A16GemmKernel(
+        size_m=4608,
+        size_n=size_n,
+        size_k=size_k,
+        num_experts=896,
+        top_k=16,
+        mul_topk_weights=False,
+        tile_n=128,
+        tile_k=128,
+        moe_block_size=block,
+        max_m_blocks=2000,
+        element_dtype="fp16",
+        weight_layout="trellis3_t256",
+        scale_format="e4m3_k32",
+        trellis_bits=2,
+        schedule_whole_tiles=True,
+        dynamic_num_experts=True,
+        **kwargs,
+    )
+
+
+def test_estimate_covers_the_real_kernel_layout_at_block_64() -> None:
+    """The planner estimate stays an upper bound of the kernel's own layout."""
+    two_bpw = _w4a16_b_unit_bytes(weight_layout="trellis3_t256", trellis_bits=2)
+    for block, expected_real in ((48, 68_352), (64, 86_016)):
+        fc1 = _k3_gemm_kernel(
+            block,
+            size_n=768,
+            size_k=3584,
+            w13_layout="trellis3_t256_proj",
+            dual_a=True,
+            route_major_a=True,
+        )
+        assert fc1.b_unit_bytes == two_bpw
+        assert fc1.shared_words * 4 == expected_real
+        assert fc1.shared_words * 4 <= _k3_footprint(block, b_unit_bytes=two_bpw)
+        # One CTA per SM at the 255-register cap: the grid contract is unchanged.
+        assert fc1.blocks_per_sm == 1
+
+
+def test_fused_kernel_accepts_block_64_with_the_modal_table(monkeypatch) -> None:
+    """Route block 64 leaves room for the 4 KiB T12 table: 90,128 <= 101,376."""
+    monkeypatch.setenv("B12X_SQG_XOR_CHEB_T12_SMEM", "1")
+    monkeypatch.setenv("B12X_SQG_XOR_CHEB_T12_DIRECT_SMEM", "1")
+    fused = W4A16FusedMoeKernel(
+        size_m=4608,
+        hidden_size=3584,
+        intermediate_size=384,
+        num_experts=896,
+        top_k=16,
+        activation="situ",
+        apply_router_weight_on_input=False,
+        zero_fc2_output=False,
+        fc1_tile_n=128,
+        fc1_tile_k=128,
+        fc2_tile_n=128,
+        fc2_tile_k=128,
+        moe_block_size=64,
+        max_m_blocks=2000,
+        element_dtype="fp16",
+        weight_layout="trellis3_t256",
+        scale_format="e4m3_k32",
+        w13_layout="trellis3_t256_proj",
+        trellis_bits=2,
+        intermediate_rotation=True,
+        full_rotation=True,
+        coupled_hadamard=True,
+        rotation_input_dtype="bf16",
+    )
+    if not torch.cuda.is_available():
+        assert fused.fc1.max_shared_mem == _DEFAULT_MAX_SHARED_MEM
+    assert fused.shared_words * 4 + 16 == 90_128
+    assert fused.shared_words * 4 + 16 <= fused.fc1.max_shared_mem
+    # The 64 KiB direct table still does not fit next to a prefill pipeline.
+    assert fused.sqg_xor_cheb_t12_smem
+    assert not fused.sqg_xor_cheb_t12_direct_smem
+    assert fused.blocks_per_sm == 1
+
+
+@pytest.mark.parametrize(
+    ("block", "accepted"),
+    [(32, True), (48, True), (64, True), (96, False)],
+)
+def test_fused_planner_admits_block_64_at_the_pinned_k3_tile(
+    block: int, accepted: bool, monkeypatch
+) -> None:
+    """``compile_w4a16_fused_moe`` reaches the kernel (cache miss) for blocks
+    whose pinned 128x128 tile fits the real layout and rejects the rest in the
+    ``force_tile_config`` fit check before constructing any kernel."""
+    monkeypatch.setenv("B12X_SQG_XOR_CHEB_T12_SMEM", "1")
+    kwargs = dict(
+        size_m=4608,
+        hidden_size=3584,
+        intermediate_size=384,
+        num_experts=896,
+        top_k=16,
+        activation="situ",
+        apply_router_weight_on_input=False,
+        zero_fc2_output=False,
+        moe_block_size=block,
+        max_m_blocks=2000,
+        element_dtype="fp16",
+        sms=188,
+        max_shared_mem=_DEFAULT_MAX_SHARED_MEM,
+        weight_layout="trellis3_t256",
+        scale_format="e4m3_k32",
+        w13_layout="trellis3_t256_proj",
+        trellis_bits=2,
+        force_tile_config=(128, 128, 128, 128),
+        intermediate_rotation=True,
+        full_rotation=True,
+        coupled_hadamard=True,
+        rotation_input_dtype="bf16",
+        _require_cached=True,
+    )
+    if accepted:
+        # Past every planner gate; the uncompiled launch is reported as such.
+        with pytest.raises(RuntimeError, match="not resolved for CUDA graph capture"):
+            compile_w4a16_fused_moe(**kwargs)
+    else:
+        # Block 96 has no measured register entry for the table tiles and its
+        # pinned tile does not fit (130,048 B); either gate is a ValueError
+        # that the serving planner treats as "try a narrower block".
+        with pytest.raises(
+            ValueError,
+            match="force_tile_config fc1 tile|missing W4A16 register count",
+        ):
+            compile_w4a16_fused_moe(**kwargs)

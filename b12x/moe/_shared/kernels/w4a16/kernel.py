@@ -362,6 +362,51 @@ def _normalize_swiglu_limit(swiglu_limit: float | None) -> float | None:
     return normalize_swiglu_limit_for_activation("silu", swiglu_limit)
 
 
+# Fixed-rate QSRT pair kinds: (low, high) trellis bits of the two paired
+# 128-channel records. Dynamic kinds (PDYNAMIC, P33_P43) carry their rates in
+# the pair metadata instead.
+_TRELLIS256_PAIR_STATIC_RATES = {
+    "P24": (2, 4),
+    "P33": (3, 3),
+    "P43": (4, 3),
+    "P44": (4, 4),
+}
+
+
+def _w4a16_b_unit_bytes(
+    *,
+    weight_layout: str,
+    trellis_bits: int,
+    trellis_pair_kind: str | None = None,
+    trellis_rate_axis: str | None = None,
+) -> int:
+    """Bytes one B stage holds per 32 weight codes (``W4A16GemmKernel.b_unit_bytes``).
+
+    Packed and modelopt weights stage 16 bytes (4 bits per code). A native
+    ``trellis3_t256`` tile stages ``4 * bits`` bytes for the same logical unit:
+    2-bpw weights stage half the bytes of the 4-bpw packed layout. Pair layouts
+    stage both records' rates (K-axis pairs keep the 16-byte packed unit,
+    compact-offset pairs 14 bytes, fixed-rate pairs ``2 * (low + high)``;
+    dynamic N-axis pairs keep the base rate). The kernel and the planner's
+    shared-memory fit check must agree on this number, so both derive it here.
+    """
+    if weight_layout != "trellis3_t256":
+        return 16
+    unit_bytes = 4 * int(trellis_bits)
+    if trellis_pair_kind is None:
+        return unit_bytes
+    pair_kind = str(trellis_pair_kind).upper()
+    rate_axis = None if trellis_rate_axis is None else str(trellis_rate_axis).lower()
+    if rate_axis == "k":
+        return 16
+    if pair_kind == "P33_P43":
+        return 14
+    if pair_kind in _TRELLIS256_PAIR_STATIC_RATES:
+        low_bits, high_bits = _TRELLIS256_PAIR_STATIC_RATES[pair_kind]
+        return 2 * (low_bits + high_bits)
+    return unit_bytes
+
+
 def _normalize_activation_swiglu_params(
     activation: str,
     swiglu_limit: float | None,
@@ -408,14 +453,24 @@ def _shared_memory_footprint(
     scale_format: str = "e4m3_k16",
     weight_layout: str = "packed",
     weight_bits: int = 4,
+    b_unit_bytes: int | None = None,
 ) -> int:
+    """Estimate the pipeline shared-memory bytes of one CTA tile.
+
+    ``weight_bits`` sizes the staged B tile at ``weight_bits`` bits per code.
+    ``b_unit_bytes`` (bytes per 32 codes, see ``_w4a16_b_unit_bytes``) sizes
+    it from the kernel's real staging layout instead and takes precedence.
+    """
     cta_m = int(cta_m_blocks) * 16
     cta_n = int(tile_n)
     cta_k = int(tile_k)
     sh_block_meta_size = cta_m * 16
     sh_a_size = _STAGES * (cta_m * cta_k) * 2
-    staged_weight_bits = int(weight_bits)
-    sh_b_size = _STAGES * (cta_k * cta_n * staged_weight_bits // 8)
+    if b_unit_bytes is None:
+        b_unit_bytes = 4 * int(weight_bits)
+    # One B stage holds cta_k * cta_n codes in 32-code units of b_unit_bytes;
+    # this is the kernel's ``b_sh_stage * b_unit_bytes``.
+    sh_b_size = _STAGES * ((cta_k * cta_n) // 32) * int(b_unit_bytes)
     sh_red_size = cta_m * (cta_n + 8) * 2
     sh_bias_size = cta_n * 2
     tmp_size = min(sh_b_size, sh_red_size) + sh_bias_size
@@ -497,6 +552,7 @@ def _candidate_tile_fits(
     scale_format: str = "e4m3_k16",
     weight_layout: str = "packed",
     weight_bits: int = 4,
+    b_unit_bytes: int | None = None,
     allow_logical_tail: bool = False,
     allow_qualified_fc2_tile: bool = False,
 ) -> bool:
@@ -541,6 +597,7 @@ def _candidate_tile_fits(
         scale_format=scale_format,
         weight_layout=weight_layout,
         weight_bits=weight_bits,
+        b_unit_bytes=b_unit_bytes,
     )
     return smem_bytes <= int(max_shared_mem)
 
@@ -558,8 +615,15 @@ def _select_tile_config(
     scale_format: str = "e4m3_k16",
     weight_layout: str = "packed",
     weight_bits: int = 4,
+    fit_b_unit_bytes: int | None = None,
     allow_logical_tail: bool = False,
 ) -> tuple[int, int, int, int]:
+    """Pick the tile maximizing planned residency among tiles that fit.
+
+    ``weight_bits`` is the residency (blocks-per-SM) planning width; the
+    shared-memory fit of each candidate uses ``fit_b_unit_bytes`` (the
+    kernel's real staging width) when given and ``weight_bits`` otherwise.
+    """
     cta_m_blocks = _covering_count(moe_block_size, 16)
     uses_m_block_8 = moe_block_size == 8
     configs = (
@@ -583,6 +647,7 @@ def _select_tile_config(
             scale_format=scale_format,
             weight_layout=weight_layout,
             weight_bits=weight_bits,
+            b_unit_bytes=fit_b_unit_bytes,
             allow_logical_tail=allow_logical_tail,
         ):
             continue
@@ -1033,14 +1098,8 @@ class W4A16GemmKernel:
         self.weight_layout_trellis256_pair = trellis_pair_kind is not None
         self.trellis_pair_dynamic = trellis_pair_kind in {"PDYNAMIC", "P33_P43"}
         self.trellis_pair_compact_offsets = trellis_pair_kind == "P33_P43"
-        static_pair_rates = {
-            "P24": (2, 4),
-            "P33": (3, 3),
-            "P43": (4, 3),
-            "P44": (4, 4),
-        }
-        self.trellis_pair_low_bits, self.trellis_pair_high_bits = static_pair_rates.get(
-            trellis_pair_kind, (3, 3)
+        self.trellis_pair_low_bits, self.trellis_pair_high_bits = (
+            _TRELLIS256_PAIR_STATIC_RATES.get(trellis_pair_kind, (3, 3))
         )
         self.sqg_xor_cheb_t12_smem = False
         self.sqg_xor_cheb_t12_direct_smem = False
@@ -1203,20 +1262,15 @@ class W4A16GemmKernel:
         self.b_sh_stride_threads = self.b_sh_stride
         self.b_sh_stage = self.b_sh_stride * self.cta_k_blocks
         self.b_sh_wr_iters = self.b_sh_stage // self.cta_threads
-        # Native t256 uses 4*bits bytes per 32 codes;
-        # packed/modelopt use 16 bytes for the same logical unit.
-        self.b_unit_bytes = 16
-        if self.weight_layout_trellis256:
-            self.b_unit_bytes = 4 * self.trellis_bits
-            if self.weight_layout_trellis256_pair:
-                if self.trellis_rate_axis == "k":
-                    self.b_unit_bytes = 16
-                elif self.trellis_pair_compact_offsets:
-                    self.b_unit_bytes = 14
-                elif not self.trellis_pair_dynamic:
-                    self.b_unit_bytes = 2 * (
-                        self.trellis_pair_low_bits + self.trellis_pair_high_bits
-                    )
+        # Native t256 uses 4*bits bytes per 32 codes; packed/modelopt use 16
+        # bytes for the same logical unit. The planner's shared-memory fit
+        # check derives the same width from ``_w4a16_b_unit_bytes``.
+        self.b_unit_bytes = _w4a16_b_unit_bytes(
+            weight_layout=self.weight_layout,
+            trellis_bits=self.trellis_bits,
+            trellis_pair_kind=self.trellis_pair_kind,
+            trellis_rate_axis=self.trellis_rate_axis,
+        )
         self.b_sh_stage_bytes = self.b_sh_stage * self.b_unit_bytes
         if self.b_region_variable:
             if self.b_sh_stage_bytes % 16 != 0:
@@ -9837,6 +9891,24 @@ def compile_w4a16_fused_moe(
     # Existing 3-bpw scheduling was conservatively planned as 4 bpw. Keep that
     # grid contract stable for D6; widen only the 5/6-bpw specializations.
     weight_bits = max(4, trellis_bits) if weight_layout == "trellis3_t256" else 4
+    # The shared-memory fit of a candidate tile uses the kernel's real B
+    # staging width (``W4A16GemmKernel.b_unit_bytes``): a 2-bpw trellis tile
+    # stages half the bytes the 4-bpw grid contract assumes, and sizing the
+    # fit with the contract width rejects geometries the kernel supports
+    # (the 64-row route block at the pinned 128x128 trellis tile). Residency
+    # planning keeps ``weight_bits``; only the fit check uses these widths.
+    fc1_fit_b_unit_bytes = _w4a16_b_unit_bytes(
+        weight_layout=weight_layout,
+        trellis_bits=trellis_bits,
+        trellis_pair_kind=fc1_trellis_pair_kind,
+        trellis_rate_axis="n" if fc1_trellis_pair_kind is not None else None,
+    )
+    fc2_fit_b_unit_bytes = _w4a16_b_unit_bytes(
+        weight_layout=weight_layout,
+        trellis_bits=trellis_bits,
+        trellis_pair_kind=fc2_trellis_pair_kind,
+        trellis_rate_axis="k" if fc2_trellis_pair_kind is not None else None,
+    )
     # GATE 5: the PRODUCTION 256-weight-tile fused-megakernel B-staging is now
     # wired (per-warp native [K/16,N/16,8*bits u32] tile staging + the per-lane
     # bitrate-specialized read) and ADMITTED at 3 bpw against a full-GEMM
@@ -9937,6 +10009,7 @@ def compile_w4a16_fused_moe(
         scale_format=scale_format,
         weight_layout=weight_layout,
         weight_bits=weight_bits,
+        fit_b_unit_bytes=fc1_fit_b_unit_bytes,
         allow_logical_tail=allow_native_logical_tail,
     )
     fc2_tile_k, fc2_tile_n, fc2_cta_threads, _ = _select_tile_config(
@@ -9950,6 +10023,7 @@ def compile_w4a16_fused_moe(
         scale_format=scale_format,
         weight_layout=weight_layout,
         weight_bits=weight_bits,
+        fit_b_unit_bytes=fc2_fit_b_unit_bytes,
         allow_logical_tail=allow_native_logical_tail,
     )
     if fc1_cta_threads != fc2_cta_threads:
@@ -9966,6 +10040,7 @@ def compile_w4a16_fused_moe(
             scale_format=scale_format,
             weight_layout=weight_layout,
             weight_bits=weight_bits,
+            fit_b_unit_bytes=fc1_fit_b_unit_bytes,
             allow_logical_tail=allow_native_logical_tail,
         )
         fc2_tile_k, fc2_tile_n, fc2_cta_threads, _ = _select_tile_config(
@@ -9980,6 +10055,7 @@ def compile_w4a16_fused_moe(
             scale_format=scale_format,
             weight_layout=weight_layout,
             weight_bits=weight_bits,
+            fit_b_unit_bytes=fc2_fit_b_unit_bytes,
             allow_logical_tail=allow_native_logical_tail,
         )
         if fc1_cta_threads != fc2_cta_threads:
@@ -10030,6 +10106,7 @@ def compile_w4a16_fused_moe(
             scale_format=scale_format,
             weight_layout=weight_layout,
             weight_bits=weight_bits,
+            b_unit_bytes=fc1_fit_b_unit_bytes,
         ):
             fc1_tile_n = 256
             fc1_tile_k = wide_fc1_tile_k
@@ -10062,6 +10139,7 @@ def compile_w4a16_fused_moe(
             scale_format=scale_format,
             weight_layout=weight_layout,
             weight_bits=weight_bits,
+            b_unit_bytes=fc2_fit_b_unit_bytes,
         ):
             fc2_tile_n = 256
             fc2_tile_k = wide_fc2_tile_k
@@ -10112,6 +10190,7 @@ def compile_w4a16_fused_moe(
             scale_format=scale_format,
             weight_layout=weight_layout,
             weight_bits=weight_bits,
+            b_unit_bytes=fc2_fit_b_unit_bytes,
             allow_qualified_fc2_tile=True,
         ):
             fc2_tile_n = 512
@@ -10147,6 +10226,9 @@ def compile_w4a16_fused_moe(
                 scale_format=scale_format,
                 weight_layout=weight_layout,
                 weight_bits=weight_bits,
+                b_unit_bytes=(
+                    fc2_fit_b_unit_bytes if name == "fc2" else fc1_fit_b_unit_bytes
+                ),
                 allow_logical_tail=allow_native_logical_tail,
                 allow_qualified_fc2_tile=name == "fc2",
             ):
