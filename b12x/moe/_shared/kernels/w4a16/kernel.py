@@ -22,6 +22,7 @@ from b12x._lib.compiler import (
     compile as b12x_compile,
 )
 from b12x._lib.intrinsics import (
+    SQG_XOR_CHEB_T12_DECODE_CHAINS,
     atomic_add_global_i32,
     bf16_mma_m16n8k16_f32,
     bf16_mma_rhs_fragments_as_mma_a_m16n8k16_f32,
@@ -37,6 +38,8 @@ from b12x._lib.intrinsics import (
     f16_mma_m16n8k16_f32,
     f16_mma_rhs_fragments_as_mma_a_m16n8k16_f32,
     cp_async_bulk_g2s_mbar,
+    fp8x2_e4m3_pair_to_bfloat2_native_sm120,
+    fp8x2_e4m3_pair_to_half2,
     fp8x4_e4m3_to_bfloat2x2_native_sm120,
     fp8x4_e4m3_to_half2x2,
     get_ptr_as_int64,
@@ -65,6 +68,7 @@ from b12x._lib.intrinsics import (
     packed_dequant_trellis_stream_to_half2x4,
     packed_decode_sqg_fp16_d3l_to_bfloat2x4,
     packed_decode_sqg_fp16_d3l_to_half2x4,
+    packed_decode_sqg_xor_cheb_t12_to_e4m3x2x4,
     packed_decode_sqg_xor_cheb_t12_to_e4m3x8,
     packed_decode_trellis_sqg_direct_lut_smem_to_e4m3x8,
     ld_global_nc_v4_u32,
@@ -209,6 +213,29 @@ def _sqg_xor_cheb_t12_smem_enabled() -> bool:
     """
 
     return os.environ.get("B12X_SQG_XOR_CHEB_T12_SMEM", "1") == "1"
+
+
+def _sqg_xor_cheb_t12_decode_chain() -> str:
+    """Select the instruction sequence of the modal T12 window decode.
+
+    ``funnel`` (default) cuts the history with one ``bfe``, shares one
+    ``brev`` per 32-bit source word, assembles the table index with one
+    funnel shift and packs bytes as 16-bit pairs; ``legacy`` is the
+    per-window ``bfe``/``shr``/``brev``/``shl``/``or`` chain. Both read the
+    same table byte for every window (bit-identical outputs); the switch
+    exists for A/B digests and timing, and participates in the kernel cache
+    key.
+    """
+
+    value = (
+        os.environ.get("B12X_SQG_XOR_CHEB_T12_DECODE_CHAIN", "funnel").strip().lower()
+    )
+    if value not in SQG_XOR_CHEB_T12_DECODE_CHAINS:
+        raise ValueError(
+            "B12X_SQG_XOR_CHEB_T12_DECODE_CHAIN must be one of "
+            f"{SQG_XOR_CHEB_T12_DECODE_CHAINS}, got {value!r}"
+        )
+    return value
 
 
 _E8M0_LOGICAL_TAIL_SCALE_N_ALIGNMENT = 64
@@ -1133,6 +1160,10 @@ class W4A16GemmKernel:
         )
         self.sqg_xor_cheb_t12_smem = False
         self.sqg_xor_cheb_t12_direct_smem = False
+        # Instruction sequence of the modal T12 window decode; both chains
+        # read the same table byte per window (see
+        # ``_sqg_xor_cheb_t12_decode_chain``).
+        self.sqg_xor_cheb_t12_decode_chain = _sqg_xor_cheb_t12_decode_chain()
         # Small-M stripe split-K: opt out of the one-tile-per-CTA fast path
         # so decode-heavy small-M phases spread each mn-tile's K range across
         # multiple CTAs (existing tail scheduling plus cross-CTA finalize).
@@ -1410,6 +1441,7 @@ class W4A16GemmKernel:
             self.paired_m8_routes,
             self.sqg_xor_cheb_t12_smem,
             self.small_m_splitk,
+            self.sqg_xor_cheb_t12_decode_chain,
         )
 
     @cute.jit
@@ -4271,6 +4303,26 @@ class W4A16GemmKernel:
             else:
                 o0, o1 = fp8x4_e4m3_to_bfloat2x2_native_sm120(e_lo)
                 o2, o3 = fp8x4_e4m3_to_bfloat2x2_native_sm120(e_hi)
+        elif cutlass.const_expr(self.sqg_xor_cheb_t12_decode_chain == "funnel"):
+            # Same table bytes as the legacy chain, delivered as four 16-bit
+            # pairs so each pair converts without a 32-bit merge.
+            p01, p23, p45, p67 = packed_decode_sqg_xor_cheb_t12_to_e4m3x2x4(
+                win_a,
+                win_b,
+                trellis_lut_addr,
+                int(bits),
+                t12_in_shared=self.sqg_xor_cheb_t12_smem,
+            )
+            if cutlass.const_expr(self.is_fp16):
+                o0 = fp8x2_e4m3_pair_to_half2(p01)
+                o1 = fp8x2_e4m3_pair_to_half2(p23)
+                o2 = fp8x2_e4m3_pair_to_half2(p45)
+                o3 = fp8x2_e4m3_pair_to_half2(p67)
+            else:
+                o0 = fp8x2_e4m3_pair_to_bfloat2_native_sm120(p01)
+                o1 = fp8x2_e4m3_pair_to_bfloat2_native_sm120(p23)
+                o2 = fp8x2_e4m3_pair_to_bfloat2_native_sm120(p45)
+                o3 = fp8x2_e4m3_pair_to_bfloat2_native_sm120(p67)
         else:
             e_lo, e_hi = packed_decode_sqg_xor_cheb_t12_to_e4m3x8(
                 win_a,
@@ -6657,6 +6709,7 @@ class W4A16FusedMoeKernel:
             self.trellis_codebook == "sqg_xor_cheb_t12"
             and _sqg_xor_cheb_t12_smem_enabled()
         )
+        self.sqg_xor_cheb_t12_decode_chain = self.fc1.sqg_xor_cheb_t12_decode_chain
         # Direct table: uniform-rate trellis3_t256 layers only (the staged
         # slice is one rate); requires the modal staging path to be on. ``None`` reads
         # the environment switch; kernels that are composed into a launch which
@@ -6764,6 +6817,7 @@ class W4A16FusedMoeKernel:
             self.sqg_xor_cheb_t12_smem,
             self.sqg_xor_cheb_t12_direct_smem,
             self.small_m_splitk,
+            self.sqg_xor_cheb_t12_decode_chain,
             self.fc1.__cache_key__,
             self.fc2.__cache_key__,
             self.cta_threads,
