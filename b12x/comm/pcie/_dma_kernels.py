@@ -667,6 +667,110 @@ class _AddLaunch:
             idx += step
 
 
+# Mixed-precision adds of the fp32-wire column reduce-scatter: the local
+# operand is always the caller's bf16 block, the received operand is a bf16
+# block (first hop) or an fp32 running sum (later hops), and the result is an
+# fp32 running sum or, on the final hop, a bf16 value rounded once with
+# ``cvt.rn.bf16x2.f32``. Mode name: ``<a dtype>_<b dtype>_<out dtype>``.
+_MIXED_ADD_MODES: dict[str, tuple[str, str]] = {
+    "bf16_bf16_f32": ("bf16", "fp32"),
+    "bf16_f32_f32": ("fp32", "fp32"),
+    "bf16_f32_bf16": ("fp32", "bf16"),
+}
+_MIXED_ADD_PACK = 8
+
+
+class _MixedAddLaunch:
+    def __init__(self, mode: str) -> None:
+        if mode not in _MIXED_ADD_MODES:
+            raise ValueError(f"unknown mixed add mode {mode!r}")
+        self._mode = mode
+        self._b_dtype, self._out_dtype = _MIXED_ADD_MODES[mode]
+
+    @cute.jit
+    def __call__(
+        self,
+        dst_ptr: cute.Pointer,
+        a_ptr: cute.Pointer,
+        b_ptr: cute.Pointer,
+        packs: Int64,
+        grid_x: Int32,
+        stream: cuda.CUstream,
+    ) -> None:
+        self.kernel(
+            _one_tensor(dst_ptr),
+            _one_tensor(a_ptr),
+            _one_tensor(b_ptr),
+            packs,
+        ).launch(
+            grid=(grid_x, 1, 1),
+            block=(_THREADS, 1, 1),
+            cluster=(1, 1, 1),
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        dst: cute.Tensor,
+        a_src: cute.Tensor,
+        b_src: cute.Tensor,
+        packs: Int64,
+    ) -> None:
+        tidx, _, _ = cute.arch.thread_idx()
+        bidx, _, _ = cute.arch.block_idx()
+        gdim, _, _ = cute.arch.grid_dim()
+        idx = Int64(bidx) * Int64(_THREADS) + Int64(tidx)
+        step = Int64(gdim) * Int64(_THREADS)
+        while idx < packs:
+            # Eight elements per pack: one 16-byte bf16 vector, two 16-byte
+            # fp32 vectors. Pointer offsets are in elements of each operand.
+            elem0 = idx * Int64(_MIXED_ADD_PACK)
+            aw = ld_global_v4_u32(get_ptr_as_int64(a_src, elem0))
+            a_vals = cute.make_rmem_tensor((_MIXED_ADD_PACK,), Float32)
+            for word in cutlass.range_constexpr(4):
+                a0, a1 = _unpack_bf16x2(aw[word])
+                a_vals[2 * word] = a0
+                a_vals[2 * word + 1] = a1
+            sums = cute.make_rmem_tensor((_MIXED_ADD_PACK,), Float32)
+            if cutlass.const_expr(self._b_dtype == "bf16"):
+                bw = ld_global_v4_u32(get_ptr_as_int64(b_src, elem0))
+                for word in cutlass.range_constexpr(4):
+                    b0, b1 = _unpack_bf16x2(bw[word])
+                    sums[2 * word] = a_vals[2 * word] + b0
+                    sums[2 * word + 1] = a_vals[2 * word + 1] + b1
+            else:
+                blo = ld_global_v4_f32(get_ptr_as_int64(b_src, elem0))
+                bhi = ld_global_v4_f32(get_ptr_as_int64(b_src, elem0 + Int64(4)))
+                for lane in cutlass.range_constexpr(4):
+                    sums[lane] = a_vals[lane] + blo[lane]
+                    sums[4 + lane] = a_vals[4 + lane] + bhi[lane]
+            if cutlass.const_expr(self._out_dtype == "bf16"):
+                st_global_v4_u32(
+                    get_ptr_as_int64(dst, elem0),
+                    _pack_bf16x2(sums[0], sums[1]),
+                    _pack_bf16x2(sums[2], sums[3]),
+                    _pack_bf16x2(sums[4], sums[5]),
+                    _pack_bf16x2(sums[6], sums[7]),
+                )
+            else:
+                st_global_v4_f32(
+                    get_ptr_as_int64(dst, elem0),
+                    sums[0],
+                    sums[1],
+                    sums[2],
+                    sums[3],
+                )
+                st_global_v4_f32(
+                    get_ptr_as_int64(dst, elem0 + Int64(4)),
+                    sums[4],
+                    sums[5],
+                    sums[6],
+                    sums[7],
+                )
+            idx += step
+
+
 class _QuantLaunch:
     def __init__(self, codec: str) -> None:
         self._codec = codec
@@ -1239,6 +1343,22 @@ def _compiled_add(dtype_name: str) -> Callable:
 
 
 @functools.cache
+def _compiled_add_mixed(mode: str) -> Callable:
+    launch = _MixedAddLaunch(mode)
+    b_dtype, out_dtype = _MIXED_ADD_MODES[mode]
+    return _compile(
+        "comm.pcie_dma.add_mixed",
+        (mode,),
+        launch,
+        _fake_ptr(_dtype_type(out_dtype), 16),
+        _fake_ptr(cutlass.BFloat16, 16),
+        _fake_ptr(_dtype_type(b_dtype), 16),
+        Int64(1),
+        Int32(1),
+    )
+
+
+@functools.cache
 def _compiled_quant(codec: str) -> Callable:
     launch = _QuantLaunch(codec)
     return _compile(
@@ -1460,6 +1580,57 @@ class DmaKernels:
             _ptr(dtype, dst_ptr, 16),
             _ptr(dtype, a_ptr, 16),
             _ptr(dtype, b_ptr, 16),
+            packs,
+            _grid_for_packs(packs),
+            current_cuda_stream(),
+        )
+
+    def prepare_reduce_scatter(self, *, wire: str) -> None:
+        """Compile and warm the adds of a column reduce-scatter wire mode.
+
+        ``wire="fp32"`` uses the three mixed-precision adds; ``"bf16"`` uses
+        the plain bf16 add that ``prepare`` already compiled. Runs before any
+        graph capture can need the kernels.
+        """
+
+        import torch
+
+        if wire != "fp32":
+            return
+        for mode in _MIXED_ADD_MODES:
+            _compiled_add_mixed(mode)
+        a = torch.zeros(_MIXED_ADD_PACK, dtype=torch.bfloat16, device="cuda")
+        b16 = torch.zeros_like(a)
+        b32 = torch.zeros(_MIXED_ADD_PACK, dtype=torch.float32, device="cuda")
+        out16 = torch.empty_like(a)
+        out32 = torch.empty_like(b32)
+        self.dma_add_mixed(
+            out32.data_ptr(), a.data_ptr(), b16.data_ptr(), a.numel(), "bf16_bf16_f32"
+        )
+        self.dma_add_mixed(
+            out32.data_ptr(), a.data_ptr(), b32.data_ptr(), a.numel(), "bf16_f32_f32"
+        )
+        self.dma_add_mixed(
+            out16.data_ptr(), a.data_ptr(), b32.data_ptr(), a.numel(), "bf16_f32_bf16"
+        )
+        torch.cuda.synchronize()
+
+    def dma_add_mixed(
+        self, dst_ptr: int, a_ptr: int, b_ptr: int, elems: int, mode: str
+    ) -> None:
+        """``dst = a + b`` with the operand/result dtypes of ``mode``
+        (``bf16_bf16_f32``, ``bf16_f32_f32`` or ``bf16_f32_bf16``); ``elems``
+        must be a multiple of eight and every pointer 16-byte aligned."""
+        if mode not in _MIXED_ADD_MODES:
+            raise ValueError(f"unknown mixed add mode {mode!r}")
+        if int(elems) % _MIXED_ADD_PACK:
+            raise ValueError("mixed add requires a multiple of eight elements")
+        b_dtype, out_dtype = _MIXED_ADD_MODES[mode]
+        packs = int(elems) // _MIXED_ADD_PACK
+        _compiled_add_mixed(mode)(
+            _ptr(_dtype_type(out_dtype), dst_ptr, 16),
+            _ptr(cutlass.BFloat16, a_ptr, 16),
+            _ptr(_dtype_type(b_dtype), b_ptr, 16),
             packs,
             _grid_for_packs(packs),
             current_cuda_stream(),

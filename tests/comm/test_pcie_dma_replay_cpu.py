@@ -1,5 +1,5 @@
-"""CPU-emulated ring tests: graph-replay static buffers and the paired
-all-gather of ``pcie_dma.PCIeDmaAllReduce``.
+"""CPU-emulated ring tests: graph-replay static buffers, the paired
+all-gather and the column reduce-scatter of ``pcie_dma.PCIeDmaAllReduce``.
 
 The emulation (``pcie_dma_emulation.py``) runs the ring's own Python
 schedule per rank over host memory with the device flag protocol and the
@@ -19,6 +19,7 @@ import torch
 from b12x.comm.pcie import pcie_dma
 from tests.comm.pcie_dma_emulation import (
     EmulatedRing,
+    column_reduce_scatter_reference,
     install_cuda_fakes,
     ring_all_reduce_reference,
 )
@@ -87,12 +88,16 @@ def test_emulated_ring_mirrors_constructor_state() -> None:
 def test_flag_slot_ranges_are_disjoint_for_every_world_size() -> None:
     ar_end = pcie_dma.AR_SLOT_BASE + pcie_dma.AR_SLOT_COUNT
     ag_end = pcie_dma.AG_PAIR_SLOT_BASE + pcie_dma.AG_PAIR_SLOT_COUNT
-    assert ar_end <= pcie_dma.AG_PAIR_SLOT_BASE < ag_end <= pcie_dma.FLAG_SLOTS
+    rs_end = pcie_dma.RS_SLOT_BASE + pcie_dma.RS_SLOT_COUNT
+    assert ar_end <= pcie_dma.AG_PAIR_SLOT_BASE < ag_end <= pcie_dma.RS_SLOT_BASE
+    assert rs_end <= pcie_dma.FLAG_SLOTS
     for world in pcie_dma.SUPPORTED_WORLD_SIZES:
         # All-reduce: 2(world-1) steps x MAX_PIECES pieces + done.
         assert 2 * (world - 1) * pcie_dma.MAX_PIECES < pcie_dma.AR_SLOT_COUNT
         # Paired all-gather: world-1 steps + done.
         assert world <= pcie_dma.AG_PAIR_SLOT_COUNT
+        # Column reduce-scatter: (world-1) x RS_MAX_PIECES + done.
+        assert (world - 1) * pcie_dma.RS_MAX_PIECES < pcie_dma.RS_SLOT_COUNT
 
 
 # ---------------------------------------------------------------------------
@@ -284,8 +289,15 @@ def test_replay_keys_carry_the_op_tag() -> None:
     first = torch.empty(rows, ROUTER_COLS, dtype=torch.float32)
     second = torch.empty(rows, LATENT_COLS, dtype=torch.bfloat16)
     ring = pcie_dma.PCIeDmaAllReduce
-    assert ring._all_reduce_key(latent) == ("ar", latent.numel(), latent.dtype)
+    assert ring._all_reduce_key(latent)[0] == "ar"
+    assert ring._reduce_scatter_key(latent, "fp32", 399)[0] == "rs_fp32"
+    assert ring._reduce_scatter_key(latent, "bf16", 399)[0] == "rs_bf16"
     assert ring._all_gather_pair_key(first, second)[0] == "ag_pair"
+    assert ring._all_reduce_key(latent)[1:] == (latent.numel(), latent.dtype)
+    assert ring._reduce_scatter_key(latent, "fp32", 399)[1:3] == (
+        latent.numel(),
+        latent.dtype,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -385,3 +397,198 @@ def test_all_gather_pair_rejects_unsupported_inputs() -> None:
     assert not ring.should_all_gather_pair(first, huge)
     with pytest.raises(ValueError, match="paired all-gather"):
         ring.all_gather_pair(first, huge)
+
+
+# ---------------------------------------------------------------------------
+# Item 3: column reduce-scatter
+# ---------------------------------------------------------------------------
+
+
+def _rs_mismatch_vs_fp64(blocks: list[torch.Tensor], inputs: list[torch.Tensor]) -> int:
+    rows, width = inputs[0].shape
+    cols = (width + WORLD - 1) // WORLD
+    reference = sum(x.double() for x in inputs).to(torch.bfloat16)
+    mismatches = 0
+    for rank, block in enumerate(blocks):
+        start = rank * cols
+        valid = min(cols, width - start)
+        mismatches += int((block[:, :valid] != reference[:, start : start + valid]).sum())
+        assert torch.equal(block[:, valid:], torch.zeros_like(block[:, valid:]))
+    return mismatches
+
+
+@pytest.mark.parametrize("wire", ["fp32", "bf16"])
+def test_reduce_scatter_columns_matches_reference(wire: str) -> None:
+    emu = EmulatedRing(WORLD, MAX_BYTES, graph_replay=False)
+    inputs = _inputs(144, LATENT, seed=20, dtype=torch.bfloat16)
+    blocks = emu.run(lambda ring, rank: ring.reduce_scatter_columns(inputs[rank], wire=wire))
+    expected = column_reduce_scatter_reference(inputs, WORLD, wire)
+    for rank, block in enumerate(blocks):
+        assert block.shape == (144, 399)
+        assert torch.equal(block, expected[rank])
+    for rank, ring in enumerate(emu.rings):
+        used = ring._send_counters.nonzero().flatten().tolist()
+        assert min(used) == pcie_dma.RS_SLOT_BASE
+        assert max(used) < pcie_dma.RS_SLOT_BASE + pcie_dma.RS_SLOT_COUNT
+
+
+def test_reduce_scatter_fp32_wire_is_at_least_as_precise_as_bf16_wire() -> None:
+    inputs = _inputs(144, LATENT, seed=21, dtype=torch.bfloat16)
+    fp32_blocks = column_reduce_scatter_reference(inputs, WORLD, "fp32")
+    bf16_blocks = column_reduce_scatter_reference(inputs, WORLD, "bf16")
+    ring_blocks = []
+    ring_out = ring_all_reduce_reference(inputs, WORLD)
+    for rank in range(WORLD):
+        start = rank * 399
+        block = torch.zeros(144, 399, dtype=torch.bfloat16)
+        valid = min(399, LATENT - start)
+        block[:, :valid] = ring_out[:, start : start + valid]
+        ring_blocks.append(block)
+    fp32_bad = _rs_mismatch_vs_fp64(fp32_blocks, inputs)
+    bf16_bad = _rs_mismatch_vs_fp64(bf16_blocks, inputs)
+    ring_bad = _rs_mismatch_vs_fp64(ring_blocks, inputs)
+    # One rounding versus eight: the fp32 wire deviates from the correctly
+    # rounded sum on far fewer elements than either eight-rounding scheme.
+    assert fp32_bad < bf16_bad
+    assert fp32_bad < ring_bad
+    assert fp32_bad * 4 < ring_bad
+
+
+def test_reduce_scatter_replay_matches_eager_and_returns_static_block() -> None:
+    emu = EmulatedRing(WORLD, MAX_BYTES)
+    inputs_a = _inputs(144, LATENT, seed=22, dtype=torch.bfloat16)
+    inputs_b = _inputs(144, LATENT, seed=23, dtype=torch.bfloat16)
+
+    def calls(ring, rank):
+        eager = ring.reduce_scatter_columns(inputs_a[rank], wire="fp32")
+        replayed = ring.reduce_scatter_columns(inputs_a[rank], wire="fp32")
+        assert ring.is_ring_storage(replayed) and not ring.is_ring_storage(eager)
+        snapshot = replayed.clone()
+        again = ring.reduce_scatter_columns(inputs_b[rank], wire="fp32")
+        assert again.data_ptr() == replayed.data_ptr()
+        return eager, snapshot, again.clone()
+
+    results = emu.run(calls)
+    expected_a = column_reduce_scatter_reference(inputs_a, WORLD, "fp32")
+    expected_b = column_reduce_scatter_reference(inputs_b, WORLD, "fp32")
+    for rank, (eager, replayed, again) in enumerate(results):
+        assert torch.equal(eager, expected_a[rank])
+        assert torch.equal(replayed, expected_a[rank])
+        assert torch.equal(again, expected_b[rank])
+    ring = emu.rings[0]
+    entry = next(iter(ring._replay_entries.values()))
+    assert entry.key[0] == "rs_fp32"
+    assert len(entry.scratch) == 2 and all(p.dtype == torch.float32 for p in entry.scratch)
+
+
+def test_reduce_scatter_two_pieces_matches_reference() -> None:
+    """A shard above 1 MB per piece splits into two pieces, each with its own
+    scratch area and flag slot."""
+    rows = 1328  # 1328 x 399 elements: divisible by 16, > 1 MB per bf16 piece
+    emu = EmulatedRing(WORLD, MAX_BYTES, graph_replay=False)
+    inputs = _inputs(rows, LATENT, seed=24, dtype=torch.bfloat16)
+    shard_elems = rows * 399
+    assert pcie_dma.PCIeDmaAllReduce._pick_pieces(shard_elems, shard_elems * 2) == 2
+    blocks = emu.run(lambda ring, rank: ring.reduce_scatter_columns(inputs[rank], wire="fp32"))
+    expected = column_reduce_scatter_reference(inputs, WORLD, "fp32")
+    for rank, block in enumerate(blocks):
+        assert torch.equal(block, expected[rank])
+    used = emu.rings[0]._send_counters.nonzero().flatten().tolist()
+    assert len(used) == (WORLD - 1) * 2 + 1
+
+
+def test_reduce_scatter_consumer_block_width_matches_aligned_shards() -> None:
+    """A row-parallel consumer with eight-aligned 400-column input shards
+    (TP9 latent up-projection) gets blocks of its own width: the last rank
+    holds 384 real columns and 16 zeros."""
+    emu = EmulatedRing(WORLD, MAX_BYTES)
+    inputs = _inputs(144, LATENT, seed=25, dtype=torch.bfloat16)
+
+    def calls(ring, rank):
+        eager = ring.reduce_scatter_columns(inputs[rank], wire="fp32", cols=400)
+        replayed = ring.reduce_scatter_columns(inputs[rank], wire="fp32", cols=400)
+        return eager, replayed.clone(), list(ring._replay_entries)
+
+    results = emu.run(calls)
+    expected = column_reduce_scatter_reference(inputs, WORLD, "fp32", cols=400)
+    for rank, (eager, replayed, keys) in enumerate(results):
+        assert eager.shape == (144, 400)
+        assert torch.equal(eager, expected[rank])
+        assert torch.equal(replayed, expected[rank])
+        assert keys[0][-1] == 400
+    last = results[WORLD - 1][0]
+    assert torch.equal(last[:, 384:], torch.zeros_like(last[:, 384:]))
+    reference = sum(x.double() for x in inputs).to(torch.bfloat16)
+    assert torch.equal(last[:, :384], reference[:, 3200:])
+    ring = emu.rings[0]
+    # The blocks of the default and the consumer width live on separate entries.
+    assert ring._reduce_scatter_key(inputs[0], "fp32", 399) != ring._reduce_scatter_key(
+        inputs[0], "fp32", 400
+    )
+
+
+def test_reduce_scatter_rejects_unsupported_inputs() -> None:
+    ring = EmulatedRing(WORLD, MAX_BYTES).rings[0]
+    good = torch.empty(144, LATENT, dtype=torch.bfloat16)
+    assert ring.should_reduce_scatter_columns(good)
+    assert ring.should_reduce_scatter_columns(good, cols=400)
+    assert not ring.should_reduce_scatter_columns(good, cols=398)
+    assert not ring.should_reduce_scatter_columns(good.float())
+    assert not ring.should_reduce_scatter_columns(good.t())
+    assert not ring.should_reduce_scatter_columns(torch.empty(7, LATENT, dtype=torch.bfloat16))
+    with pytest.raises(ValueError, match="wire must be one of"):
+        ring.reduce_scatter_columns(good, wire="fp16")
+    with pytest.raises(ValueError, match="column reduce-scatter"):
+        ring.reduce_scatter_columns(good.float())
+    with pytest.raises(ValueError, match="column reduce-scatter"):
+        ring.reduce_scatter_columns(good, cols=300)
+
+
+# ---------------------------------------------------------------------------
+# The Kimi-K3 layer sequence on one channel
+# ---------------------------------------------------------------------------
+
+
+def test_layer_sequence_mixes_ops_on_one_channel_with_replay() -> None:
+    """attention all-reduce -> gather pair -> reduce-scatter -> MoE
+    all-reduce, twice: three replay entries, every result correct, and the
+    borrowed all-reduce buffer survives the two other ops in between."""
+    emu = EmulatedRing(WORLD, MAX_BYTES, replay_max_entries=4)
+    rows = 144
+    hidden_a = _inputs(rows, HIDDEN, seed=30, dtype=torch.bfloat16)
+    hidden_b = _inputs(rows, HIDDEN, seed=31, dtype=torch.bfloat16)
+    firsts, seconds = _pair_inputs(rows, seed=32)
+    latent = _inputs(rows, LATENT, seed=33, dtype=torch.bfloat16)
+    expected_a = ring_all_reduce_reference(hidden_a, WORLD)
+    expected_b = ring_all_reduce_reference(hidden_b, WORLD)
+    expected_rs = column_reduce_scatter_reference(latent, WORLD, "fp32")
+
+    def layer(ring, rank, warm: bool):
+        a1 = ring.all_reduce(hidden_a[rank], borrow_output=True)
+        a1_view = a1
+        gathered = ring.all_gather_pair(firsts[rank], seconds[rank])
+        block = ring.reduce_scatter_columns(latent[rank], wire="fp32")
+        a1_after = a1_view.clone()
+        # The MoE all-reduce consumes the attention output's buffer in place
+        # when it is the ring's static buffer (warm layers).
+        source = a1 if warm and ring.is_ring_storage(a1) else hidden_b[rank].clone()
+        source.copy_(hidden_b[rank])
+        a5 = ring.all_reduce(source, borrow_output=True)
+        return a1_after, (gathered[0].clone(), gathered[1].clone()), block.clone(), a5.clone()
+
+    def two_layers(ring, rank):
+        cold = layer(ring, rank, warm=False)
+        warm = layer(ring, rank, warm=True)
+        return cold, warm, list(ring._replay_entries)
+
+    results = emu.run(two_layers)
+    for cold, warm, keys in results:
+        for a1, gathered, block, a5 in (cold, warm):
+            assert torch.equal(a1, expected_a)
+            assert torch.equal(a5, expected_b)
+        _check_gathered([cold[1], warm[1]], firsts, seconds)
+    for rank, (cold, warm, keys) in enumerate(results):
+        assert torch.equal(cold[2], expected_rs[rank])
+        assert torch.equal(warm[2], expected_rs[rank])
+        # Both all-reduces of a layer share one entry (same numel/dtype).
+        assert sorted(k[0] for k in keys) == ["ag_pair", "ar", "rs_fp32"]
