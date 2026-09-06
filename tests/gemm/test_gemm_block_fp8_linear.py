@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import pytest
 import torch
+
+from b12x.gemm import block_fp8_linear as bfl
+from b12x.gemm._shared import block_fp8 as block_impl
 
 from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
 from b12x.gemm._shared.block_fp8 import (
@@ -48,7 +52,14 @@ def _reference_from_quantized_operands(
     w_q = pack_block_fp8_linear_weight_mxfp8(weight, scale)
     x_deq = dequantize_mxfp8_rows_torch(x_q.values, x_q.scale_rows)
     w_deq = dequantize_mxfp8_rows_torch(w_q.weight.values, w_q.weight.scale_rows)
-    return x_deq @ w_deq.T
+    reference = x_deq.double() @ w_deq.double().T
+    rounded = reference.to(x.dtype)
+    # Torch's half constructors convert through FP32; correct double rounding.
+    for direction in (-float("inf"), float("inf")):
+        adjacent = torch.nextafter(rounded, torch.full_like(rounded, direction))
+        closer = (reference - adjacent.double()).abs() < (reference - rounded.double()).abs()
+        rounded = torch.where(closer, adjacent, rounded)
+    return rounded
 
 
 def test_block_fp8_linear_matches_quantized_reference() -> None:
@@ -71,6 +82,45 @@ def test_block_fp8_linear_matches_quantized_reference() -> None:
         expected.to(actual.dtype).float(),
         rtol=0,
         atol=0,
+    )
+
+
+@pytest.mark.parametrize("tokens", [8, 9, 127, 128, 129])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_block_fp8_linear_immediate_gemm_skips_padding_initialization(
+    tokens: int, dtype: torch.dtype, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    require_b12x()
+    torch.manual_seed(20260902)
+
+    in_features, out_features = 256, 384
+    x = (
+        torch.randn((tokens, in_features), device="cuda", dtype=dtype)
+        / 4
+    ).contiguous()
+    weight, scale = _make_block_fp8_weight(out_features, in_features)
+    packed = pack_block_fp8_linear_weight_mxfp8(weight, scale)
+
+    expected = _reference_from_quantized_operands(x, weight, scale)
+    allocate = block_impl.empty_mxfp8_rows_bases
+    poison = 0
+
+    def poisoned_allocation(*args, **kwargs):
+        bases = allocate(*args, **kwargs)
+        if not kwargs.get("initialize_scales", True):
+            bases[1].fill_(poison)
+            bases[2].fill_(poison)
+        return bases
+
+    monkeypatch.setattr(block_impl, "empty_mxfp8_rows_bases", poisoned_allocation)
+    first = block_fp8_linear_mxfp8(x, packed)
+    poison = 255
+    second = block_fp8_linear_mxfp8(x, packed)
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(first, second, rtol=0, atol=0)
+    torch.testing.assert_close(
+        first.float(), expected.to(first.dtype).float(), rtol=0, atol=0
     )
 
 
@@ -170,6 +220,89 @@ def test_block_fp8_linear_scratch_binding_replays_under_cuda_graph() -> None:
     torch.cuda.synchronize()
 
     torch.testing.assert_close(actual, eager, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("tokens", [8, 9, 127, 128, 129])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_block_fp8_linear_scratch_padding_is_not_observed(
+    tokens: int, dtype: torch.dtype,
+) -> None:
+    """Poisoned M128 scale padding must not affect logical GEMM rows."""
+
+    require_b12x()
+    torch.manual_seed(20260901)
+
+    in_features, out_features = 256, 384
+    x = (
+        torch.randn((tokens, in_features), device="cuda", dtype=dtype)
+        / 4
+    ).contiguous()
+    weight, scale = _make_block_fp8_weight(out_features, in_features)
+    packed = pack_block_fp8_linear_weight_mxfp8(weight, scale)
+    plan = plan_block_fp8_linear_scratch(
+        BlockFP8LinearScratchCaps(
+            device=x.device,
+            max_tokens=tokens,
+            in_features=in_features,
+            out_features=out_features,
+            output_dtype=x.dtype,
+        )
+    )
+    scratch = tuple(
+        torch.empty(shape, dtype=dtype, device=x.device)
+        for shape, dtype in plan.shapes_and_dtypes()
+    )
+    output = torch.empty((tokens, out_features, 1), dtype=x.dtype, device=x.device)
+    binding = plan.bind(
+        scratch=scratch,
+        source=x,
+        packed_weight=packed,
+        output=output,
+    )
+
+    def run_once() -> torch.Tensor:
+        return block_fp8_linear_mxfp8(binding=binding)
+
+    scratch[0].fill_(0)
+    zero_poison = run_once().clone()
+    scratch[0].fill_(255)
+    ff_poison = run_once().clone()
+    torch.cuda.synchronize()
+
+    expected = _reference_from_quantized_operands(x, weight, scale)
+    torch.testing.assert_close(zero_poison, ff_poison, rtol=0, atol=0)
+    torch.testing.assert_close(
+        zero_poison.float(), expected.to(zero_poison.dtype).float(), rtol=0, atol=0
+    )
+
+    run_once()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run_once()
+    scratch[0].fill_(0)
+    graph.replay()
+    graph_zero = output[:, :, 0].clone()
+    scratch[0].fill_(255)
+    graph.replay()
+    graph_ff = output[:, :, 0].clone()
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(graph_zero, graph_ff, rtol=0, atol=0)
+    torch.testing.assert_close(graph_zero, zero_poison, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_block_fp8_linear_public_quantizer_preserves_scale_padding(
+    dtype: torch.dtype,
+) -> None:
+    require_b12x()
+    x = torch.randn((129, 256), device="cuda", dtype=dtype).mul_(0.25)
+    rows = bfl.quantize_input(x)
+    physical_rows = rows.scale_mma.view(torch.uint8).permute(5, 2, 1, 0, 4, 3)
+    logical_rows = physical_rows.reshape(1, 256, 8)
+    torch.testing.assert_close(logical_rows[:, :129], rows.scale_rows.view(torch.uint8))
+    assert torch.all(logical_rows[:, 129:] == 127)
 
 
 def test_block_fp8_linear_default_fused_path_captures() -> None:

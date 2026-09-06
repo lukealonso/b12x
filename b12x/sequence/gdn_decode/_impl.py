@@ -9,7 +9,7 @@ from typing import Literal
 
 import torch
 
-from b12x.policy import PolicyContext, get_auto_policy
+from b12x.policy import PolicyContext, PolicyResolution, get_auto_policy
 from b12x._lib.scratch import (
     ScratchBufferSpec,
     scratch_buffer_spec,
@@ -21,7 +21,7 @@ from b12x._lib.scratch_layout import (
     dtype_nbytes,
     materialize_scratch_view,
 )
-from ._policy import GDN_POLICY, GdnQuery
+from ._policy import GDN_POLICY, GdnConfig, GdnQuery
 
 
 GateActivation = Literal["silu", "sigmoid"]
@@ -149,12 +149,16 @@ class Plan:
     duplicate_table_offset_bytes: int
     error_code_offset_bytes: int
     _scratch_specs: tuple[ScratchBufferSpec, ...]
+    config: GdnConfig
     recurrent_block_k: int = 128
-    recurrent_block_v: int = 32
     recurrent_num_warps: int = 1
     norm_block: int = 128
     norm_num_warps: int = 4
-    policy_resolution: object | None = None
+    policy_resolution: PolicyResolution[GdnConfig] | None = None
+
+    @property
+    def recurrent_block_v(self) -> int:
+        return self.config.recurrent_block_v
 
     def scratch_specs(self) -> tuple[ScratchBufferSpec, ...]:
         return self._scratch_specs
@@ -233,8 +237,14 @@ class KdaBinding:
 def _materialize_plan(
     caps: Caps,
     *,
-    policy_resolution: object | None,
+    config: GdnConfig | None = None,
+    policy_resolution: PolicyResolution[GdnConfig] | None,
 ) -> Plan:
+    if config is None:
+        config = GdnConfig(
+            backend="triton" if caps.key_heads == caps.value_heads else "cutedsl",
+            recurrent_block_v=32,
+        )
     error_code_offset_bytes = align_up(0, SCRATCH_ALIGN_BYTES)
     cursor = error_code_offset_bytes + dtype_nbytes(torch.int32)
     duplicate_table_offset_bytes = align_up(cursor, SCRATCH_ALIGN_BYTES)
@@ -251,6 +261,7 @@ def _materialize_plan(
         duplicate_table_offset_bytes=duplicate_table_offset_bytes,
         error_code_offset_bytes=error_code_offset_bytes,
         _scratch_specs=(spec,),
+        config=config,
         policy_resolution=policy_resolution,
     )
 
@@ -277,7 +288,11 @@ def plan(caps: Caps, *, policy: PolicyContext | None = None) -> Plan:
             state_index_columns=caps.state_index_columns,
         ),
     )
-    return _materialize_plan(caps, policy_resolution=resolution)
+    return _materialize_plan(
+        caps,
+        config=resolution.config,
+        policy_resolution=resolution,
+    )
 
 
 def _require_tensor(

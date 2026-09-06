@@ -313,8 +313,8 @@ def _block_fp8_linear_x_q_from_scratch(
         shape=layout.x_scale_mma_physical_shape,
         dtype=torch.uint8,
     )
-    x_scale_rows_u8.fill_(127)
-    x_scale_mma_u8.fill_(127)
+    # Quantization overwrites every scale contributing to a logical output row.
+    # Leave M128 padding unspecified to avoid two CUDA fills when binding scratch.
     x_scale_mma = x_scale_mma_u8.view(torch.float8_e8m0fnu).permute(
         3,
         4,
@@ -574,6 +574,44 @@ def quantize_block_fp8_linear_input_mxfp8(
     return out
 
 
+def _quantize_block_fp8_linear_input_for_immediate_gemm(
+    source_tk: torch.Tensor,
+) -> MXFP8Rows:
+    """Quantize into fresh storage whose physical padding stays unspecified.
+
+    This private path is used only inside the opaque fused linear op, where the
+    quantized rows are consumed immediately by dense GEMM and never escape to a
+    caller.  It preserves the initialized-padding semantics of the public
+    ``quantize_block_fp8_linear_input_mxfp8`` allocation API.
+    """
+
+    tokens, in_features = source_tk.shape
+    values_base, scale_rows_base, scale_physical_base = empty_mxfp8_rows_bases(
+        tokens,
+        in_features,
+        num_groups=1,
+        device=source_tk.device,
+        initialize_scales=False,
+    )
+    out = mxfp8_rows_from_bases(
+        values_base,
+        scale_rows_base,
+        scale_physical_base,
+        tokens,
+        in_features,
+        num_groups=1,
+    )
+    _run_block_fp8_quant_kernel(
+        source_tk,
+        out.values,
+        out.scale_rows,
+        out.scale_mma,
+        tokens,
+        in_features,
+    )
+    return out
+
+
 @torch.library.custom_op(
     "b12x::block_fp8_linear_mxfp8_fused",
     mutates_args=(),
@@ -604,7 +642,7 @@ def _block_fp8_linear_mxfp8_fused_op(
             sfb_k_replicated=True,
             stream=stream_int,
         )[:, :, 0]
-    x_q = quantize_block_fp8_linear_input_mxfp8(source_2d)
+    x_q = _quantize_block_fp8_linear_input_for_immediate_gemm(source_2d)
     return dense_gemm(
         (x_q.values.reshape(tokens, in_features, 1), x_q.scale_mma),
         (weight_values.reshape(out_features, in_features, 1), weight_scale_mma),
