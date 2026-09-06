@@ -12,9 +12,21 @@ each kernel and measures, against the correctly rounded fp64 sum:
 * the largest error in bf16 ulps and the relative L2 error,
 * elements on which the kernels differ from each other.
 
+The DMA ring appears as one kernel per configuration: ``dma-ring`` is the
+served ring, ``dma-ring-granule`` its row-count-invariant chunk mapping
+(``--dma-granule-rows``), and ``dma-ring-granule-fp32hP`` that mapping with
+``P`` trailing fp32 reduce-scatter hops. ``--split-check`` additionally
+reduces the two row halves of each sample separately and counts the elements
+on which the halves differ from the whole all-reduce, which is the property
+the granule mapping exists for.
+
 The result is a JSON record per kernel (rank 0 prints and writes it).
 
     B12X_RUN_PCIE_TP9_TEST=1 python benchmarks/precision_pcie_tp9_allreduce.py --output out.json
+    B12X_RUN_PCIE_TP9_TEST=1 python benchmarks/precision_pcie_tp9_allreduce.py \
+        --rows 4608 --width 7168 --samples 4 --split-check --output r1-4608.json
+    B12X_RUN_PCIE_TP9_TEST=1 python benchmarks/precision_pcie_tp9_allreduce.py \
+        --rows 2304 --width 7168 --samples 4 --output r1-2304.json
 """
 
 from __future__ import annotations
@@ -51,7 +63,18 @@ def _ulps(actual: torch.Tensor, reference: torch.Tensor) -> torch.Tensor:
     return (actual.float() - reference.float()).abs() / ulp
 
 
+def _dma_variants(args: argparse.Namespace) -> list[tuple[str, int, int]]:
+    """(name, granule rows, fp32 hops) of every requested DMA ring channel."""
+    variants = [("dma-ring", 0, 0), ("dma-ring-granule", args.dma_granule_rows, 0)]
+    for hops in args.dma_fp32_hops:
+        variants.append(
+            (f"dma-ring-granule-fp32h{hops}", args.dma_granule_rows, hops)
+        )
+    return variants
+
+
 def _worker(rank: int, port: int, args: argparse.Namespace) -> None:
+    from b12x.comm.pcie.pcie_dma import PCIeDmaAllReduce
     from b12x.comm.pcie.pcie_island9 import PCIeIsland9AllReduce
     from b12x.comm.pcie.pcie_oneshot import PCIeOneshotAllReducePool
     from b12x.comm.pcie.pcie_twoshot_bf16 import PCIeTwoShotBF16
@@ -87,6 +110,23 @@ def _worker(rank: int, port: int, args: argparse.Namespace) -> None:
         exchange_group=group, device=device, max_rows=49149, row_elems=8,
     )
     kernels["island9-push"] = lambda inp, out: island9.all_reduce(inp, out=out)
+    rings = {}
+    for name, granule_rows, hops in _dma_variants(args):
+        ring = PCIeDmaAllReduce(
+            exchange_group=group,
+            device=device,
+            max_bytes=rows * width * 2,
+            granule_rows=granule_rows,
+            fp32_hops=hops,
+        )
+        rings[name] = ring
+        kernels[name] = lambda inp, out, ring=ring: ring.all_reduce(inp, out=out)
+    if args.kernels != "all":
+        selected = set(args.kernels.split(","))
+        unknown = selected - set(kernels)
+        if unknown:
+            raise SystemExit(f"unknown kernels: {sorted(unknown)}")
+        kernels = {name: call for name, call in kernels.items() if name in selected}
 
     for seed in range(args.samples):
         inp = _activations(rows, width, rank, seed, device)
@@ -109,9 +149,27 @@ def _worker(rank: int, port: int, args: argparse.Namespace) -> None:
             err = (out.double() - reference64).norm() / reference64.norm().clamp_min(1e-30)
             record["rel_l2_sum"] += float(err.item())
             record["samples"] += 1
+            if args.split_check and name in rings:
+                half = rows // 2
+                halves = torch.empty_like(inp)
+                rings[name].all_reduce(inp[:half].contiguous(), out=halves[:half])
+                rings[name].all_reduce(inp[half:].contiguous(), out=halves[half:])
+                torch.cuda.synchronize(device)
+                record["split_mismatch_elements"] = record.get(
+                    "split_mismatch_elements", 0
+                ) + int((halves != out).sum().item())
+                split_err = (halves.double() - reference64).norm() / reference64.norm(
+                ).clamp_min(1e-30)
+                record["split_rel_l2_sum"] = record.get("split_rel_l2_sum", 0.0) + float(
+                    split_err.item()
+                )
     for name, record in results.items():
         record["rel_l2_mean"] = record["rel_l2_sum"] / max(record["samples"], 1)
         del record["rel_l2_sum"]
+        if "split_rel_l2_sum" in record:
+            record["split_rel_l2_mean"] = record.pop("split_rel_l2_sum") / max(
+                record["samples"], 1
+            )
     names = list(kernels)
     cross = {}
     for i, a in enumerate(names):
@@ -129,8 +187,11 @@ def _worker(rank: int, port: int, args: argparse.Namespace) -> None:
         consistency[name] = mismatch
     twoshot.close()
     island9.close()
+    for ring in rings.values():
+        ring.close()
     if rank == 0:
         summary = {"rows": rows, "width": width, "samples": args.samples,
+                   "dma_granule_rows": args.dma_granule_rows,
                    "per_kernel": results, "kernels_differ_on": cross,
                    "cross_rank_inconsistent_elements": consistency}
         print(json.dumps(summary, indent=2), flush=True)
@@ -147,7 +208,34 @@ def main() -> None:
     parser.add_argument("--width", type=int, default=7168)
     parser.add_argument("--samples", type=int, default=64)
     parser.add_argument("--output", default="")
+    parser.add_argument(
+        "--kernels",
+        default="all",
+        help="comma-separated kernel names to run (default: all)",
+    )
+    parser.add_argument(
+        "--dma-granule-rows",
+        type=int,
+        default=128,
+        help="rows per granule of the DMA ring's row-count-invariant mapping",
+    )
+    parser.add_argument(
+        "--dma-fp32-hops",
+        default="1,2,3,7",
+        help="trailing fp32 reduce-scatter hop counts to measure",
+    )
+    parser.add_argument(
+        "--split-check",
+        action="store_true",
+        help="also reduce the two row halves of every sample and count the "
+        "elements on which they differ from the whole all-reduce",
+    )
     args = parser.parse_args()
+    args.dma_fp32_hops = [
+        int(value) for value in args.dma_fp32_hops.split(",") if value.strip()
+    ]
+    if args.split_check and args.rows % 2:
+        raise SystemExit("--split-check needs an even row count")
     if os.getenv("B12X_RUN_PCIE_TP9_TEST") != "1":
         raise SystemExit("requires nine idle GPUs and B12X_RUN_PCIE_TP9_TEST=1")
     with socket.socket() as probe:
