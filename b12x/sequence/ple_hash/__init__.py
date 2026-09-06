@@ -5,6 +5,11 @@ geometry together with serving capacity. ``bind`` maps caller-owned runtime
 tensors and scratch without allocation. ``run`` will write logical embedding
 IDs while leaving committed history immutable.
 
+Checkpoint multiplier indices denote token lag: the hash of an order-``n``
+window is ``xor(token[t-i] * multipliers[i] for i in range(n))``. Predecessors
+behind an EOS boundary are replaced by EOS before hashing. Chronological
+history buffers retain oldest-to-current storage order.
+
 Exact PyTorch oracles are available from
 :mod:`b12x.sequence.ple_hash.reference` and are never runtime fallbacks.
 """
