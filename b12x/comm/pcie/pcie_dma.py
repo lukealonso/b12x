@@ -29,6 +29,7 @@ from .pcie_dma_reference import (
     granule_elems_for,
     piece_offset_elems,
     ring_schedule,
+    scratch_step_widths,
 )
 from .pcie_oneshot import PCIeOneshotAllReduce, _normalize_device
 
@@ -163,6 +164,26 @@ def _ring_granule_rows() -> int:
     return max(0, int(os.getenv("B12X_PCIE_RING_GRANULE_ROWS", "0")))
 
 
+def _ring_fp32_hops() -> int:
+    """Opt-in fp32 partial sums on the trailing reduce-scatter hops.
+
+    The served ring stores every reduce-scatter add as bf16, so a nine-rank
+    sum is rounded eight times. With ``B12X_PCIE_RING_FP32_HOPS=p``
+    (``1 <= p <= world - 2``) the last ``p`` reduce-scatter hops carry the
+    running sum as fp32 and the adds feeding them keep fp32: an element is
+    rounded ``world - 1 - p`` times, once at ``p = world - 2`` (fp32
+    accumulation in ring order, the precision class of the two-shot
+    all-reduce). The first hop always sends the caller's bf16 input, so
+    ``p = world - 2`` is the full fp32 wire. Link bytes grow by
+    ``p / (2 * (world - 1))`` of the served all-reduce bytes (``p / 16`` at
+    nine ranks: +6.25 % per hop, +43.75 % for the full fp32 wire) and the
+    scratch slab grows by ``p`` shard capacities. bf16 inputs only; the
+    served bf16 schedule is used for other dtypes and for compressed wires.
+    0 (default): served bf16 hops.
+    """
+    return max(0, int(os.getenv("B12X_PCIE_RING_FP32_HOPS", "0")))
+
+
 def _graph_replay_mode() -> bool:
     """Opt-in CUDA-graph replay of eager ring all-reduces.
 
@@ -221,6 +242,7 @@ class PCIeDmaAllReduce:
         ext_module=None,
         fp8: Optional[str] = None,
         granule_rows: Optional[int] = None,
+        fp32_hops: Optional[int] = None,
     ) -> None:
         # Kept only as a source-compatible keyword for callers that used to
         # inject the removed C++ extension.  Device work is always CuTe DSL.
@@ -230,6 +252,9 @@ class PCIeDmaAllReduce:
             max(0, int(granule_rows))
             if granule_rows is not None
             else _ring_granule_rows()
+        )
+        requested_hops = (
+            max(0, int(fp32_hops)) if fp32_hops is not None else _ring_fp32_hops()
         )
         self.group = exchange_group
         self.rank = dist.get_rank(group=exchange_group)
@@ -261,14 +286,25 @@ class PCIeDmaAllReduce:
         self.shard_capacity = _align_up(
             (self.max_bytes + self.world_size - 1) // self.world_size, SCRATCH_ALIGN
         )
-        steps = 2 * (self.world_size - 1)
+        self._fp32_hops = min(requested_hops, self.world_size - 2)
+        self._scratch_offsets, scratch_bytes = self._scratch_layout(
+            self.shard_capacity, self.world_size, self._fp32_hops
+        )
         flags_bytes = FLAG_SLOTS * FLAG_STRIDE
-        slab_bytes = flags_bytes + steps * self.shard_capacity
+        slab_bytes = flags_bytes + scratch_bytes
         self._slab = PCIeOneshotAllReduce._allocate_shared_buffer(
             exchange_group, slab_bytes, zero_fill=True, ipc=self._ipc
         )
         self._flags_base = list(self._slab.peer_ptrs)
         self._scratch_base = [ptr + flags_bytes for ptr in self._slab.peer_ptrs]
+        # Local (not IPC) fp32 running sums of the first fp32-kept add: that
+        # add receives a bf16 piece and cannot widen it in place, so its
+        # result lives here until the next hop's copy has sent it.
+        self._fp32_stage = (
+            torch.empty(2 * self.shard_capacity, dtype=torch.uint8, device=self.device)
+            if self._fp32_hops
+            else None
+        )
         # Device-resident monotonic counters: one per flag slot for the
         # publisher role and one for the waiter role.
         self._send_counters = torch.zeros(
@@ -348,13 +384,16 @@ class PCIeDmaAllReduce:
             self._fp8, f"fp8-{self._fp8}" if self._fp8 else "bf16"
         )
         logger.debug(
-            "[PCIe DMA allreduce] wire mode: %s, granule rows: %d",
+            "[PCIe DMA allreduce] wire mode: %s, granule rows: %d, fp32 hops: %d",
             self.wire_mode,
             self._granule_rows,
+            self._fp32_hops,
         )
         prepare = getattr(self._kernels, "prepare", None)
         if prepare is not None:
             prepare(world_size=self.world_size, wire_mode=self._fp8)
+            if self._fp32_hops:
+                self._kernels.prepare_reduce_scatter(wire="fp32")
         if logger.isEnabledFor(logging.DEBUG):
             self._log_peer_copy_bandwidth()
 
@@ -421,7 +460,23 @@ class PCIeDmaAllReduce:
         return counters.data_ptr() + slot * 4
 
     def _scratch_ptr(self, rank: int, step: int) -> int:
-        return self._scratch_base[rank] + step * self.shard_capacity
+        return self._scratch_base[rank] + self._scratch_offsets[step]
+
+    @staticmethod
+    def _scratch_layout(
+        shard_capacity: int, world: int, fp32_hops: int
+    ) -> tuple[tuple[int, ...], int]:
+        """Byte offset of every step's scratch area and the total scratch
+        bytes. Every area holds one shard capacity, except the areas of the
+        ``fp32_hops`` trailing reduce-scatter steps, which receive fp32
+        running sums and hold two. With ``fp32_hops == 0`` this is the
+        served layout ``step * shard_capacity``."""
+        offsets = []
+        total = 0
+        for width in scratch_step_widths(world, fp32_hops):
+            offsets.append(total)
+            total += width * shard_capacity
+        return tuple(offsets), total
 
     def _granule_elems(self, inp: torch.Tensor) -> int:
         """Elements per granule of the row-count-invariant mapping for
@@ -444,6 +499,13 @@ class PCIeDmaAllReduce:
         with granules off the key reduces to the served (numel, dtype).
         """
         return (inp.numel(), inp.dtype, self._granule_elems(inp))
+
+    def _fp32_hops_for(self, inp: torch.Tensor) -> int:
+        """fp32 reduce-scatter hops applied to ``inp`` (bf16, lossless wire
+        only; 0 otherwise)."""
+        if self._fp8 or inp.dtype != torch.bfloat16:
+            return 0
+        return self._fp32_hops
 
     @staticmethod
     def _pick_pieces(shard_elems: int, shard_bytes: int) -> int:
@@ -603,8 +665,11 @@ class PCIeDmaAllReduce:
     ) -> torch.Tensor:
         """Reduce equal, eight-element-aligned shards into the supplied output."""
         granule_elems = self._granule_elems(inp)
-        if granule_elems:
-            return self._all_reduce_lossless(inp, out, granule_elems=granule_elems)
+        fp32_hops = self._fp32_hops_for(inp)
+        if granule_elems or fp32_hops:
+            return self._all_reduce_lossless(
+                inp, out, granule_elems=granule_elems, fp32_hops=fp32_hops
+            )
         kernels = self._kernels
         world = self.world_size
         rank = self.rank
@@ -865,8 +930,10 @@ class PCIeDmaAllReduce:
         out: torch.Tensor,
         *,
         granule_elems: int = 0,
+        fp32_hops: int = 0,
     ) -> torch.Tensor:
-        """Lossless ring all-reduce with a selectable chunk-to-element mapping.
+        """Lossless ring all-reduce with a selectable chunk-to-element mapping
+        and fp32 running sums on the trailing reduce-scatter hops.
 
         The step table comes from ``ring_schedule`` and the element mapping
         from ``piece_offset_elems``, which the CPU proofs execute as well, so
@@ -875,14 +942,19 @@ class PCIeDmaAllReduce:
         on its lossless path: one CE copy on the copy stream, one flag on the
         flag stream, one wait plus one add (reduce-scatter) or placement copy
         (all-gather) on the main stream, and one neighbour handshake at the
-        end. Only the mapping differs:
+        end. Two things can differ from the served schedule:
 
-        * ``granule_elems == 0``: the served contiguous mapping, chunk ``c``
-          is elements ``[c * shard, (c + 1) * shard)`` cut into
-          ``_pick_pieces`` pieces.
-        * ``granule_elems > 0``: a piece is one granule and granule ``b`` of
-          the flat buffer belongs to chunk ``b % world``, which fixes the
-          number of pieces at ``shard_elems / granule_elems``.
+        * Mapping. ``granule_elems == 0``: the served contiguous mapping,
+          chunk ``c`` is elements ``[c * shard, (c + 1) * shard)`` cut into
+          ``_pick_pieces`` pieces. ``granule_elems > 0``: a piece is one
+          granule and granule ``b`` of the flat buffer belongs to chunk
+          ``b % world``, which fixes the number of pieces at
+          ``shard_elems / granule_elems``.
+        * Precision. With ``fp32_hops = p > 0`` the payloads of the last
+          ``p`` reduce-scatter steps are fp32 running sums (twice the bytes,
+          twice the receive area) and the adds that produce them keep fp32,
+          so an element is rounded to bf16 ``world - 1 - p`` times instead of
+          ``world - 1``. The final add always rounds once into ``out``.
 
         Scratch, flag slots and events are the ones ``_all_reduce_aligned``
         uses; the two schedules never run concurrently on one channel.
@@ -896,6 +968,18 @@ class PCIeDmaAllReduce:
         elem = inp.element_size()
         shard_elems = inp.numel() // world
         shard_bytes = shard_elems * elem
+        if fp32_hops:
+            if inp.dtype != torch.bfloat16:
+                raise ValueError("fp32 reduce-scatter hops need bf16 inputs")
+            if not 0 < fp32_hops <= world - 2:
+                raise ValueError(
+                    f"fp32 hops must lie in [1, {world - 2}], got {fp32_hops}"
+                )
+            if fp32_hops > self._fp32_hops or self._fp32_stage is None:
+                raise ValueError(
+                    f"channel was built for {self._fp32_hops} fp32 hops, "
+                    f"{fp32_hops} requested"
+                )
         if granule_elems:
             if shard_elems % granule_elems:
                 raise ValueError(
@@ -911,7 +995,12 @@ class PCIeDmaAllReduce:
             pieces = self._pick_pieces(shard_elems, shard_bytes)
         piece_elems = shard_elems // pieces
         piece_bytes = piece_elems * elem
-        schedule = ring_schedule(world)
+        schedule = ring_schedule(world, fp32_hops)
+        # Receive-area stride of every step: an fp32 running sum needs two
+        # bytes per bf16 element, matching ``_scratch_layout``.
+        area_stride = tuple(
+            2 * piece_bytes if step.payload_fp32 else piece_bytes for step in schedule
+        )
 
         main = torch.cuda.current_stream(self.device)
         copy_stream = self._copy_stream
@@ -920,6 +1009,7 @@ class PCIeDmaAllReduce:
         copied = self._copied_events
         base = out.data_ptr()
         in_base = inp.data_ptr()
+        stage_base = self._fp32_stage.data_ptr() if fp32_hops else 0
         self._input_ready.record(main)
         copy_stream.wait_event(self._input_ready)
         flag_stream.wait_event(self._input_ready)
@@ -944,23 +1034,32 @@ class PCIeDmaAllReduce:
             return in_base + piece_offset(chunk, piece)
 
         def scratch_piece(owner: int, step: int, piece: int) -> int:
-            return self._scratch_ptr(owner, step) + piece * piece_bytes
+            return self._scratch_ptr(owner, step) + piece * area_stride[step]
+
+        def stage_ptr(piece: int) -> int:
+            return stage_base + piece * 2 * piece_bytes
+
+        def buffer_ptr(name: str, step: int, chunk: int, piece: int) -> int:
+            if name == "input":
+                return in_piece_ptr(chunk, piece)
+            if name == "out":
+                return piece_ptr(chunk, piece)
+            if name == "stage":
+                return stage_ptr(piece)
+            return scratch_piece(rank, step, piece)
 
         for step in schedule:
             k = step.step
             send_chunk = (rank + step.send_offset) % world
             recv_chunk = (rank + step.recv_offset) % world
+            send_bytes = 2 * piece_bytes if step.payload_fp32 else piece_bytes
             for p in range(pieces):
-                send_src = (
-                    in_piece_ptr(send_chunk, p)
-                    if step.send_from == "input"
-                    else piece_ptr(send_chunk, p)
-                )
+                send_src = buffer_ptr(step.send_from, step.send_step, send_chunk, p)
                 slot = k * pieces + p
                 with torch.cuda.stream(copy_stream):
                     if k > 0:
                         copy_stream.wait_event(add_done[p])
-                    kernels.dma_copy(scratch_piece(nxt, k, p), send_src, piece_bytes)
+                    kernels.dma_copy(scratch_piece(nxt, k, p), send_src, send_bytes)
                     copied[slot].record(copy_stream)
                 with torch.cuda.stream(flag_stream):
                     flag_stream.wait_event(copied[slot])
@@ -979,6 +1078,14 @@ class PCIeDmaAllReduce:
                         scratch_piece(rank, k, p),
                         piece_elems,
                         dtype_code,
+                    )
+                elif step.op == "add_mixed":
+                    kernels.dma_add_mixed(
+                        buffer_ptr(step.sum_to, k, recv_chunk, p),
+                        in_piece_ptr(recv_chunk, p),
+                        scratch_piece(rank, k, p),
+                        piece_elems,
+                        step.add_mode,
                     )
                 else:
                     kernels.dma_copy(
