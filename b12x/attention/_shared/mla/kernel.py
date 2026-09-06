@@ -60,9 +60,10 @@ from .smem import get_unified_shared_storage_cls, make_smem_layout
 from .traits import (
     ModelType,
     ScaleFormat,
-    infer_model_type,
+    UnifiedMLATraits,
     is_glm_model_type,
     make_unified_traits,
+    resolve_unplanned_traits,
 )
 
 # natural-log of 2 (base2 <-> natural LSE conversion).
@@ -79,7 +80,6 @@ _DSV4_HEAD_DIM = 512
 _GLM_HEAD_DIM = 576
 # GLM per-token packed cache record (reference.pack_mla_kv_cache_reference).
 _GLM_KV_GMEM_STRIDE = 656
-_GLM_NEXT_KV_GMEM_STRIDE = 528
 # DSV4 H8 packs the contiguous 576-byte data record into a 592-byte smem row.
 # The 16-byte pad preserves KV_SMEM_STRIDE/4 % 32 == 20, matching the generic
 # 464-byte row's bank rotation while allowing one bulk copy per candidate.
@@ -458,13 +458,15 @@ class UnifiedDecodeKernel:
             and int(traits.scale_format) == int(ScaleFormat.ARBITRARY_FP32)
             and not self.native_glm_h8
         )
-        self.packed_io = self.native_h8 or self.packed_glm_next or self.packed_glm_generic
+        self.packed_io = (
+            self.native_h8 or self.packed_glm_next or self.packed_glm_generic
+        )
         # First-chunk copies may be issued before the per-token length is
         # known only when the first active chunk is fixed (no extra section).
         self.speculative_first_chunk = self.packed_io and not bool(has_extra)
         # Global bytes per candidate record copied by the packed producer.
         if self.packed_glm_next:
-            self.packed_record_bytes = _GLM_NEXT_KV_GMEM_STRIDE
+            self.packed_record_bytes = int(traits.kv_gmem_stride)
         elif self.native_glm_h8 or self.packed_glm_generic:
             self.packed_record_bytes = _GLM_KV_GMEM_STRIDE
         else:
@@ -1055,7 +1057,9 @@ class UnifiedDecodeKernel:
                 main_cap = Int32(self.topk if self.topk > 0 else 1)
                 if cutlass.const_expr(has_extra):
                     if pre_ci >= num_main_chunks:
-                        pc = (pre_ci - num_main_chunks) * Int32(_CAND_WINDOW) + io_lane_pre
+                        pc = (pre_ci - num_main_chunks) * Int32(
+                            _CAND_WINDOW
+                        ) + io_lane_pre
                         if pc < Int32(self.extra_topk):
                             pre_idx0 = Int32(extra_row[pc])
                         if pc + Int32(32) < Int32(self.extra_topk):
@@ -1084,11 +1088,15 @@ class UnifiedDecodeKernel:
                     # burn bandwidth. An empty split still waits on the stage
                     # before it exits, which completes at once with no copies
                     # in flight.
-                    spec_valid_chunks = (section_len + Int32(_CAND_WINDOW - 1)) // Int32(
-                        _CAND_WINDOW
-                    )
-                    if spec_valid_chunks > Int32((self.topk + _CAND_WINDOW - 1) // _CAND_WINDOW):
-                        spec_valid_chunks = Int32((self.topk + _CAND_WINDOW - 1) // _CAND_WINDOW)
+                    spec_valid_chunks = (
+                        section_len + Int32(_CAND_WINDOW - 1)
+                    ) // Int32(_CAND_WINDOW)
+                    if spec_valid_chunks > Int32(
+                        (self.topk + _CAND_WINDOW - 1) // _CAND_WINDOW
+                    ):
+                        spec_valid_chunks = Int32(
+                            (self.topk + _CAND_WINDOW - 1) // _CAND_WINDOW
+                        )
                     if pre_ci < spec_valid_chunks:
                         io_issue_packed_payload(
                             kv_cache_u8,
@@ -1669,7 +1677,9 @@ class UnifiedDecodeKernel:
                         q_rope_stride=L.q_rope_stride,
                         fp8_rope=t.fp8_rope,
                         kv_rope_stride_bytes=(
-                            staged_kv_stride if self.packed_glm_generic else t.d_rope * 2
+                            staged_kv_stride
+                            if self.packed_glm_generic
+                            else t.d_rope * 2
                         ),
                     )
 
@@ -2389,6 +2399,7 @@ def run_unified_decode(
     model_type_override: int | None = None,
     fp8_rope_override: bool | None = None,
     latent_scale_per_token: bool = False,
+    traits_override: UnifiedMLATraits | None = None,
 ):
     """Active SM120 sparse-MLA decode: kernel (split-K partials) + merge.
 
@@ -2495,55 +2506,20 @@ def run_unified_decode(
     rem_heads = heads % hpb
     h_blocks = h_blocks_full + (1 if rem_heads else 0)
 
-    model_type, compute_mode, scale_format = infer_model_type(
-        q_head_dim,
-        swa_k_cache.dtype,
-        model_type=model_type_override,
-    )
-    if scale_format_override is not None:
-        scale_format = int(scale_format_override)
-    if scale_format == ScaleFormat.NVFP4_E4M3 and fp8_rope_override is None:
-        record_bytes = int(swa_k_cache.shape[-1])
-        if record_bytes not in (368, 432):
-            raise ValueError(
-                f"NVFP4 cache record must be 368 or 432 bytes, got {record_bytes}"
-            )
-        fp8_rope_override = record_bytes == 368
-    # FAIL-CLOSED: the per-token fp32 latent scale lives at bytes [292, 296) of
-    # the NVFP4 fp8-rope 368-byte record ONLY.
-    if latent_scale_per_token:
-        if scale_format != ScaleFormat.NVFP4_E4M3:
-            raise ValueError(
-                "SM120 sparse MLA decode latent_scale_per_token requires "
-                f"ScaleFormat.NVFP4_E4M3; got scale_format={int(scale_format)}"
-            )
-        if not bool(fp8_rope_override):
-            raise ValueError(
-                "SM120 sparse MLA decode latent_scale_per_token requires the "
-                "fp8-rope 368-byte NVFP4 record; got the 432-byte record"
-            )
-    traits = make_unified_traits(
-        model_type,
-        compute_mode,
-        scale_format,
-        fp8_rope=fp8_rope_override,
-        latent_scale_per_token=bool(latent_scale_per_token),
-    )
-    if int(model_type) == int(ModelType.GLM_NEXT) and int(
-        swa_k_cache.shape[-1]
-    ) != _GLM_NEXT_KV_GMEM_STRIDE:
-        raise ValueError(
-            "GLM_NEXT sparse MLA cache record must be 528 bytes, got "
-            f"{int(swa_k_cache.shape[-1])}"
+    if traits_override is None:
+        traits = resolve_unplanned_traits(
+            q_head_dim,
+            swa_k_cache.dtype,
+            int(swa_k_cache.shape[-1]),
+            model_type=model_type_override,
+            scale_format=scale_format_override,
+            fp8_rope=fp8_rope_override,
+            latent_scale_per_token=bool(latent_scale_per_token),
         )
-    if scale_format == ScaleFormat.NVFP4_E4M3 and int(swa_k_cache.shape[-1]) != int(
-        traits.kv_gmem_stride
-    ):
-        raise ValueError(
-            "NVFP4 cache record width disagrees with fp8_rope_override: "
-            f"got {int(swa_k_cache.shape[-1])} bytes, expected "
-            f"{int(traits.kv_gmem_stride)}"
-        )
+        model_type = int(traits.model_type)
+    else:
+        traits = traits_override
+        model_type = int(traits.model_type)
     d_v = int(traits.d_v)  # output O dim (512 for both; V == nope for GLM)
 
     topk = int(swa_indices.shape[1])
@@ -2831,7 +2807,7 @@ def run_unified_decode(
             int(head_block_offset),
             bool(has_extra),
             bool(per_token_len),
-            bool(latent_scale_per_token),
+            bool(traits.latent_scale_per_token),
         )
 
     if h_blocks_full > 0:
@@ -2874,21 +2850,20 @@ def run_unified_decode(
         _final_lse_from_split_workspace,
     )
 
-    lse_natural = _final_lse_from_split_workspace(
+    lse = _final_lse_from_split_workspace(
         workspace=workspace,
         q_rows=rows,
         num_heads=heads,
         launch_num_chunks=num_splits,
-        scale="natural",
+        scale=("natural" if attn_sink is not None else lse_scale),
     )
     if attn_sink is not None:
         # Fold the per-head sink into the LSE in the natural-log domain (the merge
         # already folded it into O): lse' = log(exp(lse) + exp(sink)).
-        sink = attn_sink.float().view(1, heads)
-        lse_natural = torch.logaddexp(lse_natural.float(), sink)
-    if lse_scale == "base2":
-        return output, (lse_natural / _LN2)
-    return output, lse_natural
+        torch.logaddexp(lse, attn_sink.view(1, heads), out=lse)
+        if lse_scale == "base2":
+            lse.div_(_LN2)
+    return output, lse
 
 
 def run_unified_prefill(*args, **kwargs):

@@ -36,9 +36,13 @@ from b12x._lib.dense_gemm import dense_gemm
 from b12x.gemm._shared.wo_mxfp8 import empty_mxfp8_rows_for_dense_gemm
 from benchmarks.common import make_l2_flush_fn, resolve_l2_flush_bytes
 
-from flashinfer import mxfp8_quantize
-from flashinfer.gemm import gemm_fp8_nt_groupwise, mm_fp4, mm_mxfp8
-from flashinfer.tllm_enums import SfLayout
+try:
+    from flashinfer import mxfp8_quantize
+    from flashinfer.gemm import gemm_fp8_nt_groupwise, mm_fp4, mm_mxfp8
+    from flashinfer.tllm_enums import SfLayout
+    _FLASHINFER_IMPORT_ERROR = None
+except ImportError as exc:
+    _FLASHINFER_IMPORT_ERROR = str(exc)
 
 
 # Nemotron 3 Super shared expert down projection from the released NVFP4
@@ -741,6 +745,8 @@ def main():
     )
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--iters", type=int, default=100)
+    parser.add_argument("--evidence", type=pathlib.Path, help="JSONL evidence output for A16 comparisons.")
+    parser.add_argument("--tune-a16", action="store_true", help="Race the 16 A16 tile/split configurations.")
     parser.add_argument(
         "--batch-sizes",
         type=int,
@@ -761,7 +767,7 @@ def main():
     )
     parser.add_argument(
         "--dtype",
-        choices=("fp4", "fp8", "fp8-block", "fp8-e2e", "all"),
+        choices=("fp4", "fp8", "fp8-block", "fp8-e2e", "fp4-a16", "fp8-a16", "all"),
         default="fp4",
         help=(
             "Benchmark NVFP4, prequantized MXFP8, regular K128 block FP8, "
@@ -801,6 +807,17 @@ def main():
         raise ValueError("--n and --k must be provided together")
     if args.n is not None and (args.n <= 0 or args.k <= 0):
         raise ValueError("--n and --k must be positive")
+
+    if args.dtype in ("fp4-a16", "fp8-a16"):
+        from benchmarks.benchmark_blockscaled_precision import run
+        specs = ([(args.shape_name, args.k, args.n, "explicit CLI shape")]
+                 if args.n is not None else
+                 QWEN38_27B_GEMM_SPECS if args.profile == QWEN38_27B_PROFILE else
+                 [*FP4_GEMM_SPECS, *FP8_GEMM_SPECS, *QWEN38_27B_GEMM_SPECS])
+        run(args, specs, flashinfer_error=_FLASHINFER_IMPORT_ERROR)
+        return
+    if _FLASHINFER_IMPORT_ERROR is not None:
+        raise RuntimeError(f"FlashInfer reference unavailable: {_FLASHINFER_IMPORT_ERROR}")
 
     custom_specs = None
     if args.n is not None:

@@ -759,6 +759,62 @@ def test_op_cuda_graph_replay_is_allocation_free_with_poison() -> None:
     assert torch.isnan(binding.output[inputs["num_tokens"] :].float()).all()
 
 
+def test_op_three_window_ring_reuse_is_capture_safe() -> None:
+    """Three populated windows preserve results and fixed storage on replay."""
+    from ..conftest import require_b12x
+    from b12x.policy import PolicyContext, PolicyMode
+    from b12x.policy.components import KDA_PREFILL
+    from b12x.sequence.kda_prefill import KdaPrefillConfig
+
+    device = require_b12x()
+    inputs = make_inputs(lengths=[160], heads=2, seed=74, device=device, state_slots=4)
+    policy = PolicyContext.for_device(device, mode=PolicyMode.HEURISTIC_ONLY).with_override(
+        KDA_PREFILL,
+        KdaPrefillConfig(v_split=64, k_split=1, stages=3, window_tiles=4),
+    )
+    binding, tensors = make_binding(inputs, max_tokens=160, max_seqs=1, policy=policy)
+
+    assert binding.plan.window_tiles == 4
+    assert binding.plan.launched_windows(inputs["num_tokens"], inputs["num_seqs"]) == 3
+    scratch_capacity = binding.scratch.numel()
+    addresses = (
+        tensors["recurrent_state"].data_ptr(),
+        binding.output.data_ptr(),
+        binding.scratch.data_ptr(),
+        binding.ws.data_ptr(),
+    )
+
+    _run(binding, inputs)
+    torch.cuda.synchronize(device)
+    assert binding.error_code.item() == 0
+    _assert_op_matches_oracle(binding, tensors, inputs)
+
+    tensors["recurrent_state"].copy_(inputs["pool"])
+    binding.output.zero_()
+    binding.scratch.zero_()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        _run(binding, inputs)
+
+    tensors["recurrent_state"].copy_(inputs["pool"])
+    binding.output.fill_(float("nan"))
+    binding.scratch.fill_(0xFF)
+    allocated_before = torch.cuda.memory_allocated(device)
+    graph.replay()
+    torch.cuda.synchronize(device)
+
+    assert torch.cuda.memory_allocated(device) == allocated_before
+    assert binding.scratch.numel() == scratch_capacity
+    assert addresses == (
+        tensors["recurrent_state"].data_ptr(),
+        binding.output.data_ptr(),
+        binding.scratch.data_ptr(),
+        binding.ws.data_ptr(),
+    )
+    assert binding.error_code.item() == 0
+    _assert_op_matches_oracle(binding, tensors, inputs)
+
+
 def test_op_cuda_graph_replay_uses_device_metadata() -> None:
     from ..conftest import require_b12x
 

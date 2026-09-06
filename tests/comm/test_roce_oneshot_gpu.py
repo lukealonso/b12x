@@ -584,6 +584,78 @@ def test_all_gather_rejects_ineligible(runtime):
             )
 
 
+def test_all_gather_graph_replay_with_alternating_grid_sizes(runtime):
+    """Tiny (top-k) and large (logits) gathers may alternate in one graph.
+
+    The gather grid follows the shard size like the all-reduce grid, and each
+    power-of-two grid owns its arrival counters, so a one-block gather may sit
+    between full-grid gathers and reductions without sharing arrivals.
+    """
+    world = dist.get_world_size()
+    rank = dist.get_rank()
+    topk = torch.zeros(8, 64, dtype=torch.float32, device=runtime.device)
+    logits = torch.zeros(8, 38720, dtype=torch.bfloat16, device=runtime.device)
+    h = torch.zeros(8 * 4096, dtype=torch.bfloat16, device=runtime.device)
+    topk_out = torch.empty(8, 64 * world, dtype=torch.float32, device=runtime.device)
+    logits_out = torch.empty(
+        8, 38720 * world, dtype=torch.bfloat16, device=runtime.device
+    )
+    reduced = torch.empty_like(h)
+    from b12x.comm.roce import roce_oneshot
+
+    small_grid = roce_oneshot._grid_blocks(
+        topk.numel() * topk.element_size() // roce_oneshot.PACK_BYTES,
+        runtime._threads,
+        runtime._blocks,
+    )
+    large_grid = roce_oneshot._grid_blocks(
+        logits.numel() * logits.element_size() // roce_oneshot.PACK_BYTES,
+        runtime._threads,
+        runtime._blocks,
+    )
+    assert small_grid == 1
+    assert large_grid > small_grid
+    stream = torch.cuda.Stream(device=runtime.device)
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        runtime.all_gather(topk, dim=-1, out=topk_out)
+        runtime.all_gather(logits, dim=-1, out=logits_out)
+        runtime.all_reduce(h, out=reduced)
+    torch.cuda.current_stream().wait_stream(stream)
+    torch.cuda.synchronize()
+    dist.barrier()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream), runtime.capture(stream=stream):
+        runtime.all_gather(topk, dim=-1, out=topk_out)
+        runtime.all_gather(logits, dim=-1, out=logits_out)
+        runtime.all_gather(topk, dim=-1, out=topk_out)
+        runtime.all_reduce(h, out=reduced)
+        runtime.all_gather(topk, dim=-1, out=topk_out)
+    torch.cuda.synchronize()
+    dist.barrier()
+    for replay in range(24):
+        torch.manual_seed(31 * replay + rank)
+        topk.copy_(torch.randn_like(topk))
+        logits.copy_(torch.randn_like(logits))
+        h.copy_(torch.randn_like(h))
+        parts = [torch.empty_like(topk) for _ in range(world)]
+        dist.all_gather(parts, topk)
+        expected_topk = torch.cat(parts, dim=-1)
+        parts = [torch.empty_like(logits) for _ in range(world)]
+        dist.all_gather(parts, logits)
+        expected_logits = torch.cat(parts, dim=-1)
+        expected_reduce = h.clone()
+        dist.all_reduce(expected_reduce)
+        graph.replay()
+        torch.cuda.synchronize()
+        runtime.check_health()
+        assert torch.equal(topk_out, expected_topk)
+        assert torch.equal(logits_out, expected_logits)
+        torch.testing.assert_close(
+            reduced, expected_reduce, rtol=2e-2, atol=2e-2 * world
+        )
+
+
 def test_all_gather_graph_replay_mixed_with_all_reduce(runtime):
     """A captured graph mixing both collectives replays correctly."""
     world = dist.get_world_size()

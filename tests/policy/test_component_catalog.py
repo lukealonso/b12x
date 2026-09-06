@@ -87,8 +87,41 @@ def test_qwen_flash_next_qsa_serving_shape_resolves_from_gb10_profile() -> None:
     )
 
     assert resolution.source is PolicySource.PREPLANNED
-    assert resolution.rule_name == "measured-production-implementation"
+    assert resolution.rule_name == "qualified-split-sparse-gqa"
     assert resolution.config.backend == "cutedsl"
+    assert resolution.config.sparse_gqa_direct_kv_warps == 2
+
+
+def test_qsa_unmeasured_direct_prefill_uses_cute_heuristic() -> None:
+    profile = EMBEDDED_REGISTRY.get("nvidia.gb10.48sm")
+    context = PolicyContext.for_identity(profile.targets[0])
+    resolution = context.resolve(
+        QSA_POLICY,
+        QsaQuery(
+            q_dtype="bfloat16",
+            kv_dtype="float8_e4m3fn",
+            q_heads=24,
+            kv_heads=2,
+            head_dim=256,
+            index_heads=4,
+            index_kv_heads=1,
+            index_head_dim=128,
+            index_rotary_dim=64,
+            main_page_size=3_008,
+            max_batch=4,
+            max_q_rows=6_016,
+            max_seq_len=32_768,
+            max_speculative_tokens=3,
+            compress_ratio=4,
+            budget=2_048,
+            position_axes=3,
+            mrope_interleaved=True,
+        ),
+    )
+
+    assert resolution.source is PolicySource.HEURISTIC
+    assert resolution.config.backend == "cutedsl"
+    assert resolution.config.sparse_gqa_direct_kv_warps == 2
 
 
 def test_qwen_flash_next_vocab_projection_resolves_from_gb10_profile() -> None:
