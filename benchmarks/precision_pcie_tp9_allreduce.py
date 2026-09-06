@@ -46,6 +46,8 @@ import os
 import socket
 from datetime import timedelta
 
+import traceback
+
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
@@ -128,6 +130,29 @@ def _column_block_rms_norm(
     return (block.float() * s * weight_block.float()).to(torch.bfloat16)
 
 
+
+def build_runtime(name: str, construct, selected, skipped: dict, *, wanted: bool | None = None):
+    """Construct one collective runtime for the harness, or record why not.
+
+    ``name`` is the kernel name whose runtime ``construct`` builds; it is
+    built when ``name`` is in ``selected`` unless ``wanted`` overrides that
+    test (the DMA ring serves every ``dma-*`` kernel, so its builder passes
+    ``wanted=True`` when any of them is selected). A constructor failure is
+    recorded in ``skipped[name]`` with the exception type, message and
+    traceback — the run reports it instead of the generic "could not be
+    built" — and ``None`` is returned so the other runtimes still run.
+    """
+    if not (wanted if wanted is not None else name in selected):
+        return None
+    try:
+        return construct()
+    except Exception as exc:  # noqa: BLE001 - reported, not raised
+        skipped[name] = (
+            f"{type(exc).__name__} while building: {exc}\n" + traceback.format_exc()
+        )
+        return None
+
+
 def _worker(rank: int, port: int, args: argparse.Namespace) -> None:
     from b12x.comm.pcie.pcie_dma import PCIeDmaAllReduce
     from b12x.comm.pcie.pcie_island9 import PCIeIsland9AllReduce
@@ -155,15 +180,8 @@ def _worker(rank: int, port: int, args: argparse.Namespace) -> None:
     accepts = {}
     skipped: dict[str, str] = {}
 
-    def build(name: str, construct):
-        """Construct a runtime, or record why this size has no kernel."""
-        if name not in selected:
-            return None
-        try:
-            return construct()
-        except Exception as exc:  # noqa: BLE001 - reported, not raised
-            skipped[name] = f"{type(exc).__name__} while building: {exc}"
-            return None
+    def build(name: str, construct, *, wanted: bool | None = None):
+        return build_runtime(name, construct, selected, skipped, wanted=wanted)
 
     pool = build(
         "oneshot",
@@ -216,6 +234,7 @@ def _worker(rank: int, port: int, args: argparse.Namespace) -> None:
             lambda: PCIeDmaAllReduce(
                 exchange_group=group, device=device, max_bytes=rows * width * 2
             ),
+            wanted=True,
         )
     if dma is not None:
         dma.min_bytes = 0
