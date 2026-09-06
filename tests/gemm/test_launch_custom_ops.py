@@ -178,6 +178,8 @@ def test_dense_gemm_launch_has_fake_dispatch() -> None:
             False,
             False,
             None,
+            None,
+            2,
         )
         torch.ops.b12x.dense_gemm_launch(
             a,
@@ -212,7 +214,9 @@ def test_dense_gemm_launch_has_fake_dispatch() -> None:
             False,
             False,
             False,
+            None,
             123,
+            2,
         )
 
 
@@ -402,6 +406,7 @@ def test_tp_moe_launch_ops_have_fake_dispatch() -> None:
             1.0,
             0.0,
             False,
+            2,
         )
 
 
@@ -434,6 +439,7 @@ def test_w4a16_moe_launch_ops_have_fake_dispatch() -> None:
             output,
             barrier,
             barrier,
+            2,
             2,
             128,
             64,

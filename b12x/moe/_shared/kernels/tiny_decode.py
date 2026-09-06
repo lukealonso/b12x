@@ -5,7 +5,7 @@ by _logical_weight_to_w4a8_rp_inplace) directly.
 
 Consumes the N256/K128 in-place-repacked FP4 weights and e8m0 sfb grids
 directly (inverse mappings verified in tests/test_w4a8_rp_inverse_mapping.py),
-with BF16 activations (no input quantization) and f32 accumulation. Two plain
+with per-32 MXFP8 activation rounding and f32 accumulation. Two plain
 (non-cooperative) launches: FC1 dots gate+up rows into an fp32 intermediate,
 FC2 applies SiLU inline and folds router-weighted partials into the bf16
 output via scatter-add. The wrapper zeroes the intermediate and output first;
@@ -35,13 +35,16 @@ from cutlass.cutlass_dsl import Int32, Int64
 
 from b12x._lib.utils import current_cuda_stream, make_ptr
 from b12x._lib.intrinsics import (
-    cvt_bf16x2_to_f16x2,
+    bfloat2_to_float2_scaled,
     cvt_e8m0x4_to_f32x4,
     fp4_dot4_sum_f32acc,
+    fmax_f32,
     get_ptr_as_int64,
     ld_global_nc_u32,
     ld_global_nc_v4_u32,
+    mx_scale_from_amax32,
     pack_f32x2_to_f16x2,
+    quant_dequant_e4m3_2,
     red_add_global_f32,
     scatter_add_bf16x2,
     warp_reduce,
@@ -137,6 +140,19 @@ class MoETinyDecodeKernelBackend:
             self.compile_time_phase,
             self._cfg_key,
         )
+
+    @cute.jit
+    def _quantize_activation_quad(self, values: cute.Tensor):
+        peak = Float32(0.0)
+        for index in cutlass.range_constexpr(8):
+            peak = fmax_f32(peak, fmax_f32(values[index], -values[index]))
+        peak = warp_reduce(peak, fmax_f32, width=4)
+        scale, inverse = mx_scale_from_amax32(peak)
+        quads = cute.make_rmem_tensor((4,), cutlass.Uint32)
+        for index in cutlass.range_constexpr(4):
+            lo, hi = quant_dequant_e4m3_2(values[2 * index], values[2 * index + 1], inverse, scale)
+            quads[index] = pack_f32x2_to_f16x2(lo, hi)
+        return quads[0], quads[1], quads[2], quads[3]
 
     @cute.jit
     def _row_block_dot(
@@ -250,14 +266,11 @@ class MoETinyDecodeKernelBackend:
                         Int64(kt * Int32(128) + cgrp * Int32(8)) + Int64(k32 * 32)
                     ) * Int64(2)
                     bq = ld_global_nc_v4_u32(ax)
-                    xs.append(
-                        (
-                            cvt_bf16x2_to_f16x2(bq[0]),
-                            cvt_bf16x2_to_f16x2(bq[1]),
-                            cvt_bf16x2_to_f16x2(bq[2]),
-                            cvt_bf16x2_to_f16x2(bq[3]),
-                        )
-                    )
+                    values = cute.make_rmem_tensor((8,), Float32)
+                    for pair in cutlass.range_constexpr(4):
+                        lo, hi = bfloat2_to_float2_scaled(bq[pair], Float32(1.0))
+                        values[2 * pair], values[2 * pair + 1] = lo, hi
+                    xs.append(self._quantize_activation_quad(values))
                 d0, d1, d2, d3 = self._row_block_dot(
                     tile_word,
                     srow,
@@ -345,59 +358,25 @@ class MoETinyDecodeKernelBackend:
                 tile_word = we_base + Int64(col_tile) * Int64(4096 * 4)
                 srow = srow_base + Int64(col_tile) * Int64(1024)
                 xs = []
+                kt_valid_g32 = Int32(4)
                 if cutlass.const_expr(c["k2_tail_g32"] > 0):
-                    # Ceil-tiled FC2 K tail: 32-groups past the logical n get
-                    # zero activations (their rp weights/scales are zero-filled
-                    # too), which also keeps the intermediate loads in bounds.
-                    kt_valid_g32 = Int32(4)
                     if kt == Int32(c["kt2_full"]):
                         kt_valid_g32 = Int32(c["k2_tail_g32"])
-                    for k32 in cutlass.range_constexpr(4):
-                        ich = (
-                            ibase + kt * Int32(128) + cgrp * Int32(8) + Int32(k32 * 32)
-                        )
-                        quads = []
-                        for jp in cutlass.range_constexpr(4):
-                            a0 = Float32(0.0)
-                            a1 = Float32(0.0)
-                            if Int32(k32) < kt_valid_g32:
-                                g0 = Float32(inter[ich + Int32(2 * jp)])
-                                g1 = Float32(inter[ich + Int32(2 * jp + 1)])
-                                u0 = Float32(inter[ich + Int32(c["n"]) + Int32(2 * jp)])
-                                u1 = Float32(
-                                    inter[ich + Int32(c["n"]) + Int32(2 * jp + 1)]
-                                )
-                                s0 = Float32(1.0) / (
-                                    Float32(1.0) + cute.math.exp(-g0, fastmath=False)
-                                )
-                                s1 = Float32(1.0) / (
-                                    Float32(1.0) + cute.math.exp(-g1, fastmath=False)
-                                )
-                                a0 = s0 * g0 * u0 * rw
-                                a1 = s1 * g1 * u1 * rw
-                            quads.append(pack_f32x2_to_f16x2(a0, a1))
-                        xs.append((quads[0], quads[1], quads[2], quads[3]))
-                else:
-                    for k32 in cutlass.range_constexpr(4):
-                        ich = (
-                            ibase + kt * Int32(128) + cgrp * Int32(8) + Int32(k32 * 32)
-                        )
-                        quads = []
-                        for jp in cutlass.range_constexpr(4):
-                            g0 = Float32(inter[ich + Int32(2 * jp)])
-                            g1 = Float32(inter[ich + Int32(2 * jp + 1)])
-                            u0 = Float32(inter[ich + Int32(c["n"]) + Int32(2 * jp)])
-                            u1 = Float32(inter[ich + Int32(c["n"]) + Int32(2 * jp + 1)])
-                            s0 = Float32(1.0) / (
-                                Float32(1.0) + cute.math.exp(-g0, fastmath=False)
-                            )
-                            s1 = Float32(1.0) / (
-                                Float32(1.0) + cute.math.exp(-g1, fastmath=False)
-                            )
-                            a0 = s0 * g0 * u0 * rw
-                            a1 = s1 * g1 * u1 * rw
-                            quads.append(pack_f32x2_to_f16x2(a0, a1))
-                        xs.append((quads[0], quads[1], quads[2], quads[3]))
+                for k32 in cutlass.range_constexpr(4):
+                    ich = ibase + kt * Int32(128) + cgrp * Int32(8) + Int32(k32 * 32)
+                    values = cute.make_rmem_tensor((8,), Float32)
+                    for pair in cutlass.range_constexpr(4):
+                        a0, a1 = Float32(0.0), Float32(0.0)
+                        if Int32(k32) < kt_valid_g32:
+                            g0 = Float32(inter[ich + Int32(2 * pair)])
+                            g1 = Float32(inter[ich + Int32(2 * pair + 1)])
+                            u0 = Float32(inter[ich + Int32(c["n"]) + Int32(2 * pair)])
+                            u1 = Float32(inter[ich + Int32(c["n"]) + Int32(2 * pair + 1)])
+                            s0 = Float32(1.0) / (Float32(1.0) + cute.math.exp(-g0, fastmath=False))
+                            s1 = Float32(1.0) / (Float32(1.0) + cute.math.exp(-g1, fastmath=False))
+                            a0, a1 = s0 * g0 * u0, s1 * g1 * u1
+                        values[2 * pair], values[2 * pair + 1] = a0, a1
+                    xs.append(self._quantize_activation_quad(values))
                 d0, d1, d2, d3 = self._row_block_dot(
                     tile_word,
                     srow,
@@ -442,7 +421,7 @@ class MoETinyDecodeKernelBackend:
                     for v in cutlass.range_constexpr(4):
                         p2 = nt * Int32(256) + n8c * Int32(32) + Int32(v * 8) + r8
                         scatter_add_bf16x2(
-                            ob + Int64(p2) * Int64(2), accs[v], others[v]
+                            ob + Int64(p2) * Int64(2), accs[v] * rw, others[v] * rw
                         )
 
     @cute.jit
