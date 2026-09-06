@@ -201,8 +201,8 @@ def test_block_fp8_linear_scratch_padding_is_not_observed() -> None:
     require_b12x()
     torch.manual_seed(20260901)
 
-    # M=9 takes the standalone MXFP8 quantize + dense-GEMM path used by the
-    # DFlash M8 round instead of the M<=8 fused-quant specialization.
+    # M=9 uses standalone MXFP8 quantization plus dense GEMM instead of the
+    # M<=8 fused-quantization path.
     tokens, in_features, out_features = 9, 256, 384
     x = (
         torch.randn((tokens, in_features), device="cuda", dtype=torch.bfloat16)
