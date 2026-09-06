@@ -17,8 +17,8 @@ import torch
 from benchmarks.benchmark_paged_attention import (
     _cosine_similarity,
     _decode_effective_cache_tokens,
-    _make_decode_context_metadata,
     _make_decode_bucket_shared_inputs,
+    _make_uniform_page_metadata,
     _relative_l2_error,
 )
 from benchmarks.common import make_l2_flush_fn, resolve_l2_flush_bytes
@@ -36,6 +36,30 @@ PROFILES: dict[str, dict[str, int]] = {
 
 def _parse_csv_ints(value: str) -> list[int]:
     return [int(part) for part in value.split(",") if part]
+
+
+def _make_decode_context_metadata(
+    *,
+    batch: int,
+    context_tokens: int,
+    page_size: int,
+    num_pages: int,
+    seed: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-context decode page table + cache lengths at effective tokens.
+
+    Wraps ``_make_uniform_page_metadata``, converting decode context
+    tokens to the effective cache length (context + q_len) that
+    ``_make_decode_bucket_shared_inputs`` uses for the capture bucket, so
+    replay metadata matches the bucket's capture shape.
+    """
+    return _make_uniform_page_metadata(
+        batch=batch,
+        cache_seqlen=_decode_effective_cache_tokens(context_tokens=context_tokens),
+        page_size=page_size,
+        num_pages=num_pages,
+        seed=seed,
+    )
 
 
 def _capture_graph(fn: Callable[[], None], *, warmup: int) -> torch.cuda.CUDAGraph:
@@ -65,7 +89,7 @@ def _bench_graph(
         graph.replay()
         ends[idx].record()
     torch.cuda.synchronize()
-    return [start.elapsed_time(end) * 1000.0 for start, end in zip(starts, ends)]
+    return [start.elapsed_time(end) * 1000.0 for start, end in zip(starts, ends, strict=True)]
 
 
 def _reference_output(
@@ -267,7 +291,7 @@ def main() -> None:
                 context_tokens=context,
                 page_size=args.page_size,
                 num_pages=int(shared.k_cache.shape[0]),
-                seed=shared.seed,
+                seed=args.seed + 1000 + batch_idx,
             )
             ref_out = (
                 _reference_output(

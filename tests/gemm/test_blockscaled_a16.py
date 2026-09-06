@@ -73,6 +73,48 @@ def assert_close(actual, expected):
     torch.testing.assert_close(actual.float(), expected.float(), atol=float(expected.abs().max()) * 0.008 + 1e-6, rtol=0.008)
 
 
+@pytest.mark.parametrize("allocation", ["system", "pinned", "pinned_wc", "registered", "managed", "file"])
+@pytest.mark.parametrize("recipe,m", [("nvfp4", 1), ("nvfp4", 16), ("mxfp8", 1), ("mxfp8", 16)])
+def test_shared_checkpoint_storage_matches_cuda_weights_in_graphs(tmp_path, allocation, recipe, m):
+    """Both ordinary-load and TMA paths must consume the owned shared weights."""
+    require_b12x()
+    from b12x.loader import capabilities
+    from benchmarks.loader._utils import WeightFiles
+    caps = capabilities()
+    if allocation in ("system", "file") and not caps["host_page_tables"]:
+        pytest.skip("requires GPU host page tables")
+    if allocation == "registered" and not caps["host_register_supported"]:
+        pytest.skip("requires host registration")
+    if allocation == "managed" and not caps["concurrent_managed_access"]:
+        pytest.skip("requires concurrent managed access")
+    weight, decoded, _ = make_weight(recipe, 128, 256)
+    loaded = WeightFiles(tmp_path, allocation).load(weight)
+    source = torch.randn(m, 256, device="cuda", dtype=torch.bfloat16)
+    output = torch.empty(m, 128, device="cuda", dtype=torch.bfloat16)
+    workspace = torch.empty(blockscaled.workspace_size(weight, m), device="cuda", dtype=torch.uint8)
+    options = {"activation_global_scale": torch.tensor([128.], device="cuda")} if recipe == "nvfp4" else {}
+    for mode in ("a16", "quantized"):
+        expected = blockscaled.mm(source, weight, mode=mode, **options)
+        if mode == "a16":
+            assert_close(expected, source.float() @ decoded.T)
+        def run():
+            blockscaled.mm(source, loaded, mode=mode, out=output, workspace=workspace, **options)
+        if recipe == "nvfp4" and mode == "quantized" and allocation in ("system", "file"):
+            # Triton's launcher rejects the unregistered global-scale pointer.
+            with pytest.raises(ValueError, match="Pointer argument cannot be accessed"):
+                run()
+            continue
+        run()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            run()
+        for _ in range(3):
+            output.fill_(float("nan"))
+            graph.replay()
+        torch.testing.assert_close(output, expected, rtol=0, atol=0)
+        graph.reset()
+
+
 @pytest.mark.parametrize("recipe", ["nvfp4", "mxfp8"])
 @pytest.mark.parametrize("mode", ["auto", "a16", "quantized"])
 @pytest.mark.parametrize("use_out", [False, True])
