@@ -3631,3 +3631,130 @@ def test_qsa_decode_full_path_matches_exact_gqa_and_keeps_main_cache_read_only()
         torch.arange(4, dtype=torch.int32, device=device),
     )
     assert torch.all(binding.selected_positions[0, 4:] == -1)
+
+
+@pytest.mark.parametrize("output_rows", [4, 66])
+@pytest.mark.parametrize("budget", [2048, 8192])
+def test_qsa_public_prewarm_covers_bound_output_and_captured_capacity(
+    output_rows: int, budget: int,
+) -> None:
+    from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
+
+    device = require_sm120()
+    caps = _caps(
+        device, max_q_rows=128, q_heads=24, head_dim=256,
+        index_heads=4, index_head_dim=128, index_rotary_dim=64,
+        max_speculative_tokens=3, budget=budget,
+    )
+    binding = _allocate_binding(caps)
+    binding = _rebind(binding, output=binding.output[:output_rows])
+    binding.main_k_cache.zero_()
+    binding.main_v_cache.fill_(1)
+    binding.main_block_table.fill_(0)
+    persistent = (
+        binding.main_k_cache, binding.main_v_cache, binding.compressed_k_cache,
+        binding.raw_k_ring, binding.raw_logical_positions,
+        binding.raw_rope_positions, binding.raw_interval_start_positions,
+    )
+    for tensor in persistent[2:]:
+        tensor.fill_(7)
+    saved = [tensor.clone() for tensor in persistent]
+    qsa.prewarm(binding)
+    for tensor, expected in zip(persistent, saved, strict=True):
+        assert torch.equal(tensor, expected)
+    with pytest.raises(ValueError, match="output capacity"):
+        qsa.prewarm(binding, rows=output_rows + 1)
+
+    query = torch.zeros_like(binding.output)
+    positions = torch.zeros(output_rows, dtype=torch.int64, device=device)
+    selected = torch.full(
+        (output_rows, caps.selection_width + caps.max_speculative_tokens),
+        -1, dtype=torch.int32, device=device,
+    )
+    selected[:, -1] = 0
+    errors = torch.zeros(output_rows, dtype=torch.int32, device=device)
+    binding.state_errors.fill_(123)
+    pointers = tuple(t.data_ptr() for t in (binding.scratch, binding.output, selected))
+    freeze_kernel_resolution("public QSA prewarm covers captured selection capacity")
+    try:
+        for dtype in (torch.int32, torch.int64):
+            requests = torch.zeros(output_rows, dtype=dtype, device=device)
+            for rows in sorted({1, min(4, output_rows), output_rows}):
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    result = qsa.run_selected(
+                        binding, query=query[:rows], request_ids=requests[:rows],
+                        query_positions=positions[:rows],
+                        selected_positions=selected[:rows], selection_errors=errors[:rows],
+                    )
+                for value in (1, 2):
+                    binding.main_v_cache.fill_(value)
+                    binding.output.fill_(float("nan"))
+                    torch.cuda.synchronize()
+                    before = torch.cuda.memory_stats()
+                    graph.replay()
+                    torch.cuda.synchronize()
+                    after = torch.cuda.memory_stats()
+                    for key in ("allocation.all.allocated", "allocated_bytes.all.allocated"):
+                        assert after[key] == before[key]
+                    assert torch.all(result == value)
+                    assert torch.all(binding.state_errors == 123)
+                    assert tuple(t.data_ptr() for t in (binding.scratch, binding.output, selected)) == pointers
+    finally:
+        unfreeze_kernel_resolution()
+
+
+def test_qsa_score_uses_tensor_device_and_stream() -> None:
+    from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
+    from b12x.attention.qsa import _score_cute as implementation
+
+    device = require_sm120()
+    if torch.cuda.device_count() < 2:
+        pytest.skip("requires two explicitly assigned CUDA devices")
+    device = torch.device("cuda", torch.cuda.current_device())
+    other = (device.index + 1) % torch.cuda.device_count()
+    caps = _caps(device, q_heads=24, head_dim=256, index_heads=4, index_head_dim=128)
+    query = torch.ones(1, 4, 128, dtype=torch.bfloat16, device=device)
+    cache = torch.ones(4, 8, 128, dtype=torch.bfloat16, device=device)
+    output = torch.empty(1, 16, device=device)
+    errors = torch.zeros(1, dtype=torch.int32, device=device)
+    kwargs = dict(
+        prepared_query=query,
+        query_positions=torch.full((1,), 63, dtype=torch.int64, device=device),
+        request_ids=torch.zeros(1, dtype=torch.int32, device=device),
+        sequence_lengths=torch.full((1,), 64, dtype=torch.int32, device=device),
+        compressed_cache=cache,
+        compressed_block_table=torch.arange(4, dtype=torch.int32, device=device).view(1, 4),
+        state_errors=errors, scores=output,
+        eligible_counts=torch.empty_like(errors), merge_lengths=torch.empty_like(errors),
+        group_offset=0, group_count=16, caps=caps,
+    )
+    stream = torch.cuda.Stream(device=device)
+    stream.wait_stream(torch.cuda.current_stream(device))
+    implementation._CACHE.clear()
+    with torch.cuda.stream(stream), torch.cuda.device(other):
+        implementation.launch_score_representatives(**kwargs)
+        assert torch.cuda.current_device() == other
+    stream.synchronize()
+    warmed = tuple(implementation._CACHE.items())
+    freeze_kernel_resolution("QSA scorer retains tensor device under ambient device changes")
+    try:
+        with torch.cuda.stream(stream), torch.cuda.device(other):
+            graph = torch.cuda.CUDAGraph()
+            with (
+                torch.cuda.device(device),
+                torch.cuda.graph(graph, stream=stream),
+                torch.cuda.device(other),
+            ):
+                implementation.launch_score_representatives(**kwargs)
+            for value in (2, 3):
+                with torch.cuda.device(device):
+                    cache.fill_(value)
+                    output.fill_(float("nan"))
+                graph.replay()
+                stream.synchronize()
+                torch.testing.assert_close(output, torch.full_like(output, 4 * 128**0.5 * value))
+        assert tuple(implementation._CACHE.items()) == warmed
+        assert not errors.any()
+    finally:
+        unfreeze_kernel_resolution()

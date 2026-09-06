@@ -369,40 +369,41 @@ def launch_score_representatives(
         int(caps.max_groups),
         int(caps.group_budget),
     )
-    key = (prepared_query.device.index, geometry, tuple(t.dtype for t in tensors))
-    raw = _CACHE.get(key)
-    if raw is None:
-        kernel = _RepresentativeScoreKernel(*geometry)
-        raise_if_kernel_resolution_frozen("cute.compile", target=kernel, cache_key=key)
-        fake = tuple(
-            make_ptr(t, 16, cute.AddressSpace.gmem, assumed_align=t.width // 8)
-            for t in types
-        )
-        raw = b12x_compile(
-            kernel,
-            fake,
-            (Int64(1),) * 4,
-            Int32(1),
-            Int64(1),
-            Int32(0),
-            Int32(1),
-            current_cuda_stream(),
-            compile_spec=KernelCompileSpec.from_key(
-                "attention.qsa.representative_score", 1, key
+    with torch.cuda.device(prepared_query.device):
+        key = (prepared_query.device.index, geometry, tuple(t.dtype for t in tensors))
+        raw = _CACHE.get(key)
+        if raw is None:
+            kernel = _RepresentativeScoreKernel(*geometry)
+            raise_if_kernel_resolution_frozen("cute.compile", target=kernel, cache_key=key)
+            fake = tuple(
+                make_ptr(t, 16, cute.AddressSpace.gmem, assumed_align=t.width // 8)
+                for t in types
+            )
+            raw = b12x_compile(
+                kernel,
+                fake,
+                (Int64(1),) * 4,
+                Int32(1),
+                Int64(1),
+                Int32(0),
+                Int32(1),
+                current_cuda_stream(),
+                compile_spec=KernelCompileSpec.from_key(
+                    "attention.qsa.representative_score", 1, key
+                ),
+            )
+            _CACHE[key] = raw
+        raw(
+            tuple(_pointer(t, dt) for t, dt in zip(tensors, types, strict=True)),
+            (
+                Int64(compressed_cache.stride(0)),
+                Int64(compressed_cache.stride(1)),
+                Int64(compressed_block_table.stride(0)),
+                Int64(scores.stride(0)),
             ),
+            Int32(prepared_query.shape[0]),
+            Int64(compressed_cache.shape[0]),
+            Int32(group_offset),
+            Int32(group_count),
+            current_cuda_stream(),
         )
-        _CACHE[key] = raw
-    raw(
-        tuple(_pointer(t, dt) for t, dt in zip(tensors, types, strict=True)),
-        (
-            Int64(compressed_cache.stride(0)),
-            Int64(compressed_cache.stride(1)),
-            Int64(compressed_block_table.stride(0)),
-            Int64(scores.stride(0)),
-        ),
-        Int32(prepared_query.shape[0]),
-        Int64(compressed_cache.shape[0]),
-        Int32(group_offset),
-        Int32(group_count),
-        current_cuda_stream(),
-    )

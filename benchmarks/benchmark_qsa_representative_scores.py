@@ -10,6 +10,7 @@ import argparse
 import hashlib
 import json
 import statistics
+import subprocess
 import sys
 from pathlib import Path
 
@@ -56,6 +57,11 @@ def main():
     result = {
         "status": "research-only",
         "command": sys.argv,
+        "worktree": str(Path(__file__).resolve().parents[1]),
+        "revision": subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            cwd=Path(__file__).resolve().parents[1], text=True,
+        ).strip(),
         "source_sha256": {
             str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest()
             for p in sources
@@ -113,6 +119,9 @@ def main():
                     for v in bench_cuda_graph(graphs[name], replays=30)["replay_us"]
                 )
             record = {
+                "correctness": "passed",
+                "rtol": 1e-5,
+                "atol": 1e-5,
                 "rows": rows,
                 "context": context,
                 "samples_us": samples,

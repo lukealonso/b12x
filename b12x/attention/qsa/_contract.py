@@ -261,7 +261,7 @@ class Caps:
             is_qwen_geometry,
         )
 
-        if int(self.selection_width) != 2051 or not is_qwen_geometry(
+        if not is_qwen_geometry(
             q_heads=int(self.q_heads),
             kv_heads=int(self.kv_heads),
             head_dim=int(self.head_dim),
@@ -2940,8 +2940,8 @@ def prewarm(binding: Binding, *, rows: int | None = None) -> None:
     """Compile a bound QSA transaction without mutating persistent state.
 
     Every synthetic row has an invalid request ID and position. The launch
-    therefore compiles the plan's exact row capacity, cache-table stride,
-    selector workspace, and sparse-GQA specialization while all cache accesses
+    therefore warms the bound output capacity, cache-table stride, selector
+    workspace, and ordinary and captured-selection specializations. Cache accesses
     and persistent selector-state writes remain masked. Scratch, output, and
     selected-position buffers are transient and have unspecified contents
     after this call.
@@ -2950,9 +2950,10 @@ def prewarm(binding: Binding, *, rows: int | None = None) -> None:
         raise TypeError("binding must be a qsa.Binding")
 
     caps = binding.plan.caps
-    requested_rows = int(caps.max_q_rows if rows is None else rows)
-    if not 0 < requested_rows <= int(caps.max_q_rows):
-        raise ValueError("prewarm rows must be within the planned QSA capacity")
+    output_capacity = int(binding.output.shape[0])
+    requested_rows = output_capacity if rows is None else int(rows)
+    if not 0 < requested_rows <= output_capacity:
+        raise ValueError("prewarm rows must fit the bound QSA output capacity")
     device = caps.device
     sequence_lengths = torch.zeros(
         int(caps.max_batch), dtype=torch.int32, device=device
@@ -2965,8 +2966,8 @@ def prewarm(binding: Binding, *, rows: int | None = None) -> None:
     )
     is_prefilling = torch.ones(int(caps.max_batch), dtype=torch.bool, device=device)
     warm_rows = {requested_rows}
-    if int(caps.max_q_rows) > _MAX_SPLIT_ROWS:
-        warm_rows.add(min(_MAX_SPLIT_ROWS, int(caps.max_q_rows)))
+    if output_capacity > _MAX_SPLIT_ROWS:
+        warm_rows.add(_MAX_SPLIT_ROWS)
         warm_rows.add(_MAX_SPLIT_ROWS + 1)
     for warm_row_count in sorted(warm_rows):
         query = torch.empty(
@@ -3013,6 +3014,25 @@ def prewarm(binding: Binding, *, rows: int | None = None) -> None:
                 num_accepted_tokens=num_accepted_tokens,
                 is_prefilling=is_prefilling,
             )
+            if int(caps.max_speculative_tokens):
+                selected = torch.full(
+                    (
+                        warm_row_count,
+                        int(caps.selection_width) + int(caps.max_speculative_tokens),
+                    ),
+                    -1,
+                    dtype=torch.int32,
+                    device=device,
+                )
+                errors = torch.zeros(warm_row_count, dtype=torch.int32, device=device)
+                run_selected(
+                    binding,
+                    query=query,
+                    request_ids=request_ids,
+                    query_positions=query_positions,
+                    selected_positions=selected,
+                    selection_errors=errors,
+                )
 
 
 def is_supported(device: torch.device | str | None = None) -> bool:

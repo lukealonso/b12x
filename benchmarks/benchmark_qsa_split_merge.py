@@ -5,6 +5,7 @@ import argparse
 import hashlib
 import json
 import statistics
+import subprocess
 import sys
 from pathlib import Path
 
@@ -32,6 +33,11 @@ def main():
         "status": "research-only",
         "measurement_scope": "proxy: isolated merge kernel; end-to-end serving is not measured",
         "command": sys.argv,
+        "worktree": str(Path(__file__).resolve().parents[1]),
+        "revision": subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            cwd=Path(__file__).resolve().parents[1], text=True,
+        ).strip(),
         "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
         "gpu_before": nvidia_smi_gpu_mode_snapshot(),
         "cases": [],
@@ -110,6 +116,9 @@ def main():
                         label: statistics.median(v) for label, v in samples.items()
                     }
                     row = {
+                        "correctness": "passed",
+                        "rtol": 0,
+                        "atol": 0,
                         "heads": heads,
                         "rows": rows,
                         "splits": splits,
