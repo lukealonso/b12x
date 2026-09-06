@@ -48,6 +48,7 @@ from .planning import (
     plan_weights as _plan_weights,
     prepare_weights as _prepare_weights,
 )
+from .rank_sliced_trellis import prepare_rank_sliced_trellis_weights
 from .source import PackedSource, PackedSourceFormat, W13Layout, WeightSource
 from .weights import (
     PackedWeights,
@@ -304,6 +305,7 @@ __all__ = [
     "plan_execution",
     "plan_weights",
     "prepare_fc2_weights",
+    "prepare_rank_sliced_trellis_weights",
     "prepare_weights",
     "prewarm",
     "prewarm_fc2",
