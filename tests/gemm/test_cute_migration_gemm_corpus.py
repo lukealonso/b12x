@@ -139,10 +139,15 @@ def test_cute_migration_dense_nvfp4_gpu_oracle_and_graph() -> None:
     torch.testing.assert_close(out, expected, rtol=0, atol=0)
 
 
-def test_cute_migration_dense_fused_quant_gpu_oracle_and_graph() -> None:
+@pytest.mark.parametrize(
+    "m,expected_m,a_inner_span", ((2, None, 0), (8, 8, 32), (1, 8, 32), (1, 1, 32))
+)
+def test_cute_migration_dense_fused_quant_gpu_oracle_and_graph(
+    m: int, expected_m: int | None, a_inner_span: int,
+) -> None:
     require_b12x()
     generator = torch.Generator(device="cuda").manual_seed(46_002)
-    m, n, k = 2, 128, 128
+    n, k = 128, 128
     source = (
         torch.randn(
             (m, k),
@@ -152,6 +157,16 @@ def test_cute_migration_dense_fused_quant_gpu_oracle_and_graph() -> None:
         )
         / 4
     ).contiguous()
+    if a_inner_span:
+        physical = torch.empty(
+            (k // a_inner_span, m, a_inner_span), dtype=source.dtype, device=source.device
+        )
+        physical.copy_(source.view(m, k // a_inner_span, a_inner_span).permute(1, 0, 2))
+        source = physical.permute(1, 2, 0)
+
+    def logical_source():
+        return source if not a_inner_span else source.permute(0, 2, 1).reshape(m, k)
+
     b_source = (
         torch.randn(
             (n, k, 1),
@@ -171,12 +186,14 @@ def test_cute_migration_dense_fused_quant_gpu_oracle_and_graph() -> None:
             b_quant.scale_mma,
             out=out,
             mma_tiler_mn=(64, 64),
+            expected_m=expected_m,
+            a_inner_span=a_inner_span,
         )
 
     run()
     torch.cuda.synchronize()
     expected = _mxfp8_gemm_reference(
-        source.unsqueeze(-1), b_quant.values, b_quant.scale_rows
+        logical_source().unsqueeze(-1), b_quant.values, b_quant.scale_rows
     )
     torch.testing.assert_close(out, expected, rtol=0, atol=0)
 
@@ -195,15 +212,18 @@ def test_cute_migration_dense_fused_quant_gpu_oracle_and_graph() -> None:
     graph.replay()
     torch.cuda.synchronize()
     expected = _mxfp8_gemm_reference(
-        source.unsqueeze(-1), b_quant.values, b_quant.scale_rows
+        logical_source().unsqueeze(-1), b_quant.values, b_quant.scale_rows
     )
     torch.testing.assert_close(out, expected, rtol=0, atol=0)
 
 
-def test_cute_migration_dense_grouped_fused_quant_gpu_oracle_and_graph() -> None:
+@pytest.mark.parametrize("m,expected_m", ((2, None), (1, 1), (8, 8), (1, 8)))
+def test_cute_migration_dense_grouped_fused_quant_gpu_oracle_and_graph(
+    m: int, expected_m: int | None,
+) -> None:
     require_b12x()
     generator = torch.Generator(device="cuda").manual_seed(46_003)
-    m, n, k, groups = 2, 128, 128, 2
+    n, k, groups = 128, 128, 2
     source = (
         torch.randn(
             (m, groups, k),
@@ -237,6 +257,7 @@ def test_cute_migration_dense_grouped_fused_quant_gpu_oracle_and_graph() -> None
             groups=groups,
             out=out,
             mma_tiler_mn=(64, 64),
+            expected_m=expected_m,
         )
 
     run()

@@ -4,6 +4,9 @@ Writes packed e4m3 values plus both scale layouts (row-major e8m0 and the
 MMA-swizzled physical layout) into caller-provided output tensors — no
 allocation, CUDA-graph safe.
 
+Pass a fixed ``expected_m`` row bound to retain the quantizer specialization
+when live row counts vary. Omitting it preserves shape-based selection.
+
 Example:
     from b12x.quantization import mxfp8
 

@@ -3,12 +3,17 @@ from __future__ import annotations
 from contextlib import AbstractContextManager
 from types import SimpleNamespace
 
+import pytest
+
 from benchmarks.benchmark_gdn_decode import QWEN38_GDN_CASES
 from benchmarks.benchmark_paged_attention import BENCHMARK_PROFILES
 from benchmarks.benchmark_qsa import PROFILES as QSA_PROFILES
 from b12x.policy import (
     EMBEDDED_REGISTRY,
     DeviceIdentity,
+    PolicyContext,
+    PolicyMode,
+    PolicySource,
     list_profiled_components,
     profile_from_dict,
 )
@@ -58,7 +63,7 @@ from b12x.policy.generation.providers.norm_sequence import (
     _mtp_feedback_cases,
 )
 from b12x.policy.generation.registry import ComponentGeneratorRegistry
-from b12x.sequence.gdn_decode._policy import GDN_POLICY, GdnQuery
+from b12x.sequence.gdn_decode._policy import GDN_POLICY, GdnConfig, GdnQuery
 
 
 class _FixedGdnSession(AbstractContextManager["_FixedGdnSession"]):
@@ -69,7 +74,7 @@ class _FixedGdnSession(AbstractContextManager["_FixedGdnSession"]):
         return None
 
     def candidates(self, _case):
-        return (SweepCandidate.create({"backend": "triton"}),)
+        return (SweepCandidate.create({"backend": "triton", "recurrent_block_v": 32}),)
 
     def measure(self, _case, candidates):
         return (
@@ -335,6 +340,101 @@ def test_gdn_backend_identifies_decay_contract_from_head_geometry() -> None:
 
     assert GDN_POLICY.heuristic(qwen, None).backend == "cutedsl"
     assert GDN_POLICY.heuristic(glm, None).backend == "triton"
+    assert GDN_POLICY.heuristic(qwen, None).recurrent_block_v == 32
+    assert GDN_POLICY.heuristic(glm, None).recurrent_block_v == 32
+
+
+@pytest.mark.parametrize(
+    ("value_heads", "tile", "error", "message"),
+    [
+        (8, 16.0, TypeError, "must be an integer"),
+        (8, True, TypeError, "must be an integer"),
+        (8, "16", TypeError, "must be an integer"),
+        (8, 64, ValueError, "must be 16 or 32"),
+        (24, 16, ValueError, "Qwen GDN requires recurrent_block_v=32"),
+    ],
+)
+def test_gdn_policy_rejects_unsupported_tile_overrides(
+    value_heads, tile, error, message
+) -> None:
+    query = GdnQuery(
+        gate_activation="sigmoid",
+        qk_l2norm=True,
+        state_dtype="float32",
+        key_heads=8,
+        value_heads=value_heads,
+        max_seqs=4,
+        max_tokens=16,
+        state_index_columns=4,
+    )
+    device = DeviceIdentity(
+        vendor="NVIDIA",
+        compute_capability=(12, 0),
+        sm_count=188,
+        product_name="Synthetic GDN",
+    )
+    config = GdnConfig(
+        backend="triton" if value_heads == 8 else "cutedsl",
+        recurrent_block_v=tile,
+    )
+    with pytest.raises(error, match=message):
+        PolicyContext.for_identity(device).resolve(GDN_POLICY, query, override=config)
+
+
+def test_max_q_gdn_profile_limits_v16_to_qualified_decode_capacity() -> None:
+    """Keep speculative and neighboring capacities on V32."""
+
+    device = DeviceIdentity(
+        vendor="NVIDIA",
+        compute_capability=(12, 0),
+        sm_count=188,
+        product_name="NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+    )
+    profile = EMBEDDED_REGISTRY.get("nvidia.rtx.pro.6000.blackwell.max-q")
+    component = profile.component("attention.gdn")
+    assert component is not None
+
+    serving_capacities = (
+        (16, 16, 1, 16),  # One target token without speculative decoding.
+        (16, 64, 4, 32),  # Target plus three multi-token-prediction draft tokens.
+        (16, 128, 8, 32),  # One target token plus seven DFlash2 draft tokens.
+        (15, 15, 1, 32),
+        (17, 17, 1, 32),
+        (16, 15, 1, 32),
+        (16, 17, 1, 32),
+        (16, 16, 2, 32),
+    )
+    for max_seqs, max_tokens, state_index_columns, tile in serving_capacities:
+        query = GdnQuery(
+            gate_activation="sigmoid",
+            qk_l2norm=True,
+            state_dtype="float32",
+            key_heads=16,
+            value_heads=16,
+            max_seqs=max_seqs,
+            max_tokens=max_tokens,
+            state_index_columns=state_index_columns,
+        )
+        leaf = component.lookup(query.profile_fields())
+        resolution = PolicyContext.for_identity(
+            device,
+            mode=PolicyMode.PREPLANNED_ONLY,
+        ).resolve(GDN_POLICY, query)
+
+        assert leaf is not None
+        assert leaf.config["backend"] == "triton"
+        assert leaf.config["recurrent_block_v"] == tile
+        assert resolution.source is PolicySource.PREPLANNED
+        assert resolution.config.backend == "triton"
+        assert resolution.config.recurrent_block_v == tile
+
+    other_device = DeviceIdentity(
+        vendor="NVIDIA",
+        compute_capability=(12, 0),
+        sm_count=188,
+        product_name="Synthetic RTX",
+    )
+    assert GDN_POLICY.heuristic(query, other_device).recurrent_block_v == 32
 
 
 def test_generated_gdn_profile_covers_dense_and_sparse_capacity_ranges(
@@ -362,11 +462,16 @@ def test_generated_gdn_profile_covers_dense_and_sparse_capacity_ranges(
         source_revision="test",
         settings=GenerationSettings(),
     )
+    checkpoints = CheckpointStore(tmp_path / "checkpoints")
     result = generator.generate(
         context,
         progress=NullProgressReporter(),
-        checkpoints=CheckpointStore(tmp_path / "checkpoints"),
+        checkpoints=checkpoints,
     )
+    for case in cases:
+        checkpoint = checkpoints.load("attention.gdn", case.case_id)
+        assert checkpoint is not None
+        assert checkpoint["candidate_contract_version"] == 2
     profile = profile_from_dict(
         {
             "profile_id": "synthetic",
@@ -399,6 +504,7 @@ def test_generated_gdn_profile_covers_dense_and_sparse_capacity_ranges(
         )
         assert leaf is not None
         assert leaf.config["backend"] == "triton"
+        assert leaf.config["recurrent_block_v"] == 32
 
     assert (
         component.lookup(
@@ -425,6 +531,47 @@ def test_gdn_benchmark_factory_accepts_grouped_capacity_cases() -> None:
 
     assert len(cases) > 1
     assert session.candidates(cases[0])[0].config["backend"] == "cutedsl"
+    assert session.candidates(cases[0])[0].config["recurrent_block_v"] == 32
+
+
+def test_gdn_benchmark_factory_races_kda_recurrent_value_tiles() -> None:
+    case = next(case for case in gdn_cases() if case.metadata["decay_recipe"] == "kda")
+    session = GdnBenchmarkFactory()(case.group_id, (case,), object())
+
+    assert tuple(
+        candidate.config.to_dict() for candidate in session.candidates(case)
+    ) == (
+        {"backend": "triton", "recurrent_block_v": 16},
+        {"backend": "triton", "recurrent_block_v": 32},
+    )
+
+
+def test_gdn_benchmark_balances_candidate_measurement_order(monkeypatch) -> None:
+    """KDA tuning alternates the leading candidate and aggregates each arm."""
+    case = next(case for case in gdn_cases() if case.metadata["decay_recipe"] == "kda")
+    session = GdnBenchmarkFactory()(case.group_id, (case,), object())
+    candidates = session.candidates(case)
+    observed: list[int] = []
+
+    def measure_one(_case, candidate):
+        tile = int(candidate.config["recurrent_block_v"])
+        observed.append(tile)
+        return SweepMeasurement(
+            candidate=candidate,
+            latency_us=float(tile),
+            correct=True,
+            metrics={"tile": tile},
+        )
+
+    monkeypatch.setattr(session, "_measure_candidate_pass", measure_one)
+    measured = session.measure(case, candidates)
+
+    assert observed == [16, 32, 32, 16]
+    assert [measurement.latency_us for measurement in measured] == [16.0, 32.0]
+    assert all(
+        len(measurement.metrics["balanced_pass_latencies_us"]) == 2
+        for measurement in measured
+    )
 
 
 def test_attention_corpus_manifests_are_content_addressed() -> None:

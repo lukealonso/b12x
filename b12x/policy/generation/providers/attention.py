@@ -70,6 +70,7 @@ class _AttentionGenerator(DiscreteSweepGenerator):
         benchmark_factory: SweepBenchmarkFactory | None,
         query_schema_version: int = 1,
         config_schema_version: int = 1,
+        candidate_contract_version: int = 1,
         nearest_range_bounds: Mapping[str, tuple[int, int]] | None = None,
     ) -> None:
         del corpus_name
@@ -88,6 +89,7 @@ class _AttentionGenerator(DiscreteSweepGenerator):
             coverage={
                 "model_geometries": geometry_count,
             },
+            candidate_contract_version=candidate_contract_version,
             nearest_range_bounds=nearest_range_bounds,
         )
 
@@ -124,7 +126,8 @@ class GdnAttentionGenerator(_AttentionGenerator):
             corpus_name="gdn",
             geometry_count=len(GDN_GEOMETRIES),
             benchmark_factory=benchmark_factory or GdnBenchmarkFactory(),
-            config_schema_version=2,
+            config_schema_version=3,
+            candidate_contract_version=2,
             nearest_range_bounds={
                 "max_seqs": (1, max(COMMON_SEQUENCE_CAPACITIES)),
                 "max_tokens": (
