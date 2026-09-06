@@ -416,15 +416,22 @@ def quantize_mxfp8_rows_cute(
         )
     if source.ndim != 2 or not source.is_contiguous():
         raise ValueError("CuTe MXFP8 quantizer requires contiguous [M,K] input")
+    threads = _THREADS
     if value_order == "trellis_native_mma":
         subgroup_width = 8
+    elif int(source.shape[0]) <= 8:
+        # Cooperative K32 reductions avoid 32 serial element operations per
+        # thread in decode. Values, scales and physical write coverage are
+        # identical to the scalar lane path.
+        subgroup_width = 8
+        threads = 128
     else:
-        subgroup_width = _WARP_SUBGROUP_WIDTH if int(source.shape[0]) > 8 else 0
+        subgroup_width = _WARP_SUBGROUP_WIDTH
     _get_compiled_mxfp8_rows_quant(
         int(source.shape[1]),
         source.dtype,
         subgroup_width,
-        _THREADS,
+        threads,
         value_order,
     )(
         source,
