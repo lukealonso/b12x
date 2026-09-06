@@ -10,6 +10,109 @@ import triton.language as tl
 _VALIDATION_BLOCK = 256
 
 
+@triton.jit(
+    do_not_specialize=[
+        "token_capacity",
+        "sequence_capacity",
+        "state_index_columns",
+        "stride_indices_request",
+        "stride_indices_column",
+    ]
+)
+def _validate_bounded_packed_metadata_kernel(
+    query_start_loc,
+    num_accepted_tokens,
+    state_indices,
+    num_seqs,
+    num_tokens,
+    error_code,
+    token_capacity,
+    sequence_capacity,
+    state_index_columns,
+    stride_indices_request,
+    stride_indices_column,
+    MAX_STATE_SLOTS: tl.constexpr,
+    HAS_NULL_STATE_INDEX: tl.constexpr,
+    NULL_STATE_INDEX: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    # A single CTA checks all cells before publishing one transaction status.
+    # Pairwise duplicate detection needs no mutable hash-table initialization.
+    cells = tl.arange(0, BLOCK)
+    request = cells // state_index_columns
+    column = cells % state_index_columns
+    live_seqs = tl.load(num_seqs).to(tl.int32)
+    live_tokens = tl.load(num_tokens).to(tl.int32)
+    safe_seqs = tl.maximum(0, tl.minimum(live_seqs, sequence_capacity))
+    active_request = request < safe_seqs
+    first = tl.load(query_start_loc).to(tl.int32)
+    last = tl.load(query_start_loc + safe_seqs.to(tl.int64)).to(tl.int32)
+    count_error = (
+        (live_seqs < 0)
+        | (live_seqs > sequence_capacity)
+        | (live_tokens < 0)
+        | (live_tokens > token_capacity)
+        | (first != 0)
+        | (last != live_tokens)
+    )
+    start = tl.load(query_start_loc + request.to(tl.int64), active_request, 0)
+    end = tl.load(query_start_loc + request.to(tl.int64) + 1, active_request, 0)
+    accepted = tl.load(
+        num_accepted_tokens + request.to(tl.int64),
+        active_request,
+        1,
+    )
+    length = end - start
+    request_error = active_request & (
+        (start < 0)
+        | (end < start)
+        | (end > live_tokens)
+        | (length > state_index_columns)
+        | (accepted < 1)
+        | (accepted > state_index_columns)
+    )
+    active_cell = (
+        active_request & (length > 0) & ((column < length) | (column == accepted - 1))
+    )
+    if HAS_NULL_STATE_INDEX:
+        source_column = tl.maximum(0, tl.minimum(accepted - 1, state_index_columns - 1))
+        source = tl.load(
+            state_indices
+            + request.to(tl.int64) * stride_indices_request
+            + source_column.to(tl.int64) * stride_indices_column,
+            active_request,
+            NULL_STATE_INDEX,
+        ).to(tl.int64)
+        active_cell &= source != NULL_STATE_INDEX
+    slots = tl.load(
+        state_indices
+        + request.to(tl.int64) * stride_indices_request
+        + column.to(tl.int64) * stride_indices_column,
+        active_cell,
+        -1,
+    ).to(tl.int64)
+    if HAS_NULL_STATE_INDEX:
+        active_cell &= slots != NULL_STATE_INDEX
+    slot_valid = (slots >= 0) & (slots < MAX_STATE_SLOTS)
+    slot_error = active_cell & ~slot_valid
+    compared = active_cell & slot_valid
+    duplicates = (
+        compared[:, None]
+        & compared[None, :]
+        & (cells[:, None] < cells[None, :])
+        & (slots[:, None] == slots[None, :])
+    )
+    duplicate_error = tl.sum(tl.sum(duplicates.to(tl.int32), axis=1), axis=0) > 0
+    metadata_error = count_error | (tl.sum(request_error.to(tl.int32), axis=0) > 0)
+    invalid_slot_error = tl.sum(slot_error.to(tl.int32), axis=0) > 0
+    tl.store(
+        error_code,
+        duplicate_error.to(tl.int32)
+        | (metadata_error.to(tl.int32) * 2)
+        | (invalid_slot_error.to(tl.int32) * 4),
+    )
+
+
 @triton.jit
 def _reset_validation_kernel(
     duplicate_slots,
@@ -532,11 +635,35 @@ def _launch_gdn_decode(
             f"key_heads={key_heads}, value_heads={value_heads}"
         )
     else:
-        token_capacity = int(max_tokens)
-        sequence_capacity = int(max_seqs)
-        live_state_index_columns = int(state_index_columns)
+        token_capacity = int(output.shape[0])
+        sequence_capacity = int(state_indices.shape[0])
+        live_state_index_columns = int(state_indices.shape[1])
 
-    if validate_metadata:
+    if (
+        validate_metadata
+        and not lower_bounded_kda
+        and max_seqs * state_index_columns <= 32
+    ):
+        _validate_bounded_packed_metadata_kernel[(1,)](
+            query_start_loc,
+            num_accepted_tokens,
+            state_indices,
+            num_seqs,
+            num_tokens,
+            error_code,
+            token_capacity,
+            sequence_capacity,
+            live_state_index_columns,
+            stride_indices_request=int(state_indices.stride(0)),
+            stride_indices_column=int(state_indices.stride(1)),
+            MAX_STATE_SLOTS=int(max_state_slots),
+            HAS_NULL_STATE_INDEX=bool(has_null_state_index),
+            NULL_STATE_INDEX=int(null_state_index),
+            BLOCK=triton.next_power_of_2(max_seqs * state_index_columns),
+            num_warps=1,
+            num_stages=1,
+        )
+    elif validate_metadata:
         _reset_validation_kernel[
             (triton.cdiv(duplicate_table_size, _VALIDATION_BLOCK),)
         ](

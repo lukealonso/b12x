@@ -411,18 +411,14 @@ class _PackedRecurrentQwenKernel:
             raise ValueError("CuTe Qwen GDN requires three value heads per key head")
         self.work_ctas = min(
             _MAX_WORK_CTAS,
-            self.max_seqs
-            * self.value_heads
-            * (_VALUE_DIM // _VALUE_ROWS_PER_CTA),
+            self.max_seqs * self.value_heads * (_VALUE_DIM // _VALUE_ROWS_PER_CTA),
         )
         self.packed_qkv_width = (
             2 * self.key_heads * _KEY_DIM + self.value_heads * _VALUE_DIM
         )
         self.qk_l2norm = bool(qk_l2norm)
         self.has_null_state_index = null_state_index is not None
-        self.null_state_index = (
-            0 if null_state_index is None else int(null_state_index)
-        )
+        self.null_state_index = 0 if null_state_index is None else int(null_state_index)
         self.state_type = state_type
 
     @cute.jit
@@ -441,6 +437,12 @@ class _PackedRecurrentQwenKernel:
         output: cute.Pointer,
         error_code: cute.Pointer,
         state_slot_stride: Int64,
+        mixed_token_stride: Int64,
+        a_token_stride: Int64,
+        b_token_stride: Int64,
+        output_token_stride: Int64,
+        state_index_request_stride: Int64,
+        state_index_column_stride: Int64,
         scale: Float32,
         stream: cuda.CUstream,
     ):
@@ -458,6 +460,12 @@ class _PackedRecurrentQwenKernel:
             output,
             error_code,
             state_slot_stride,
+            mixed_token_stride,
+            a_token_stride,
+            b_token_stride,
+            output_token_stride,
+            state_index_request_stride,
+            state_index_column_stride,
             scale,
         ).launch(
             grid=(self.work_ctas, 1, 1),
@@ -474,12 +482,13 @@ class _PackedRecurrentQwenKernel:
         end: Int32,
         value_head: Int32,
         value_row: Int32,
+        output_token_stride: Int64,
     ):
         for relative_token in cutlass.range_constexpr(self.state_index_columns):
             if Int32(relative_token) < end - start:
                 token = start + Int32(relative_token)
                 output_offset = (
-                    token.to(Int64) * Int64(self.value_heads * _VALUE_DIM)
+                    token.to(Int64) * output_token_stride
                     + value_head.to(Int64) * Int64(_VALUE_DIM)
                     + value_row.to(Int64)
                 )
@@ -504,6 +513,12 @@ class _PackedRecurrentQwenKernel:
         end: Int32,
         source_index: Int64,
         state_slot_stride: Int64,
+        mixed_token_stride: Int64,
+        a_token_stride: Int64,
+        b_token_stride: Int64,
+        output_token_stride: Int64,
+        state_index_request_stride: Int64,
+        state_index_column_stride: Int64,
         scale: Float32,
     ):
         thread, _, _ = cute.arch.thread_idx()
@@ -545,15 +560,13 @@ class _PackedRecurrentQwenKernel:
         a_log_scale = Float32(0.0)
         dt_bias_value = Float32(0.0)
         if thread == Int32(0):
-            a_log_scale = cute.math.exp(
-                Float32(A_log[value_head]), fastmath=False
-            )
+            a_log_scale = cute.math.exp(Float32(A_log[value_head]), fastmath=False)
             dt_bias_value = Float32(dt_bias[value_head])
 
         for relative_token in cutlass.range_constexpr(self.state_index_columns):
             if Int32(relative_token) < end - start:
                 token = start + Int32(relative_token)
-                token_base = token.to(Int64) * Int64(self.packed_qkv_width)
+                token_base = token.to(Int64) * mixed_token_stride
                 q_base = token_base + key_head.to(Int64) * Int64(_KEY_DIM)
                 k_base = (
                     token_base
@@ -564,16 +577,10 @@ class _PackedRecurrentQwenKernel:
                 if thread < Int32(32):
                     q_square_sum = Float32(0.0)
                     k_square_sum = Float32(0.0)
-                    for lane_element in cutlass.range_constexpr(
-                        _KEY_DIM // 32
-                    ):
+                    for lane_element in cutlass.range_constexpr(_KEY_DIM // 32):
                         key_column = lane + Int32(lane_element * 32)
-                        q_value = Float32(
-                            mixed_qkv[q_base + key_column.to(Int64)]
-                        )
-                        k_value = Float32(
-                            mixed_qkv[k_base + key_column.to(Int64)]
-                        )
+                        q_value = Float32(mixed_qkv[q_base + key_column.to(Int64)])
+                        k_value = Float32(mixed_qkv[k_base + key_column.to(Int64)])
                         shared_q[key_column] = q_value
                         shared_k[key_column] = k_value
                         if cutlass.const_expr(self.qk_l2norm):
@@ -588,9 +595,7 @@ class _PackedRecurrentQwenKernel:
                         k_inv_norm = cute.math.rsqrt(
                             k_square_sum + Float32(1.0e-6), fastmath=False
                         )
-                        for lane_element in cutlass.range_constexpr(
-                            _KEY_DIM // 32
-                        ):
+                        for lane_element in cutlass.range_constexpr(_KEY_DIM // 32):
                             key_column = lane + Int32(lane_element * 32)
                             shared_q[key_column] = (
                                 Float32(shared_q[key_column]) * q_inv_norm * scale
@@ -599,21 +604,15 @@ class _PackedRecurrentQwenKernel:
                                 Float32(shared_k[key_column]) * k_inv_norm
                             )
                     else:
-                        for lane_element in cutlass.range_constexpr(
-                            _KEY_DIM // 32
-                        ):
+                        for lane_element in cutlass.range_constexpr(_KEY_DIM // 32):
                             key_column = lane + Int32(lane_element * 32)
-                            shared_q[key_column] = (
-                                Float32(shared_q[key_column]) * scale
-                            )
+                            shared_q[key_column] = Float32(shared_q[key_column]) * scale
 
                 if thread == Int32(0):
-                    head_offset = (
-                        token.to(Int64) * Int64(self.value_heads)
-                        + value_head.to(Int64)
-                    )
-                    a_value = Float32(a[head_offset])
-                    b_value = Float32(b[head_offset])
+                    a_offset = token.to(Int64) * a_token_stride + value_head.to(Int64)
+                    b_offset = token.to(Int64) * b_token_stride + value_head.to(Int64)
+                    a_value = Float32(a[a_offset])
+                    b_value = Float32(b[b_offset])
                     softplus_input = a_value + dt_bias_value
                     softplus = softplus_input
                     if softplus_input <= Float32(20.0):
@@ -653,54 +652,41 @@ class _PackedRecurrentQwenKernel:
                     )
                     state_value = state[key_element] * decay
                     state[key_element] = state_value
-                    state_dot_k += state_value * Float32(
-                        shared_k[local_key_column]
-                    )
-                state_dot_k = warp_reduce(
-                    state_dot_k, _add, _KEY_LANES_PER_ROW
-                )
+                    state_dot_k += state_value * Float32(shared_k[local_key_column])
+                state_dot_k = warp_reduce(state_dot_k, _add, _KEY_LANES_PER_ROW)
                 delta = (value - state_dot_k) * beta
                 decoded = Float32(0.0)
                 for key_element in cutlass.range_constexpr(_KEYS_PER_THREAD):
                     local_key_column = key_lane + Int32(
                         key_element * _KEY_LANES_PER_ROW
                     )
-                    state_value = (
-                        state[key_element]
-                        + delta
-                        * Float32(shared_k[local_key_column])
+                    state_value = state[key_element] + delta * Float32(
+                        shared_k[local_key_column]
                     )
                     state[key_element] = state_value
-                    decoded += state_value * Float32(
-                        shared_q[local_key_column]
-                    )
+                    decoded += state_value * Float32(shared_q[local_key_column])
                 decoded = warp_reduce(decoded, _add, _KEY_LANES_PER_ROW)
 
                 if key_lane == Int32(0):
                     output_offset = (
-                        token.to(Int64) * Int64(self.value_heads * _VALUE_DIM)
+                        token.to(Int64) * output_token_stride
                         + value_head.to(Int64) * Int64(_VALUE_DIM)
                         + value_row.to(Int64)
                     )
                     output[output_offset] = BFloat16(decoded)
                 destination_index_offset = (
-                    request.to(Int64) * Int64(self.state_index_columns)
-                    + Int64(relative_token)
+                    request.to(Int64) * state_index_request_stride
+                    + Int64(relative_token) * state_index_column_stride
                 )
-                destination_index = state_indices[
-                    destination_index_offset
-                ].to(Int64)
+                destination_index = state_indices[destination_index_offset].to(Int64)
                 if cutlass.const_expr(self.has_null_state_index):
                     if destination_index != Int64(self.null_state_index):
                         destination_base = (
                             destination_index * state_slot_stride
-                            + value_head.to(Int64)
-                            * Int64(_VALUE_DIM * _KEY_DIM)
+                            + value_head.to(Int64) * Int64(_VALUE_DIM * _KEY_DIM)
                             + value_row.to(Int64) * Int64(_KEY_DIM)
                         )
-                        for key_element in cutlass.range_constexpr(
-                            _KEYS_PER_THREAD
-                        ):
+                        for key_element in cutlass.range_constexpr(_KEYS_PER_THREAD):
                             local_key_column = key_lane + Int32(
                                 key_element * _KEY_LANES_PER_ROW
                             )
@@ -713,9 +699,7 @@ class _PackedRecurrentQwenKernel:
                         + value_head.to(Int64) * Int64(_VALUE_DIM * _KEY_DIM)
                         + value_row.to(Int64) * Int64(_KEY_DIM)
                     )
-                    for key_element in cutlass.range_constexpr(
-                        _KEYS_PER_THREAD
-                    ):
+                    for key_element in cutlass.range_constexpr(_KEYS_PER_THREAD):
                         local_key_column = key_lane + Int32(
                             key_element * _KEY_LANES_PER_ROW
                         )
@@ -743,6 +727,12 @@ class _PackedRecurrentQwenKernel:
         end: Int32,
         source_index: Int64,
         state_slot_stride: Int64,
+        mixed_token_stride: Int64,
+        a_token_stride: Int64,
+        b_token_stride: Int64,
+        output_token_stride: Int64,
+        state_index_request_stride: Int64,
+        state_index_column_stride: Int64,
         scale: Float32,
     ):
         thread, _, _ = cute.arch.thread_idx()
@@ -775,38 +765,25 @@ class _PackedRecurrentQwenKernel:
             byte_alignment=16,
         )
 
-        a_log_scales = cute.make_rmem_tensor(
-            (_GROUPED_VALUE_HEADS,), Float32
-        )
-        dt_bias_values = cute.make_rmem_tensor(
-            (_GROUPED_VALUE_HEADS,), Float32
-        )
-        for value_head_offset in cutlass.range_constexpr(
-            _GROUPED_VALUE_HEADS
-        ):
+        a_log_scales = cute.make_rmem_tensor((_GROUPED_VALUE_HEADS,), Float32)
+        dt_bias_values = cute.make_rmem_tensor((_GROUPED_VALUE_HEADS,), Float32)
+        for value_head_offset in cutlass.range_constexpr(_GROUPED_VALUE_HEADS):
             a_log_scales[value_head_offset] = Float32(0.0)
             dt_bias_values[value_head_offset] = Float32(0.0)
         if thread == Int32(0):
-            for value_head_offset in cutlass.range_constexpr(
-                _GROUPED_VALUE_HEADS
-            ):
-                value_head = (
-                    key_head * Int32(self.head_ratio)
-                    + Int32(value_head_offset)
+            for value_head_offset in cutlass.range_constexpr(_GROUPED_VALUE_HEADS):
+                value_head = key_head * Int32(self.head_ratio) + Int32(
+                    value_head_offset
                 )
                 a_log_scales[value_head_offset] = cute.math.exp(
                     Float32(A_log[value_head]), fastmath=False
                 )
-                dt_bias_values[value_head_offset] = Float32(
-                    dt_bias[value_head]
-                )
+                dt_bias_values[value_head_offset] = Float32(dt_bias[value_head])
 
-        for relative_token in cutlass.range_constexpr(
-            self.state_index_columns
-        ):
+        for relative_token in cutlass.range_constexpr(self.state_index_columns):
             if Int32(relative_token) < end - start:
                 token = start + Int32(relative_token)
-                token_base = token.to(Int64) * Int64(self.packed_qkv_width)
+                token_base = token.to(Int64) * mixed_token_stride
                 q_base = token_base + key_head.to(Int64) * Int64(_KEY_DIM)
                 k_base = (
                     token_base
@@ -818,16 +795,10 @@ class _PackedRecurrentQwenKernel:
                 if thread < Int32(32):
                     q_square_sum = Float32(0.0)
                     k_square_sum = Float32(0.0)
-                    for lane_element in cutlass.range_constexpr(
-                        _KEY_DIM // 32
-                    ):
+                    for lane_element in cutlass.range_constexpr(_KEY_DIM // 32):
                         key_column = lane + Int32(lane_element * 32)
-                        q_value = Float32(
-                            mixed_qkv[q_base + key_column.to(Int64)]
-                        )
-                        k_value = Float32(
-                            mixed_qkv[k_base + key_column.to(Int64)]
-                        )
+                        q_value = Float32(mixed_qkv[q_base + key_column.to(Int64)])
+                        k_value = Float32(mixed_qkv[k_base + key_column.to(Int64)])
                         shared_offset = shared_token_base + key_column
                         shared_q[shared_offset] = q_value
                         shared_k[shared_offset] = k_value
@@ -843,23 +814,17 @@ class _PackedRecurrentQwenKernel:
                         k_inv_norm = cute.math.rsqrt(
                             k_square_sum + Float32(1.0e-6), fastmath=False
                         )
-                        for lane_element in cutlass.range_constexpr(
-                            _KEY_DIM // 32
-                        ):
+                        for lane_element in cutlass.range_constexpr(_KEY_DIM // 32):
                             key_column = lane + Int32(lane_element * 32)
                             shared_offset = shared_token_base + key_column
                             shared_q[shared_offset] = (
-                                Float32(shared_q[shared_offset])
-                                * q_inv_norm
-                                * scale
+                                Float32(shared_q[shared_offset]) * q_inv_norm * scale
                             )
                             shared_k[shared_offset] = (
                                 Float32(shared_k[shared_offset]) * k_inv_norm
                             )
                     else:
-                        for lane_element in cutlass.range_constexpr(
-                            _KEY_DIM // 32
-                        ):
+                        for lane_element in cutlass.range_constexpr(_KEY_DIM // 32):
                             key_column = lane + Int32(lane_element * 32)
                             shared_offset = shared_token_base + key_column
                             shared_q[shared_offset] = (
@@ -870,30 +835,30 @@ class _PackedRecurrentQwenKernel:
                     for value_head_offset in cutlass.range_constexpr(
                         _GROUPED_VALUE_HEADS
                     ):
-                        value_head = (
-                            key_head * Int32(self.head_ratio)
-                            + Int32(value_head_offset)
+                        value_head = key_head * Int32(self.head_ratio) + Int32(
+                            value_head_offset
                         )
-                        head_offset = (
-                            token.to(Int64) * Int64(self.value_heads)
-                            + value_head.to(Int64)
+                        a_offset = token.to(Int64) * a_token_stride + value_head.to(
+                            Int64
+                        )
+                        b_offset = token.to(Int64) * b_token_stride + value_head.to(
+                            Int64
                         )
                         softplus_input = (
-                            Float32(a[head_offset])
-                            + dt_bias_values[value_head_offset]
+                            Float32(a[a_offset]) + dt_bias_values[value_head_offset]
                         )
                         softplus = softplus_input
                         if softplus_input <= Float32(20.0):
                             softplus = cute.math.log(
                                 Float32(1.0)
-                                + cute.math.exp(
-                                    softplus_input, fastmath=False
-                                ),
+                                + cute.math.exp(softplus_input, fastmath=False),
                                 fastmath=False,
                             )
                         param_offset = Int32(
-                            (value_head_offset * self.state_index_columns
-                             + relative_token)
+                            (
+                                value_head_offset * self.state_index_columns
+                                + relative_token
+                            )
                             * 2
                         )
                         shared_params[param_offset] = cute.math.exp(
@@ -902,19 +867,13 @@ class _PackedRecurrentQwenKernel:
                         )
                         beta = cute.arch.rcp_approx(
                             Float32(1.0)
-                            + cute.math.exp(
-                                -Float32(b[head_offset]), fastmath=False
-                            )
+                            + cute.math.exp(-Float32(b[b_offset]), fastmath=False)
                         )
-                        shared_params[param_offset + Int32(1)] = Float32(
-                            BFloat16(beta)
-                        )
+                        shared_params[param_offset + Int32(1)] = Float32(BFloat16(beta))
 
         cute.arch.sync_threads()
 
-        for value_head_offset in cutlass.range(
-            Int32(_GROUPED_VALUE_HEADS), unroll=1
-        ):
+        for value_head_offset in cutlass.range(Int32(_GROUPED_VALUE_HEADS), unroll=1):
             value_head = key_head * Int32(self.head_ratio) + value_head_offset
             # All pool-scaled products are widened before multiplication.
             state_base = (
@@ -924,31 +883,21 @@ class _PackedRecurrentQwenKernel:
             )
             state = cute.make_rmem_tensor((_KEYS_PER_THREAD,), Float32)
             for key_element in cutlass.range_constexpr(_KEYS_PER_THREAD):
-                key_column = key_lane + Int32(
-                    key_element * _KEY_LANES_PER_ROW
-                )
+                key_column = key_lane + Int32(key_element * _KEY_LANES_PER_ROW)
                 state[key_element] = Float32(
                     recurrent_state[state_base + key_column.to(Int64)]
                 )
 
-            for relative_token in cutlass.range_constexpr(
-                self.state_index_columns
-            ):
+            for relative_token in cutlass.range_constexpr(self.state_index_columns):
                 if Int32(relative_token) < end - start:
                     token = start + Int32(relative_token)
-                    token_base = (
-                        token.to(Int64) * Int64(self.packed_qkv_width)
-                    )
+                    token_base = token.to(Int64) * mixed_token_stride
                     param_offset = (
-                        (value_head_offset
-                         * Int32(self.state_index_columns)
-                         + Int32(relative_token))
-                        * Int32(2)
-                    )
+                        value_head_offset * Int32(self.state_index_columns)
+                        + Int32(relative_token)
+                    ) * Int32(2)
                     decay = Float32(shared_params[param_offset])
-                    beta = Float32(
-                        shared_params[param_offset + Int32(1)]
-                    )
+                    beta = Float32(shared_params[param_offset + Int32(1)])
                     value = Float32(0.0)
                     if key_lane == Int32(0):
                         value_offset = (
@@ -958,73 +907,50 @@ class _PackedRecurrentQwenKernel:
                             + value_row.to(Int64)
                         )
                         value = Float32(mixed_qkv[value_offset])
-                    value = Float32(
-                        cute.arch.shuffle_sync(value, row_leader)
-                    )
+                    value = Float32(cute.arch.shuffle_sync(value, row_leader))
 
                     shared_token_base = Int32(relative_token * _KEY_DIM)
                     state_dot_k = Float32(0.0)
-                    for key_element in cutlass.range_constexpr(
-                        _KEYS_PER_THREAD
-                    ):
-                        key_column = key_lane + Int32(
-                            key_element * _KEY_LANES_PER_ROW
-                        )
+                    for key_element in cutlass.range_constexpr(_KEYS_PER_THREAD):
+                        key_column = key_lane + Int32(key_element * _KEY_LANES_PER_ROW)
                         state_value = state[key_element] * decay
                         state[key_element] = state_value
                         state_dot_k += state_value * Float32(
                             shared_k[shared_token_base + key_column]
                         )
-                    state_dot_k = warp_reduce(
-                        state_dot_k, _add, _KEY_LANES_PER_ROW
-                    )
+                    state_dot_k = warp_reduce(state_dot_k, _add, _KEY_LANES_PER_ROW)
                     delta = (value - state_dot_k) * beta
                     decoded = Float32(0.0)
-                    for key_element in cutlass.range_constexpr(
-                        _KEYS_PER_THREAD
-                    ):
-                        key_column = key_lane + Int32(
-                            key_element * _KEY_LANES_PER_ROW
-                        )
-                        state_value = (
-                            state[key_element]
-                            + delta
-                            * Float32(
-                                shared_k[shared_token_base + key_column]
-                            )
+                    for key_element in cutlass.range_constexpr(_KEYS_PER_THREAD):
+                        key_column = key_lane + Int32(key_element * _KEY_LANES_PER_ROW)
+                        state_value = state[key_element] + delta * Float32(
+                            shared_k[shared_token_base + key_column]
                         )
                         state[key_element] = state_value
                         decoded += state_value * Float32(
                             shared_q[shared_token_base + key_column]
                         )
-                    decoded = warp_reduce(
-                        decoded, _add, _KEY_LANES_PER_ROW
-                    )
+                    decoded = warp_reduce(decoded, _add, _KEY_LANES_PER_ROW)
 
                     if key_lane == Int32(0):
                         output_offset = (
-                            token.to(Int64)
-                            * Int64(self.value_heads * _VALUE_DIM)
+                            token.to(Int64) * output_token_stride
                             + value_head.to(Int64) * Int64(_VALUE_DIM)
                             + value_row.to(Int64)
                         )
                         output[output_offset] = BFloat16(decoded)
                     destination_index_offset = (
-                        request.to(Int64)
-                        * Int64(self.state_index_columns)
-                        + Int64(relative_token)
+                        request.to(Int64) * state_index_request_stride
+                        + Int64(relative_token) * state_index_column_stride
                     )
-                    destination_index = state_indices[
-                        destination_index_offset
-                    ].to(Int64)
+                    destination_index = state_indices[destination_index_offset].to(
+                        Int64
+                    )
                     if cutlass.const_expr(self.has_null_state_index):
-                        if destination_index != Int64(
-                            self.null_state_index
-                        ):
+                        if destination_index != Int64(self.null_state_index):
                             destination_base = (
                                 destination_index * state_slot_stride
-                                + value_head.to(Int64)
-                                * Int64(_VALUE_DIM * _KEY_DIM)
+                                + value_head.to(Int64) * Int64(_VALUE_DIM * _KEY_DIM)
                                 + value_row.to(Int64) * Int64(_KEY_DIM)
                             )
                             for key_element in cutlass.range_constexpr(
@@ -1034,25 +960,21 @@ class _PackedRecurrentQwenKernel:
                                     key_element * _KEY_LANES_PER_ROW
                                 )
                                 recurrent_state[
-                                    destination_base
-                                    + key_column.to(Int64)
+                                    destination_base + key_column.to(Int64)
                                 ] = self.state_type(state[key_element])
                     else:
                         destination_base = (
                             destination_index * state_slot_stride
-                            + value_head.to(Int64)
-                            * Int64(_VALUE_DIM * _KEY_DIM)
+                            + value_head.to(Int64) * Int64(_VALUE_DIM * _KEY_DIM)
                             + value_row.to(Int64) * Int64(_KEY_DIM)
                         )
-                        for key_element in cutlass.range_constexpr(
-                            _KEYS_PER_THREAD
-                        ):
+                        for key_element in cutlass.range_constexpr(_KEYS_PER_THREAD):
                             key_column = key_lane + Int32(
                                 key_element * _KEY_LANES_PER_ROW
                             )
-                            recurrent_state[
-                                destination_base + key_column.to(Int64)
-                            ] = self.state_type(state[key_element])
+                            recurrent_state[destination_base + key_column.to(Int64)] = (
+                                self.state_type(state[key_element])
+                            )
 
     @cute.kernel
     def kernel(
@@ -1070,15 +992,19 @@ class _PackedRecurrentQwenKernel:
         output: cute.Pointer,
         error_code: cute.Pointer,
         state_slot_stride: Int64,
+        mixed_token_stride: Int64,
+        a_token_stride: Int64,
+        b_token_stride: Int64,
+        output_token_stride: Int64,
+        state_index_request_stride: Int64,
+        state_index_column_stride: Int64,
         scale: Float32,
     ):
         work_block, _, _ = cute.arch.block_idx()
         lane, _, _ = cute.arch.thread_idx()
         work_block = Int32(work_block)
 
-        # CuTe kernels cannot use dynamic early returns. Nesting the work under
-        # the validation flag preserves the transaction boundary: nonzero
-        # error_code launches perform no state or output access.
+        # Failed metadata transactions must not read or mutate recurrent state.
         if error_code[Int32(0)].to(Int32) == Int32(0):
             live_seqs = num_seqs[Int32(0)].to(Int32)
             bounded_seqs = cutlass.max(
@@ -1098,44 +1024,39 @@ class _PackedRecurrentQwenKernel:
                 value_head = request_value_head % Int32(self.value_heads)
                 request = request_value_head // Int32(self.value_heads)
                 key_head = value_head // Int32(self.head_ratio)
-                value_row = (
-                    value_tile * Int32(_VALUE_ROWS_PER_CTA)
-                    + Int32(lane) // Int32(_KEY_LANES_PER_ROW)
-                )
+                value_row = value_tile * Int32(_VALUE_ROWS_PER_CTA) + Int32(
+                    lane
+                ) // Int32(_KEY_LANES_PER_ROW)
                 start = query_start_loc[request].to(Int32)
                 end = query_start_loc[request + Int32(1)].to(Int32)
                 if end > start:
-                    accepted_column = (
-                        num_accepted_tokens[request].to(Int32) - Int32(1)
-                    )
+                    accepted_column = num_accepted_tokens[request].to(Int32) - Int32(1)
                     source_index_offset = (
-                        request.to(Int64) * Int64(self.state_index_columns)
-                        + accepted_column.to(Int64)
+                        request.to(Int64) * state_index_request_stride
+                        + accepted_column.to(Int64) * state_index_column_stride
                     )
                     source_index = state_indices[source_index_offset].to(Int64)
-                    grouped_heads = (end - start > Int32(1)) & (
-                        bounded_seqs > Int32(1)
-                    )
+                    grouped_heads = (end - start > Int32(1)) & (bounded_seqs > Int32(1))
                     value_head_in_group = value_head % Int32(self.head_ratio)
                     group_leader = value_head_in_group == Int32(0)
-                    ungrouped_tail = value_head_in_group == Int32(
-                        _GROUPED_VALUE_HEADS
-                    )
+                    ungrouped_tail = value_head_in_group == Int32(_GROUPED_VALUE_HEADS)
                     if cutlass.const_expr(self.has_null_state_index):
                         if source_index == Int64(self.null_state_index):
                             if Int32(lane) % Int32(_KEY_LANES_PER_ROW) == Int32(0):
                                 if grouped_heads:
                                     if group_leader:
-                                        for value_head_offset in cutlass.range_constexpr(
+                                        for (
+                                            value_head_offset
+                                        ) in cutlass.range_constexpr(
                                             _GROUPED_VALUE_HEADS
                                         ):
                                             self._zero_request(
                                                 output,
                                                 start,
                                                 end,
-                                                value_head
-                                                + Int32(value_head_offset),
+                                                value_head + Int32(value_head_offset),
                                                 value_row,
+                                                output_token_stride,
                                             )
                                     elif ungrouped_tail:
                                         self._zero_request(
@@ -1144,6 +1065,7 @@ class _PackedRecurrentQwenKernel:
                                             end,
                                             value_head,
                                             value_row,
+                                            output_token_stride,
                                         )
                                 else:
                                     self._zero_request(
@@ -1152,6 +1074,7 @@ class _PackedRecurrentQwenKernel:
                                         end,
                                         value_head,
                                         value_row,
+                                        output_token_stride,
                                     )
                         else:
                             if grouped_heads:
@@ -1172,6 +1095,12 @@ class _PackedRecurrentQwenKernel:
                                         end,
                                         source_index,
                                         state_slot_stride,
+                                        mixed_token_stride,
+                                        a_token_stride,
+                                        b_token_stride,
+                                        output_token_stride,
+                                        state_index_request_stride,
+                                        state_index_column_stride,
                                         scale,
                                     )
                                 elif ungrouped_tail:
@@ -1192,6 +1121,12 @@ class _PackedRecurrentQwenKernel:
                                         end,
                                         source_index,
                                         state_slot_stride,
+                                        mixed_token_stride,
+                                        a_token_stride,
+                                        b_token_stride,
+                                        output_token_stride,
+                                        state_index_request_stride,
+                                        state_index_column_stride,
                                         scale,
                                     )
                             else:
@@ -1212,6 +1147,12 @@ class _PackedRecurrentQwenKernel:
                                     end,
                                     source_index,
                                     state_slot_stride,
+                                    mixed_token_stride,
+                                    a_token_stride,
+                                    b_token_stride,
+                                    output_token_stride,
+                                    state_index_request_stride,
+                                    state_index_column_stride,
                                     scale,
                                 )
                     else:
@@ -1233,6 +1174,12 @@ class _PackedRecurrentQwenKernel:
                                     end,
                                     source_index,
                                     state_slot_stride,
+                                    mixed_token_stride,
+                                    a_token_stride,
+                                    b_token_stride,
+                                    output_token_stride,
+                                    state_index_request_stride,
+                                    state_index_column_stride,
                                     scale,
                                 )
                             elif ungrouped_tail:
@@ -1253,6 +1200,12 @@ class _PackedRecurrentQwenKernel:
                                     end,
                                     source_index,
                                     state_slot_stride,
+                                    mixed_token_stride,
+                                    a_token_stride,
+                                    b_token_stride,
+                                    output_token_stride,
+                                    state_index_request_stride,
+                                    state_index_column_stride,
                                     scale,
                                 )
                         else:
@@ -1273,6 +1226,12 @@ class _PackedRecurrentQwenKernel:
                                 end,
                                 source_index,
                                 state_slot_stride,
+                                mixed_token_stride,
+                                a_token_stride,
+                                b_token_stride,
+                                output_token_stride,
+                                state_index_request_stride,
+                                state_index_column_stride,
                                 scale,
                             )
 
@@ -1353,11 +1312,17 @@ def _compile(binding: Binding) -> tuple[tuple[object, ...], Callable[[Binding, f
         fake_pointer(BFloat16),
         fake_pointer(Int32),
         Int64(1),
+        Int64(1),
+        Int64(1),
+        Int64(1),
+        Int64(1),
+        Int64(1),
+        Int64(1),
         Float32(1.0),
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key(
             "sequence.gdn_decode.packed_recurrent_qwen",
-            1,
+            2,
             key,
         ),
     )
@@ -1390,6 +1355,12 @@ def _compile(binding: Binding) -> tuple[tuple[object, ...], Callable[[Binding, f
             pointer(active_binding.output, BFloat16),
             pointer(active_binding.error_code, Int32),
             int(active_binding.recurrent_state.stride(0)),
+            int(active_binding.mixed_qkv.stride(0)),
+            int(active_binding.a.stride(0)),
+            int(active_binding.b.stride(0)),
+            int(active_binding.output.stride(0)),
+            int(active_binding.state_indices.stride(0)),
+            int(active_binding.state_indices.stride(1)),
             float(scale),
             current_cuda_stream(),
         )

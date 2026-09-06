@@ -408,7 +408,7 @@ def bind(
     num_tokens: torch.Tensor,
     output: torch.Tensor,
 ) -> Binding:
-    """Bind fixed-capacity tensors without allocating runtime storage.
+    """Bind Qwen GDN tensors without allocating runtime storage.
 
     ``recurrent_state`` uses the optimized physical layout
     ``[slot, value_head, value_dim, key_dim]``. Each slot must be contiguous,
@@ -416,6 +416,12 @@ def bind(
     that stride directly without copying the caller-owned cache. Slow
     mathematical references commonly use its transpose,
     ``[batch, head, key_dim, value_dim]``.
+
+    Projection, metadata, and output tensors may use any positive leading
+    capacity within the plan. Projection rows may be views into wider packed
+    tensors; their innermost dimensions must remain contiguous and rows must
+    not overlap. All live tensors for one invocation must be bound together
+    before :func:`run`.
     """
     if not isinstance(plan, Plan):
         raise TypeError(f"plan must be Plan, got {type(plan)!r}")
@@ -435,25 +441,61 @@ def bind(
     )
     model = (caps.model_dtype,)
     parameter = (torch.bfloat16, torch.float32)
-    _require_tensor(
+    if mixed_qkv.ndim != 2:
+        raise ValueError(
+            f"mixed_qkv must have two dimensions, got shape {tuple(mixed_qkv.shape)}"
+        )
+    token_capacity = _positive("mixed_qkv token capacity", mixed_qkv.shape[0])
+    if token_capacity > caps.max_tokens:
+        raise ValueError(
+            f"mixed_qkv token capacity {token_capacity} exceeds planned "
+            f"capacity {caps.max_tokens}"
+        )
+    if state_indices.ndim != 2:
+        raise ValueError(
+            "state_indices must have two dimensions, got "
+            f"shape {tuple(state_indices.shape)}"
+        )
+    sequence_capacity = _positive(
+        "state_indices sequence capacity", state_indices.shape[0]
+    )
+    state_index_columns = _positive(
+        "state_indices column capacity", state_indices.shape[1]
+    )
+    if sequence_capacity > caps.max_seqs:
+        raise ValueError(
+            f"state_indices sequence capacity {sequence_capacity} exceeds "
+            f"planned capacity {caps.max_seqs}"
+        )
+    if state_index_columns > caps.state_index_columns:
+        raise ValueError(
+            f"state_indices column capacity {state_index_columns} exceeds "
+            f"planned capacity {caps.state_index_columns}"
+        )
+    if token_capacity > sequence_capacity * state_index_columns:
+        raise ValueError(
+            "token capacity must fit the bound packed metadata geometry, got "
+            f"{token_capacity} > {sequence_capacity} * {state_index_columns}"
+        )
+    _require_row_contiguous(
         "mixed_qkv",
         mixed_qkv,
-        shape=(caps.max_tokens, caps.packed_qkv_width),
+        shape=(token_capacity, caps.packed_qkv_width),
         device=caps.device,
         dtypes=model,
     )
     for name, tensor in (("a", a), ("b", b)):
-        _require_tensor(
+        _require_row_contiguous(
             name,
             tensor,
-            shape=(caps.max_tokens, caps.value_heads),
+            shape=(token_capacity, caps.value_heads),
             device=caps.device,
             dtypes=model,
         )
-    _require_tensor(
+    _require_row_contiguous(
         "z",
         z,
-        shape=(caps.max_tokens, caps.value_heads, caps.value_head_dim),
+        shape=(token_capacity, caps.value_heads, caps.value_head_dim),
         device=caps.device,
         dtypes=model,
     )
@@ -486,23 +528,24 @@ def bind(
     _require_tensor(
         "query_start_loc",
         query_start_loc,
-        shape=(caps.max_seqs + 1,),
+        shape=(sequence_capacity + 1,),
         device=caps.device,
         dtypes=(torch.int32,),
     )
     _require_tensor(
         "num_accepted_tokens",
         num_accepted_tokens,
-        shape=(caps.max_seqs,),
+        shape=(sequence_capacity,),
         device=caps.device,
         dtypes=(torch.int32,),
     )
     _require_tensor(
         "state_indices",
         state_indices,
-        shape=(caps.max_seqs, caps.state_index_columns),
+        shape=(sequence_capacity, state_index_columns),
         device=caps.device,
         dtypes=(torch.int32, torch.int64),
+        contiguous=False,
     )
     for name, tensor in (("num_seqs", num_seqs), ("num_tokens", num_tokens)):
         _require_tensor(
@@ -512,10 +555,10 @@ def bind(
             device=caps.device,
             dtypes=(torch.int32,),
         )
-    _require_tensor(
+    _require_row_contiguous(
         "output",
         output,
-        shape=(caps.max_tokens, caps.value_heads, caps.value_head_dim),
+        shape=(token_capacity, caps.value_heads, caps.value_head_dim),
         device=caps.device,
         dtypes=model,
     )
