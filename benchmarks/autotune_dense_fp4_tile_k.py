@@ -53,12 +53,14 @@ class Candidate:
     tile_k: int
     load_path: str
     swap_ab: bool
+    target_occupancy: int | None
 
     def label(self) -> str:
         storage = "swap" if self.swap_ab else "normal"
         return (
             f"{self.tile_mn[0]}x{self.tile_mn[1]}/BK{self.tile_k}/"
-            f"{self.load_path}/{storage}"
+            f"{self.load_path}/{storage}/"
+            f"occ{self.target_occupancy if self.target_occupancy is not None else 'auto'}"
         )
 
 
@@ -153,6 +155,7 @@ def _plan_candidates(
     tile_mn_list: list[tuple[int, int]] | None,
     load_path_list: list[str] | None,
     swap_ab_list: list[bool] | None,
+    target_occupancy_list: list[int] | None = None,
 ) -> list[Candidate]:
     if joint:
         tile_storage = (
@@ -172,10 +175,12 @@ def _plan_candidates(
         tile_storage = tuple((tile, swap) for tile in tiles for swap in swaps)
         load_paths = tuple(load_path_list or [plan.load_path])
     return [
-        Candidate(tile, tile_k, load_path, swap)
+        Candidate(tile, tile_k, load_path, swap, target_occupancy)
         for tile, swap in tile_storage
         for tile_k in tile_k_list
         for load_path in load_paths
+        for target_occupancy in (target_occupancy_list or [None])
+        if not (tile == (128, 128) and tile_k == 512)
     ]
 
 
@@ -206,6 +211,7 @@ def _baseline(
     *,
     m: int,
     n: int,
+    k: int,
     plan: object,
 ) -> torch.Tensor:
     out = torch.empty((m, n, 1), device="cuda", dtype=torch.bfloat16)
@@ -221,7 +227,7 @@ def _baseline(
         mma_tiler_mn=plan.mma_tiler_mn,
         load_path=plan.load_path,
         swap_ab=plan.swap_ab,
-        _tile_k_override=128,
+        _tile_k_override=128 if k % 128 == 0 else None,
     )
     torch.cuda.synchronize()
     return out[:, :, 0].clone()
@@ -254,6 +260,7 @@ def main() -> None:
     parser.add_argument("--tile-mn-list", type=_parse_tile_list)
     parser.add_argument("--load-path-list", type=_parse_load_paths)
     parser.add_argument("--swap-ab-list", type=_parse_bool_list)
+    parser.add_argument("--target-occupancy-list", type=_parse_int_list)
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--iters", type=int, default=100)
     parser.add_argument("--repeats", type=int, default=2)
@@ -281,9 +288,19 @@ def main() -> None:
         parser.error("warmup must be nonnegative; iters and repeats must be positive")
     if any(tile_k not in (128, 256, 512) for tile_k in args.tile_k_list):
         parser.error("--tile-k-list is restricted to 128,256,512")
+    if args.target_occupancy_list is not None and any(
+        occupancy not in (1, 2, 3, 4)
+        for occupancy in args.target_occupancy_list
+    ):
+        parser.error("--target-occupancy-list is restricted to 1,2,3,4")
     if args.joint and any(
         value is not None
-        for value in (args.tile_mn_list, args.load_path_list, args.swap_ab_list)
+        for value in (
+            args.tile_mn_list,
+            args.load_path_list,
+            args.swap_ab_list,
+            args.target_occupancy_list,
+        )
     ):
         parser.error(
             "--joint is mutually exclusive with explicit tile/load/swap candidate lists"
@@ -309,6 +326,7 @@ def main() -> None:
 
     columns = (
         "shape\tm\tn\tk\ttile_m\ttile_n\ttile_k\tload_path\tswap_ab\t"
+        "target_occupancy\t"
         "status\tmedian_us\tmin_us\tmax_us\tcos\tmax_abs\tsamples_us\n"
     )
     with args.output.open("w", encoding="utf-8") as output:
@@ -331,6 +349,29 @@ def main() -> None:
                     sm_count,
                     is_mxfp8=False,
                 )
+                candidates = _plan_candidates(
+                    plan,
+                    tile_k_list=args.tile_k_list,
+                    joint=args.joint,
+                    tile_mn_list=args.tile_mn_list,
+                    load_path_list=args.load_path_list,
+                    swap_ab_list=args.swap_ab_list,
+                    target_occupancy_list=args.target_occupancy_list,
+                )
+                if not any(
+                    shape.k % candidate.tile_k == 0 for candidate in candidates
+                ):
+                    for candidate in candidates:
+                        output.write(
+                            f"{shape.name}\t{m}\t{shape.n}\t{shape.k}\t"
+                            f"{candidate.tile_mn[0]}\t{candidate.tile_mn[1]}\t"
+                            f"{candidate.tile_k}\t{candidate.load_path}\t"
+                            f"{int(candidate.swap_ab)}\t"
+                            f"{candidate.target_occupancy or 'auto'}\t"
+                            "not_divisible\t\t\t\t\t\t\n"
+                        )
+                    print(f"  M={m:<3} no requested tile K divides K={shape.k}")
+                    continue
                 baseline = _baseline(
                     a_packed,
                     a_sf,
@@ -339,25 +380,19 @@ def main() -> None:
                     alpha,
                     m=m,
                     n=shape.n,
+                    k=shape.k,
                     plan=plan,
                 )
                 prepared: list[CandidateRun] = []
-
-                candidates = _plan_candidates(
-                    plan,
-                    tile_k_list=args.tile_k_list,
-                    joint=args.joint,
-                    tile_mn_list=args.tile_mn_list,
-                    load_path_list=args.load_path_list,
-                    swap_ab_list=args.swap_ab_list,
-                )
                 for candidate in candidates:
                     if shape.k % candidate.tile_k:
                         output.write(
                             f"{shape.name}\t{m}\t{shape.n}\t{shape.k}\t"
                             f"{candidate.tile_mn[0]}\t{candidate.tile_mn[1]}\t"
                             f"{candidate.tile_k}\t{candidate.load_path}\t"
-                            f"{int(candidate.swap_ab)}\tnot_divisible\t\t\t\t\t\t\n"
+                            f"{int(candidate.swap_ab)}\t"
+                            f"{candidate.target_occupancy or 'auto'}\t"
+                            "not_divisible\t\t\t\t\t\t\n"
                         )
                         continue
                     if not DenseGemmKernel.can_implement(
@@ -380,7 +415,9 @@ def main() -> None:
                             f"{shape.name}\t{m}\t{shape.n}\t{shape.k}\t"
                             f"{candidate.tile_mn[0]}\t{candidate.tile_mn[1]}\t"
                             f"{candidate.tile_k}\t{candidate.load_path}\t"
-                            f"{int(candidate.swap_ab)}\tunsupported\t\t\t\t\t\t\n"
+                            f"{int(candidate.swap_ab)}\t"
+                            f"{candidate.target_occupancy or 'auto'}\t"
+                            "unsupported\t\t\t\t\t\t\n"
                         )
                         continue
                     out = torch.empty((m, shape.n, 1), device="cuda", dtype=torch.bfloat16)
@@ -402,6 +439,7 @@ def main() -> None:
                             load_path=candidate.load_path,
                             swap_ab=candidate.swap_ab,
                             _tile_k_override=candidate.tile_k,
+                            _target_occupancy_override=candidate.target_occupancy,
                         )
 
                     try:
@@ -418,7 +456,9 @@ def main() -> None:
                             f"{shape.name}\t{m}\t{shape.n}\t{shape.k}\t"
                             f"{candidate.tile_mn[0]}\t{candidate.tile_mn[1]}\t"
                             f"{candidate.tile_k}\t{candidate.load_path}\t"
-                            f"{int(candidate.swap_ab)}\tlaunch_failed:{message}\t\t\t\t\t\t\n"
+                            f"{int(candidate.swap_ab)}\t"
+                            f"{candidate.target_occupancy or 'auto'}\t"
+                            f"launch_failed:{message}\t\t\t\t\t\t\n"
                         )
                         continue
 
@@ -458,7 +498,9 @@ def main() -> None:
                         f"{candidate.candidate.tile_mn[1]}\t"
                         f"{candidate.candidate.tile_k}\t"
                         f"{candidate.candidate.load_path}\t"
-                        f"{int(candidate.candidate.swap_ab)}\tpass\t{median_us:.3f}\t"
+                        f"{int(candidate.candidate.swap_ab)}\t"
+                        f"{candidate.candidate.target_occupancy or 'auto'}\t"
+                        f"pass\t{median_us:.3f}\t"
                         f"{min(samples_us):.3f}\t{max(samples_us):.3f}\t1.0\t0.0\t"
                         f"{sample_text}\n"
                     )
