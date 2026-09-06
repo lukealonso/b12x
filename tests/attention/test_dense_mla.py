@@ -681,9 +681,10 @@ def test_fp8_production_split_plan_handles_short_live_sequence() -> None:
         cu_seqlens_q=cu_seqlens_q,
         q_scale=q_scale,
         kv_scale=kv_scale,
-        active_splits=1,
+        # The balanced prefix: one split per live 64-token chunk.
+        active_splits=5,
     )
-    assert binding.active_splits == 1
+    assert binding.active_splits == 5
     dense_mla.compile(binding=binding)
     actual_output, actual_lse = dense_mla.run(binding=binding)
     torch.cuda.synchronize()
@@ -717,9 +718,11 @@ def test_fp8_production_split_plan_handles_short_live_sequence() -> None:
         expected_lse,
     )
 
-    # The active prefix preserves the maximum-context split boundaries and
-    # only omits mathematically empty tail splits. It must therefore match a
-    # full-plan launch exactly, including the BF16 output bits.
+    # Split ranges are balanced over the launched splits: a prefix of
+    # min(num_splits, live chunks) splits partitions the live chunks exactly
+    # like the full-plan launch (one chunk per split here, the remaining
+    # full-plan splits empty), so the two must match including the BF16
+    # output bits.
     full_output = torch.empty_like(output)
     full_binding = dense_mla.bind(
         plan,
@@ -932,3 +935,67 @@ def test_fp8_page_ids_past_int32_scaled_offset_match_reference() -> None:
         expected_output,
         expected_lse,
     )
+
+
+@torch.inference_mode()
+def test_balanced_splits_cover_a_long_live_sequence_with_every_split() -> None:
+    """A live sequence far below the planned capacity is shared by every
+    launched split (about live_chunks / active_splits chunks each) instead
+    of a few splits scanning capacity-sized ranges; the result matches the
+    reference, and a one-split launch of the same rows agrees within the
+    reassociation tolerance."""
+    device = require_b12x()
+    torch.manual_seed(20260902)
+    page_size = 64
+    max_cache_tokens = 131_072
+    plan = dense_mla.plan(
+        dense_mla.Caps(
+            device=device,
+            mode="decode",
+            kv_dtype=torch.bfloat16,
+            num_q_heads=8,
+            page_size=page_size,
+            max_total_q=1,
+            max_batch=1,
+            max_cache_tokens=max_cache_tokens,
+            max_page_table_width=max_cache_tokens // page_size,
+            num_cache_pages=1 << 20,
+            use_cuda_graph=True,
+        )
+    )
+    assert plan.num_splits > 8
+    live = 10_240  # 160 chunks: fewer than the planned 2,048, more than the splits
+    num_pages = live // page_size
+    q = torch.randn(1, 8, QK_DIM, device=device, dtype=torch.bfloat16) * 0.1
+    cache = torch.randn(num_pages, page_size, QK_DIM, device=device, dtype=torch.bfloat16) * 0.1
+    page_table = torch.arange(num_pages, dtype=torch.int32, device=device).view(1, -1)
+    cache_seqlens = torch.tensor([live], dtype=torch.int32, device=device)
+    cu_seqlens_q = torch.tensor([0, 1], dtype=torch.int32, device=device)
+    expected_output, expected_lse = dense_mla.reference(
+        q, cache, page_table, cache_seqlens, cu_seqlens_q
+    )
+
+    outputs = {}
+    for active in (plan.num_splits, 1):
+        output = torch.empty(1, 8, VALUE_DIM, dtype=torch.bfloat16, device=device)
+        binding = dense_mla.bind(
+            plan,
+            scratch=_scratch(plan),
+            q=q,
+            kv_cache=cache,
+            output=output,
+            page_table=page_table,
+            cache_seqlens=cache_seqlens,
+            cu_seqlens_q=cu_seqlens_q,
+            active_splits=active,
+        )
+        dense_mla.compile(binding=binding)
+        actual_output, actual_lse = dense_mla.run(binding=binding)
+        torch.cuda.synchronize()
+        _assert_matches(actual_output, actual_lse, expected_output, expected_lse)
+        outputs[active] = (actual_output.clone(), actual_lse.clone())
+    full_output, full_lse = outputs[plan.num_splits]
+    one_output, one_lse = outputs[1]
+    torch.testing.assert_close(full_output, one_output, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(full_lse, one_lse, rtol=2e-5, atol=2e-5)
+
