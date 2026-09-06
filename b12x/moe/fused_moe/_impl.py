@@ -9479,6 +9479,7 @@ def _get_micro_kernel(
         dummy(cutlass.BFloat16),  # out_ptr
         barrier_fake,  # barrier_count
         barrier_fake,  # barrier_epoch
+        Int32(weight_E),  # route_expert_limit
         Int32(compile_m),  # m_val
         Int32(1),  # grid_x
         current_cuda_stream(),  # stream
