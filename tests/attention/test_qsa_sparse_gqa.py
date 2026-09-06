@@ -161,24 +161,30 @@ def test_split_prewarm_matches_planned_selection_capacity(selection_width: int) 
     )
     freeze_kernel_resolution("planned selected-attention warmup capacity")
     try:
+
+        def launch(rows):
+            implementation.launch_sparse_gqa_split(
+                query=query[:rows],
+                key_cache=keys,
+                value_cache=values,
+                k_descale=None,
+                v_descale=None,
+                block_table=table,
+                request_ids=requests[:rows],
+                selected_positions=selected[:rows],
+                query_positions=positions[:rows],
+                partial_output=partials[:rows],
+                partial_lse=lse[:rows],
+                softmax_scale=1 / 16,
+                splits=16,
+            )
+
+        # Compilation does not warm CUDA launch state or write caller storage.
+        launch(1)
         for rows in (1, 4):
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
-                implementation.launch_sparse_gqa_split(
-                    query=query[:rows],
-                    key_cache=keys,
-                    value_cache=values,
-                    k_descale=None,
-                    v_descale=None,
-                    block_table=table,
-                    request_ids=requests[:rows],
-                    selected_positions=selected[:rows],
-                    query_positions=positions[:rows],
-                    partial_output=partials[:rows],
-                    partial_lse=lse[:rows],
-                    softmax_scale=1 / 16,
-                    splits=16,
-                )
+                launch(rows)
             for _ in range(2):
                 query.normal_()
                 graph.replay()
