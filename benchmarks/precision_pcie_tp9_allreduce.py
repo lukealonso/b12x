@@ -25,11 +25,17 @@ bf16 latent, ``bf16(bf16(x * s) * w)``) against the column-block scheme
 fp64 all-reduce, ``bf16(x * s * w)`` rounded once), both against the fp64
 RMSNorm of the fp64 sum.
 
+A selected kernel that cannot serve the requested ``(rows, width)`` - the
+decode-size staging kernels reject prefill-size inputs - is dropped with its
+reason under ``skipped`` instead of aborting the run, so one unsupported pair
+in a ``--kernels`` list does not cost the measurements of the others. The
+decision is taken collectively, so every rank drops the same kernels.
+
 The result is a JSON record per kernel (rank 0 prints and writes it).
 
     B12X_RUN_PCIE_TP9_TEST=1 python benchmarks/precision_pcie_tp9_allreduce.py \
         --rows 4608 --width 3584 --samples 8 --norm \
-        --kernels dma-ring,dma-rs-bf16,dma-rs-fp32,twoshot-push --output out.json
+        --kernels dma-ring,dma-rs-bf16,dma-rs-fp32 --output out.json
 """
 
 from __future__ import annotations
@@ -146,41 +152,124 @@ def _worker(rank: int, port: int, args: argparse.Namespace) -> None:
     closers = []
 
     kernels = {}
-    if "oneshot" in selected:
-        pool = PCIeOneshotAllReducePool.from_process_group(
+    accepts = {}
+    skipped: dict[str, str] = {}
+
+    def build(name: str, construct):
+        """Construct a runtime, or record why this size has no kernel."""
+        if name not in selected:
+            return None
+        try:
+            return construct()
+        except Exception as exc:  # noqa: BLE001 - reported, not raised
+            skipped[name] = f"{type(exc).__name__} while building: {exc}"
+            return None
+
+    pool = build(
+        "oneshot",
+        lambda: PCIeOneshotAllReducePool.from_process_group(
             process_group=group, device=device, max_input_bytes=rows * width * 2,
             max_concurrent_channels=1,
-        )
+        ),
+    )
+    if pool is not None:
         pool.prepare_channels(("eager",))
         kernels["oneshot"] = lambda inp, out: pool.all_reduce(inp, out=out, channel_id="eager")
-    if "twoshot-push" in selected:
-        twoshot = PCIeTwoShotBF16.from_exchange_group(
-            exchange_group=group, device=device, max_rows=49149, row_elems=8,
+        accepts["oneshot"] = lambda inp: (
+            pool.for_stream(None, channel_id="eager").should_allreduce(inp),
+            "input not accepted by the one-shot channel",
         )
+    twoshot = build(
+        "twoshot-push",
+        lambda: PCIeTwoShotBF16.from_exchange_group(
+            exchange_group=group, device=device, max_rows=49149, row_elems=8,
+        ),
+    )
+    if twoshot is not None:
         twoshot.all_reduce_mode = "push"
         kernels["twoshot-push"] = lambda inp, out: twoshot.all_reduce(inp, out=out)
-        closers.append(twoshot.close)
-    if "island9-push" in selected:
-        island9 = PCIeIsland9AllReduce.from_exchange_group(
-            exchange_group=group, device=device, max_rows=49149, row_elems=8,
+        accepts["twoshot-push"] = lambda inp: (
+            twoshot.accepts(inp),
+            "input not accepted by PCIeTwoShotBF16.all_reduce (a decode-size "
+            f"kernel: staging holds {twoshot.max_rows} rows of "
+            f"{twoshot.row_elems} elements)",
         )
+        closers.append(twoshot.close)
+    island9 = build(
+        "island9-push",
+        lambda: PCIeIsland9AllReduce.from_exchange_group(
+            exchange_group=group, device=device, max_rows=49149, row_elems=8,
+        ),
+    )
+    if island9 is not None:
         kernels["island9-push"] = lambda inp, out: island9.all_reduce(inp, out=out)
+        accepts["island9-push"] = lambda inp: (
+            island9.accepts(inp),
+            "input not accepted by PCIeIsland9AllReduce.all_reduce (a "
+            f"decode-size kernel: staging holds {island9.max_elements} elements)",
+        )
         closers.append(island9.close)
     dma = None
     if any(name.startswith("dma-") for name in selected):
-        dma = PCIeDmaAllReduce(exchange_group=group, device=device, max_bytes=rows * width * 2)
+        dma = build(
+            "dma",
+            lambda: PCIeDmaAllReduce(
+                exchange_group=group, device=device, max_bytes=rows * width * 2
+            ),
+        )
+    if dma is not None:
         dma.min_bytes = 0
         closers.append(dma.close)
         if "dma-ring" in selected:
             kernels["dma-ring"] = lambda inp, out: dma.all_reduce(inp, out=out)
-        if "dma-rs-bf16" in selected:
-            kernels["dma-rs-bf16"] = lambda inp, out: out.copy_(
-                _gather_column_blocks(dma.reduce_scatter_columns(inp, wire="bf16"), width, group)
+            accepts["dma-ring"] = lambda inp: (
+                dma.should_allreduce(inp),
+                "input not accepted by the PCIe DMA ring all-reduce",
             )
-        if "dma-rs-fp32" in selected:
-            kernels["dma-rs-fp32"] = lambda inp, out: out.copy_(
-                _gather_column_blocks(dma.reduce_scatter_columns(inp, wire="fp32"), width, group)
+        for wire in ("bf16", "fp32"):
+            name = f"dma-rs-{wire}"
+            if name not in selected:
+                continue
+            kernels[name] = (
+                lambda inp, out, wire=wire: out.copy_(
+                    _gather_column_blocks(
+                        dma.reduce_scatter_columns(inp, wire=wire), width, group
+                    )
+                )
             )
+            accepts[name] = lambda inp: (
+                dma.should_reduce_scatter_columns(inp),
+                "input not accepted by the PCIe DMA ring column reduce-scatter",
+            )
+    elif any(name.startswith("dma-") for name in selected):
+        reason = skipped.pop("dma", "the PCIe DMA ring could not be built")
+        for name in selected:
+            if name.startswith("dma-"):
+                skipped[name] = reason
+
+    # A kernel that cannot serve this (rows, width) is dropped with its reason
+    # instead of aborting the run, so one unsupported pair in a --kernels list
+    # does not cost the measurements of the others. The verdict is collective:
+    # every rank must drop the same kernels or the survivors would deadlock.
+    probe = torch.zeros(rows, width, dtype=torch.bfloat16, device=device)
+    for name in list(kernels):
+        check = accepts.get(name)
+        if check is None:
+            continue
+        try:
+            ok, reason = check(probe)
+        except Exception as exc:  # noqa: BLE001 - reported, not raised
+            ok, reason = False, f"{type(exc).__name__}: {exc}"
+        verdict = torch.tensor([0 if ok else 1], device=device)
+        dist.all_reduce(verdict, group=group)
+        if int(verdict.item()):
+            skipped[name] = reason
+            del kernels[name]
+    del probe
+    if not kernels:
+        raise SystemExit(
+            f"no selected kernel serves rows={rows} width={width}: {skipped}"
+        )
 
     norm_weight = None
     if args.norm:
@@ -243,7 +332,8 @@ def _worker(rank: int, port: int, args: argparse.Namespace) -> None:
         close()
     if rank == 0:
         summary = {"rows": rows, "width": width, "samples": args.samples,
-                   "kernels": names, "per_kernel": results, "kernels_differ_on": cross,
+                   "kernels": names, "skipped": skipped, "per_kernel": results,
+                   "kernels_differ_on": cross,
                    "cross_rank_inconsistent_elements": consistency}
         print(json.dumps(summary, indent=2), flush=True)
         if args.output:

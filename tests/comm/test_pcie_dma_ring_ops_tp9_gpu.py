@@ -158,15 +158,12 @@ def _worker(rank: int, port: int, evidence: str) -> None:
                 gathered_latent[seed], WORLD, wire, cols=LATENT_COLS
             )[rank]
             assert block.shape == (ROWS, LATENT_COLS)
-            equal = torch.equal(block, reference)
-            if wire == "fp32":
-                # The deployable wire must match the chained reference on
-                # every call (eager capture, then two replays).
-                assert equal, f"{wire} wire block differs (call {call})"
-            elif not equal:
-                # The bf16 wire is a candidate (served precision class); a
-                # replay mismatch is recorded as a fault, not a test failure,
-                # so the fp32 evidence and the layer sequence still land.
+            if not torch.equal(block, reference):
+                # Every rank runs the same number of ring ops whatever the
+                # values are: leaving the loop early on one rank would strand
+                # its peers in the flag protocol. A block that differs from the
+                # chained reference is recorded and the verdict is taken
+                # collectively once both wires have run.
                 wire_faults.setdefault(wire, []).append(f"rank {rank} call {call}")
             if call >= 1:
                 assert ring.is_ring_storage(block)
@@ -180,17 +177,31 @@ def _worker(rank: int, port: int, evidence: str) -> None:
         stats[wire] = int(mismatch.item())
     ring_full = ring_all_reduce_reference(gathered_latent[0], WORLD)
     ring_mismatch = int((ring_full != sum64[0].to(torch.bfloat16)).sum())
-    faults = [f for f in gather_all(torch.tensor([len(wire_faults.get("bf16", []))], device=device))]
-    bf16_faults = int(sum(int(f.item()) for f in faults))
-    assert stats["fp32"] * 4 < ring_mismatch
+    counts = torch.tensor(
+        [len(wire_faults.get("fp32", [])), len(wire_faults.get("bf16", []))],
+        device=device,
+    )
+    dist.all_reduce(counts, group=group)
+    fp32_faults, bf16_faults = (int(value) for value in counts.tolist())
+    # The fp32 wire is the deployable one: it must equal the chained reference
+    # on every rank and every call, and stay four times closer to the correctly
+    # rounded fp64 sum than the eight-rounding ring. The bf16 wire is a
+    # candidate, so its faults are recorded only.
+    reduce_scatter_ok = fp32_faults == 0 and stats["fp32"] * 4 < ring_mismatch
     record(
-        "item3_reduce_scatter_passed",
+        "item3_reduce_scatter_passed" if reduce_scatter_ok else "item3_reduce_scatter_failed",
         mismatch_vs_fp64={"rs_fp32": stats["fp32"], "rs_bf16": stats["bf16"], "ring": ring_mismatch},
         elements=ROWS * LATENT,
+        rs_fp32_replay_faults=fp32_faults,
         rs_bf16_replay_faults=bf16_faults,
     )
 
     # ---- the layer sequence on one channel, replayed --------------------------
+    # The sequence carries the evidence for items 7 and 1 (a borrowed all-reduce
+    # buffer surviving the other ops of a layer, and the gather pair replaying
+    # on a side stream while the main stream works). It runs whether or not the
+    # reduce-scatter matched, with the reduce-scatter dropped from the layer
+    # when it did not, so those two items stay decidable on their own.
     first = _heavy_tailed(ROWS, ROUTER_COLS, rank, 40, torch.float32, device)
     second = _heavy_tailed(ROWS, LATENT_COLS, rank, 41, torch.bfloat16, device)
     expected_first = torch.stack(gather_all(first))
@@ -198,6 +209,8 @@ def _worker(rank: int, port: int, evidence: str) -> None:
     rs_reference = column_reduce_scatter_reference(gathered_latent[0], WORLD, "fp32", cols=LATENT_COLS)[rank]
     static = ring.all_reduce_input((ROWS, HIDDEN), torch.bfloat16)
     assert static is not None
+    ops = ["ar", "ag_pair", "rs_fp32", "ar"] if reduce_scatter_ok else ["ar", "ag_pair", "ar"]
+    block = None
     for layer in range(200):
         static.copy_(hidden[layer % 3])
         a1 = ring.all_reduce(static, borrow_output=True)
@@ -207,7 +220,8 @@ def _worker(rank: int, port: int, evidence: str) -> None:
             g_first, g_second = ring.all_gather_pair(first, second)
         done.record(side)
         main.wait_event(done)
-        block = ring.reduce_scatter_columns(latent[0], wire="fp32", cols=LATENT_COLS)
+        if reduce_scatter_ok:
+            block = ring.reduce_scatter_columns(latent[0], wire="fp32", cols=LATENT_COLS)
         a1_snapshot = a1.clone()
         a1.copy_(hidden[(layer + 1) % 3])
         a5 = ring.all_reduce(a1, borrow_output=True)
@@ -217,13 +231,15 @@ def _worker(rank: int, port: int, evidence: str) -> None:
             assert torch.equal(a5, expected[(layer + 1) % 3])
             assert torch.equal(g_first.view(torch.int32), expected_first.view(torch.int32))
             assert torch.equal(g_second.view(torch.int16), expected_second.view(torch.int16))
-            assert torch.equal(block, rs_reference)
+            if reduce_scatter_ok:
+                assert torch.equal(block, rs_reference)
             assert same_on_all_ranks(a5)
     torch.cuda.synchronize(device)
-    assert {k[0] for k in ring._replay_entries} >= {"ag_pair", "ar", "rs_fp32"}
+    assert {k[0] for k in ring._replay_entries} >= set(ops)
     record(
         "layer_sequence_replay_passed",
         layers=200,
+        ops=ops,
         entries=[k[0] for k in ring._replay_entries],
         op_seq=ring._op_seq,
     )
@@ -233,6 +249,13 @@ def _worker(rank: int, port: int, evidence: str) -> None:
         with open(evidence, "w") as stream:
             json.dump(records, stream, indent=2)
     dist.destroy_process_group()
+    if not reduce_scatter_ok:
+        raise AssertionError(
+            "column reduce-scatter: fp32 wire blocks differing from the chained "
+            f"reference on {fp32_faults} (rank, call) pairs, "
+            f"fp32 mismatch vs fp64 {stats['fp32']} against ring {ring_mismatch}; "
+            f"bf16 wire faults {bf16_faults}"
+        )
 
 
 @pytest.mark.skipif(
