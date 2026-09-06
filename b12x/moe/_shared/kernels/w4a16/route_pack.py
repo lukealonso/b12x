@@ -19,7 +19,7 @@ _SMALL_PREFIX_MAX_ROUTE_BLOCKS = 512
 _FAST_COUNT_BLOCK_T = 1024
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["live_numel"])
 def _w4a16_route_count_kernel(
     topk_ids,
     expert_map,
@@ -122,7 +122,9 @@ def _workspace_slice(
     return tensor[:elements]
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=["live_numel", "max_packed_routes", "max_route_blocks"]
+)
 def _pack_topk_routes_post_prefix_kernel(
     packed_route_indices,
     block_expert_ids,
@@ -130,8 +132,8 @@ def _pack_topk_routes_post_prefix_kernel(
     live_numel,
     BLOCK_SIZE: tl.constexpr,
     NUM_EXPERTS: tl.constexpr,
-    MAX_PACKED_ROUTES: tl.constexpr,
-    MAX_ROUTE_BLOCKS: tl.constexpr,
+    max_packed_routes,
+    max_route_blocks,
     BLOCK_T: tl.constexpr,
     SEARCH_STEPS: tl.constexpr,
 ):
@@ -146,12 +148,12 @@ def _pack_topk_routes_post_prefix_kernel(
     tl.store(
         packed_route_indices + offsets,
         live_numel,
-        mask=offsets < MAX_PACKED_ROUTES,
+        mask=offsets < max_packed_routes,
     )
 
     total = tl.load(expert_offsets + NUM_EXPERTS)
     block_rows = offsets * BLOCK_SIZE
-    valid_blocks = (offsets < MAX_ROUTE_BLOCKS) & (block_rows < total)
+    valid_blocks = (offsets < max_route_blocks) & (block_rows < total)
     low = tl.zeros((BLOCK_T,), dtype=tl.int32)
     high = tl.full((BLOCK_T,), NUM_EXPERTS, dtype=tl.int32)
     for _ in tl.static_range(0, SEARCH_STEPS):
@@ -164,7 +166,7 @@ def _pack_topk_routes_post_prefix_kernel(
     tl.store(
         block_expert_ids + offsets,
         block_experts,
-        mask=offsets < MAX_ROUTE_BLOCKS,
+        mask=offsets < max_route_blocks,
     )
 
 
@@ -264,7 +266,7 @@ def _pack_topk_routes_small_prefix_kernel(
     )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["live_numel"])
 def _pack_topk_routes_sort_kernel(
     topk_ids,
     expert_map,
@@ -517,8 +519,8 @@ def pack_topk_routes_by_expert(
             numel,
             BLOCK_SIZE=int(block_size),
             NUM_EXPERTS=int(num_experts),
-            MAX_PACKED_ROUTES=max_packed_routes,
-            MAX_ROUTE_BLOCKS=max_route_blocks,
+            max_packed_routes=max_packed_routes,
+            max_route_blocks=max_route_blocks,
             BLOCK_T=_POST_PREFIX_BLOCK_T,
             SEARCH_STEPS=block_e.bit_length(),
             num_warps=4,

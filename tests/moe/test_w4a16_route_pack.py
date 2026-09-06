@@ -14,6 +14,33 @@ from b12x.moe._shared.kernels.w4a16.host import (
 )
 
 
+def test_post_prefix_capacity_bounds_are_runtime_scalars() -> None:
+    kernel = route_pack_module._pack_topk_routes_post_prefix_kernel
+    constexpr_names = {kernel.arg_names[index] for index in kernel.constexprs}
+
+    assert "max_packed_routes" not in constexpr_names
+    assert "max_route_blocks" not in constexpr_names
+
+
+@pytest.mark.parametrize(
+    ("kernel", "runtime_names"),
+    [
+        (route_pack_module._w4a16_route_count_kernel, {"live_numel"}),
+        (
+            route_pack_module._pack_topk_routes_post_prefix_kernel,
+            {"live_numel", "max_packed_routes", "max_route_blocks"},
+        ),
+        (route_pack_module._pack_topk_routes_sort_kernel, {"live_numel"}),
+    ],
+)
+def test_route_pack_runtime_bounds_do_not_specialize(kernel, runtime_names) -> None:
+    do_not_specialize = {
+        value if isinstance(value, str) else kernel.arg_names[value]
+        for value in kernel.do_not_specialize
+    }
+    assert do_not_specialize >= runtime_names
+
+
 @pytest.mark.parametrize(
     ("max_tokens", "topk", "num_experts"),
     [
