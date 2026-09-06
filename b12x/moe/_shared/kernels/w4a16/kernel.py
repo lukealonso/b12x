@@ -215,6 +215,29 @@ def _sqg_xor_cheb_t12_smem_enabled() -> bool:
     return os.environ.get("B12X_SQG_XOR_CHEB_T12_SMEM", "1") == "1"
 
 
+def _w4a16_cross_tile_prefetch_enabled() -> bool:
+    """Issue the next tile's route metadata and first stages during the epilogue.
+
+    Applies to whole-tile route-packed schedules (the large-M prefill grids):
+    the persistent loop resolves the next tile early, loads its packed route
+    indices while the current tile computes, and issues its first
+    ``_STAGES - 1`` A/B stages right after the current MMA loop, so the fold
+    and the output drain overlap the global-memory latency the next tile
+    would otherwise expose in its prologue. The tile sequence, the K order
+    and the fold order are unchanged (bit-identical outputs). Participates
+    in the kernel cache key.
+    """
+
+    return os.environ.get("B12X_W4A16_CROSS_TILE_PREFETCH", "1") == "1"
+
+
+# Shared memory the fused launch appends after a GEMM's own layout: the
+# 4 KiB modal T12 table, the 16-byte copy barrier and the 1 KiB alignment
+# of the storage struct. The de-aliased reduction scratch is only used when
+# the layout still fits below the opt-in limit with this reserve.
+_CROSS_TILE_PREFETCH_SMEM_RESERVE_BYTES = (1 << 12) + 16 + 1024
+
+
 def _sqg_xor_cheb_t12_decode_chain() -> str:
     """Select the instruction sequence of the modal T12 window decode.
 
@@ -1380,9 +1403,61 @@ class W4A16GemmKernel:
         sh_size_max = max(sh_red_size, sh_b_size)
         sh_bias_size = self.cta_n_blocks * 16 // 8
         sh_b_red_bias_size = max(sh_size_max, sh_size_min + sh_bias_size)
-        self.sh_b_off = self.sh_valid_count_off
-        self.sh_red_off = self.sh_valid_count_off
-        self.sh_s_off = self.sh_valid_count_off + sh_b_red_bias_size
+        # Cross-tile prefetch (whole-tile route-packed schedules): the next
+        # tile's route metadata and first pipeline stages are issued during
+        # the current tile's epilogue. It needs two route-metadata blocks
+        # (one per tile parity) and, for the B stages to be issued before the
+        # fold, a reduction scratch that does not alias the B stages. The
+        # de-aliased layout is used only when it fits next to the staged
+        # 4 KiB T12 table; otherwise the B stages are issued after the drain.
+        self.cross_tile_prefetch = (
+            _w4a16_cross_tile_prefetch_enabled()
+            and self.schedule_whole_tiles
+            and self.schedule_route_block_factor == 1
+            and not self.uses_m_block_8
+            and not self.direct_topk_routes
+            and not self.dense_route_fast_path
+            and not self.single_token_route_fast_path
+            and not self.trellis_pair_dynamic
+            and not self.fused_topk_sum
+        )
+        self.sh_meta_int4 = self.sh_valid_count_off + 1
+        pipeline_int4 = _STAGES * self.s_sh_stage + _STAGES * self.a_sh_stage
+        # Residency contract: ``blocks_per_sm`` CTAs of this layout plus the
+        # fused launch's reserve must fit, or the persistent grid barrier
+        # would wait for CTAs that are never resident.
+        smem_budget = int(max_shared_mem) // int(self.blocks_per_sm)
+        if self.cross_tile_prefetch:
+            sh_meta_total = 2 * self.sh_meta_int4
+            aliased_int4 = sh_meta_total + sh_b_red_bias_size + pipeline_int4
+            if (
+                aliased_int4 * 16 + _CROSS_TILE_PREFETCH_SMEM_RESERVE_BYTES
+                > smem_budget
+            ):
+                self.cross_tile_prefetch = False
+        self.sh_meta_copies = 2 if self.cross_tile_prefetch else 1
+        self.sh_red_dealiased = False
+        if self.cross_tile_prefetch:
+            sh_meta_total = 2 * self.sh_meta_int4
+            self.sh_b_off = sh_meta_total
+            dealiased_int4 = (
+                sh_meta_total + sh_b_size + sh_red_size + sh_bias_size + pipeline_int4
+            )
+            self.sh_red_dealiased = (
+                dealiased_int4 * 16 + _CROSS_TILE_PREFETCH_SMEM_RESERVE_BYTES
+                <= smem_budget
+            )
+            if self.sh_red_dealiased:
+                self.sh_red_off = sh_meta_total + sh_b_size
+                self.sh_s_off = self.sh_red_off + sh_red_size + sh_bias_size
+            else:
+                self.sh_red_off = sh_meta_total
+                self.sh_s_off = sh_meta_total + sh_b_red_bias_size
+        else:
+            self.sh_b_off = self.sh_valid_count_off
+            self.sh_red_off = self.sh_valid_count_off
+            self.sh_s_off = self.sh_valid_count_off + sh_b_red_bias_size
+        self.sh_meta_stride_bytes = self.sh_meta_int4 * 16
         self.sh_a_off = self.sh_s_off + _STAGES * self.s_sh_stage
         self.shared_int4 = self.sh_a_off + _STAGES * self.a_sh_stage
         self.shared_words = self.shared_int4 * 4
@@ -1442,6 +1517,8 @@ class W4A16GemmKernel:
             self.sqg_xor_cheb_t12_smem,
             self.small_m_splitk,
             self.sqg_xor_cheb_t12_decode_chain,
+            self.cross_tile_prefetch,
+            self.sh_red_dealiased,
         )
 
     @cute.jit
@@ -1702,6 +1779,28 @@ class W4A16GemmKernel:
         active_size_m: Int32,
         emit_tile: cutlass.Constexpr = None,
     ):
+        if cutlass.const_expr(self.cross_tile_prefetch and emit_tile is None):
+            self._run_persistent_gemm_pipelined(
+                a_bf16_flat,
+                a_alt_bf16_flat,
+                b_i32_flat,
+                c_bf16_flat,
+                scales_i32_flat,
+                global_scale,
+                packed_route_indices,
+                block_expert_ids,
+                packed_route_count,
+                topk_weights_flat,
+                c_tmp_f32_flat,
+                locks_i32_flat,
+                trellis_lut_addr,
+                smem_base,
+                tid,
+                cta,
+                grid_x,
+                active_size_m,
+            )
+            return
         n_tiles = Int32(self.n_tiles)
         route_blocks = active_size_m * Int32(self.top_k)
         if cutlass.const_expr(self.dense_route_fast_path):
@@ -1905,16 +2004,108 @@ class W4A16GemmKernel:
                         route_block_idx += Int32(1)
 
     @cute.jit
+    def _run_persistent_gemm_pipelined(
+        self,
+        a_bf16_flat: cute.Tensor,
+        a_alt_bf16_flat: cute.Tensor,
+        b_i32_flat: cute.Tensor,
+        c_bf16_flat: cute.Tensor,
+        scales_i32_flat: cute.Tensor,
+        global_scale: cute.Tensor,
+        packed_route_indices: cute.Tensor,
+        block_expert_ids: cute.Tensor,
+        packed_route_count: cute.Tensor,
+        topk_weights_flat: cute.Tensor,
+        c_tmp_f32_flat: cute.Tensor,
+        locks_i32_flat: cute.Tensor,
+        trellis_lut_addr: Int64,
+        smem_base: Int32,
+        tid: Int32,
+        cta: Int32,
+        grid_x: Int32,
+        active_size_m: Int32,
+    ):
+        """Whole-tile persistent loop with the next tile resolved one step ahead.
+
+        Tile sequence, K order and fold order are those of the whole-tile
+        branch of ``_run_persistent_gemm`` (task ``cta + wave * grid_x``,
+        route-block-major, ragged last wave skipped). The next executed tile
+        is known before the current one starts, so its prologue can be
+        overlapped (see ``_run_tile_large_m_pipelined``); a tile whose next
+        candidate is beyond the route blocks or has no expert simply runs the
+        following tile without prefetch.
+        """
+        n_tiles = Int32(self.n_tiles)
+        route_blocks = packed_route_count[Int32(0)].to(Int32) // Int32(
+            self.moe_block_size
+        )
+        global_mn_tiles = route_blocks * n_tiles
+        remaining = (global_mn_tiles + grid_x - Int32(1)) // grid_x
+        work_mn_tile = cta
+        prefetched = Int32(0)
+        parity = Int32(0)
+        while remaining > Int32(0):
+            remaining -= Int32(1)
+            route_block_idx = work_mn_tile // n_tiles
+            output_n_tile = work_mn_tile - route_block_idx * n_tiles
+            if route_block_idx < route_blocks:
+                expert_idx = block_expert_ids[route_block_idx].to(Int32)
+                if expert_idx >= Int32(0):
+                    next_tile = work_mn_tile + grid_x
+                    next_route_block_idx = next_tile // n_tiles
+                    next_output_n_tile = next_tile - next_route_block_idx * n_tiles
+                    next_expert_idx = Int32(0)
+                    has_next = Int32(0)
+                    if remaining > Int32(0) and next_route_block_idx < route_blocks:
+                        next_expert_idx = block_expert_ids[next_route_block_idx].to(
+                            Int32
+                        )
+                        if next_expert_idx >= Int32(0):
+                            has_next = Int32(1)
+                    self._run_tile_large_m_pipelined(
+                        a_bf16_flat,
+                        a_alt_bf16_flat,
+                        b_i32_flat,
+                        c_bf16_flat,
+                        scales_i32_flat,
+                        global_scale,
+                        packed_route_indices,
+                        topk_weights_flat,
+                        c_tmp_f32_flat,
+                        locks_i32_flat,
+                        trellis_lut_addr,
+                        smem_base,
+                        tid,
+                        route_block_idx,
+                        expert_idx,
+                        output_n_tile,
+                        active_size_m,
+                        prefetched,
+                        parity,
+                        has_next,
+                        next_route_block_idx,
+                        next_expert_idx,
+                        next_output_n_tile,
+                        -1,
+                    )
+                    prefetched = has_next
+                    parity = Int32(1) - parity
+            work_mn_tile += grid_x
+
+    @cute.jit
     def _read_moe_block_data(
         self,
         packed_route_indices: cute.Tensor,
         topk_weights_flat: cute.Tensor,
-        smem_base: Int32,
+        meta_base: Int32,
         tid: Int32,
         route_block_idx: Int32,
         global_scale_f32: cutlass.Float32,
         active_size_m: Int32,
     ) -> Int32:
+        # ``meta_base`` is the shared byte address of this tile's route
+        # metadata block (``smem_base`` plus the parity offset when the
+        # cross-tile prefetch double-buffers the metadata).
         if cutlass.const_expr(self.dense_route_fast_path):
             block_row = route_block_idx * Int32(self.moe_block_size)
             valid_rows = active_size_m - block_row
@@ -1925,11 +2116,11 @@ class W4A16GemmKernel:
             if tid < Int32(self.moe_block_size):
                 row = block_row + tid
                 st_shared_i32(
-                    smem_base + Int32(self.sh_route_off * 16) + tid * Int32(4),
+                    meta_base + Int32(self.sh_route_off * 16) + tid * Int32(4),
                     row,
                 )
                 st_shared_i32(
-                    smem_base + Int32(self.sh_rd_route_off * 16) + tid * Int32(4),
+                    meta_base + Int32(self.sh_rd_route_off * 16) + tid * Int32(4),
                     row,
                 )
             cute.arch.sync_threads()
@@ -1938,15 +2129,15 @@ class W4A16GemmKernel:
         if cutlass.const_expr(self.direct_topk_routes):
             if tid == Int32(0):
                 idx = route_block_idx
-                st_shared_i32(smem_base + Int32(self.sh_route_off * 16), idx)
+                st_shared_i32(meta_base + Int32(self.sh_route_off * 16), idx)
                 rd_row = idx // Int32(self.top_k)
                 if cutlass.const_expr(self.route_major_a):
                     rd_row = idx
-                st_shared_i32(smem_base + Int32(self.sh_rd_route_off * 16), rd_row)
+                st_shared_i32(meta_base + Int32(self.sh_rd_route_off * 16), rd_row)
                 if cutlass.const_expr(self.mul_topk_weights):
                     topk = topk_weights_flat[idx].to(cutlass.Float32) * global_scale_f32
                     st_shared_u32(
-                        smem_base + Int32(self.sh_topk_off * 16),
+                        meta_base + Int32(self.sh_topk_off * 16),
                         self._broadcast_f32_to_elem2(topk),
                     )
             cute.arch.sync_threads()
@@ -1957,11 +2148,11 @@ class W4A16GemmKernel:
                 idx = packed_route_indices[
                     route_block_idx * Int32(self.moe_block_size)
                 ].to(Int32)
-                st_shared_i32(smem_base + Int32(self.sh_route_off * 16), idx)
+                st_shared_i32(meta_base + Int32(self.sh_route_off * 16), idx)
                 rd_row = idx // Int32(self.top_k)
                 if cutlass.const_expr(self.route_major_a):
                     rd_row = idx
-                st_shared_i32(smem_base + Int32(self.sh_rd_route_off * 16), rd_row)
+                st_shared_i32(meta_base + Int32(self.sh_rd_route_off * 16), rd_row)
                 if cutlass.const_expr(self.mul_topk_weights):
                     safe_idx = idx
                     if idx >= active_size_m * Int32(self.top_k):
@@ -1971,14 +2162,30 @@ class W4A16GemmKernel:
                         * global_scale_f32
                     )
                     st_shared_u32(
-                        smem_base + Int32(self.sh_topk_off * 16),
+                        meta_base + Int32(self.sh_topk_off * 16),
                         self._broadcast_f32_to_elem2(topk),
                     )
             cute.arch.sync_threads()
             return Int32(1)
 
+        self._issue_route_metadata_load(
+            packed_route_indices, meta_base, tid, route_block_idx
+        )
+        return self._finish_route_metadata(
+            topk_weights_flat, meta_base, tid, global_scale_f32, active_size_m
+        )
+
+    @cute.jit
+    def _issue_route_metadata_load(
+        self,
+        packed_route_indices: cute.Tensor,
+        meta_base: Int32,
+        tid: Int32,
+        route_block_idx: Int32,
+    ):
+        """Start the async copy of one route block's packed route indices."""
         route_indices_int4_addr = self._int4_addr(
-            smem_base, Int32(self.sh_route_off) + tid
+            meta_base, Int32(self.sh_route_off) + tid
         )
         route_indices_gmem = get_ptr_as_int64(
             packed_route_indices,
@@ -1990,6 +2197,22 @@ class W4A16GemmKernel:
             (tid < Int32(self.moe_block_size // 4)).to(Int32),
         )
         cute.arch.cp_async_commit_group()
+
+    @cute.jit
+    def _finish_route_metadata(
+        self,
+        topk_weights_flat: cute.Tensor,
+        meta_base: Int32,
+        tid: Int32,
+        global_scale_f32: cutlass.Float32,
+        active_size_m: Int32,
+    ) -> Int32:
+        """Derive the valid-row count, A read rows and top-k weights.
+
+        Waits for every outstanding cp.async group (the route indices were
+        the last one issued), then fills the block's metadata and returns
+        the number of valid routes.
+        """
         cute.arch.cp_async_wait_group(0)
         cute.arch.sync_threads()
 
@@ -2001,23 +2224,23 @@ class W4A16GemmKernel:
                 j = lane * Int32(size_per_thread) + Int32(i)
                 if j < Int32(self.moe_block_size):
                     idx = ld_shared_i32_relaxed(
-                        smem_base + Int32(self.sh_route_off * 16) + j * Int32(4)
+                        meta_base + Int32(self.sh_route_off * 16) + j * Int32(4)
                     )
                     if idx < active_size_m * Int32(self.top_k):
                         local_count += Int32(1)
             valid = cute.arch.warp_redux_sync(local_count, "add")
             if lane == Int32(0):
-                st_shared_i32(smem_base + Int32(self.sh_valid_count_off * 16), valid)
+                st_shared_i32(meta_base + Int32(self.sh_valid_count_off * 16), valid)
 
         if tid < Int32(self.moe_block_size):
             idx = ld_shared_i32_relaxed(
-                smem_base + Int32(self.sh_route_off * 16) + tid * Int32(4)
+                meta_base + Int32(self.sh_route_off * 16) + tid * Int32(4)
             )
             rd_row = idx // Int32(self.top_k)
             if cutlass.const_expr(self.route_major_a):
                 rd_row = idx
             st_shared_i32(
-                smem_base + Int32(self.sh_rd_route_off * 16) + tid * Int32(4),
+                meta_base + Int32(self.sh_rd_route_off * 16) + tid * Int32(4),
                 rd_row,
             )
             if cutlass.const_expr(self.mul_topk_weights):
@@ -2030,13 +2253,13 @@ class W4A16GemmKernel:
                 packed_topk = self._broadcast_f32_to_elem2(topk)
                 # top-k weights are cached as packed element pairs.
                 topk_word_addr = (
-                    smem_base + Int32(self.sh_topk_off * 16) + tid * Int32(4)
+                    meta_base + Int32(self.sh_topk_off * 16) + tid * Int32(4)
                 )
                 st_shared_u32(topk_word_addr, packed_topk)
 
         cute.arch.sync_threads()
         valid_count = ld_shared_i32_relaxed(
-            smem_base + Int32(self.sh_valid_count_off * 16)
+            meta_base + Int32(self.sh_valid_count_off * 16)
         )
         cute.arch.sync_threads()
         return valid_count
@@ -2312,28 +2535,35 @@ class W4A16GemmKernel:
             )
 
     @cute.jit
-    def _tile_common_prologue(
-        self,
-        global_scale: cute.Tensor,
-        packed_route_indices: cute.Tensor,
-        topk_weights_flat: cute.Tensor,
-        smem_base: Int32,
-        tid: Int32,
-        route_block_idx: Int32,
-        expert_idx: Int32,
-        output_n_tile: Int32,
-        active_size_m: Int32,
-    ):
+    def _expert_global_scale(
+        self, global_scale: cute.Tensor, expert_idx: Int32
+    ) -> cutlass.Float32:
         global_scale_f32 = global_scale[expert_idx].to(cutlass.Float32)
         if cutlass.const_expr(self.scale_format_e8m0_k32):
             if cutlass.const_expr(self.is_fp16):
                 global_scale_f32 *= cutlass.Float32(_E8M0_K32_FP16_GLOBAL_COMPENSATION)
             else:
                 global_scale_f32 *= cutlass.Float32(_E8M0_K32_BF16_GLOBAL_COMPENSATION)
+        return global_scale_f32
+
+    @cute.jit
+    def _tile_common_prologue(
+        self,
+        global_scale: cute.Tensor,
+        packed_route_indices: cute.Tensor,
+        topk_weights_flat: cute.Tensor,
+        meta_base: Int32,
+        tid: Int32,
+        route_block_idx: Int32,
+        expert_idx: Int32,
+        output_n_tile: Int32,
+        active_size_m: Int32,
+    ):
+        global_scale_f32 = self._expert_global_scale(global_scale, expert_idx)
         block_valid_rows = self._read_moe_block_data(
             packed_route_indices,
             topk_weights_flat,
-            smem_base,
+            meta_base,
             tid,
             route_block_idx,
             global_scale_f32,
@@ -2540,6 +2770,7 @@ class W4A16GemmKernel:
             b_i32_flat,
             scales_i32_flat,
             smem_base,
+            smem_base,
             tid,
             k_tiles,
             reduce_k_tile,
@@ -2590,6 +2821,7 @@ class W4A16GemmKernel:
             scales_i32_flat,
             trellis_lut_addr,
             smem_base,
+            smem_base,
             tid,
             acc,
             acc,
@@ -2628,6 +2860,7 @@ class W4A16GemmKernel:
             c_bf16_flat,
             c_tmp_f32_flat,
             locks_i32_flat,
+            smem_base,
             smem_base,
             tid,
             output_n_tile,
@@ -2714,6 +2947,7 @@ class W4A16GemmKernel:
             b_i32_flat,
             scales_i32_flat,
             smem_base,
+            smem_base,
             tid,
             k_tiles,
             reduce_k_tile,
@@ -2764,6 +2998,7 @@ class W4A16GemmKernel:
             scales_i32_flat,
             trellis_lut_addr,
             smem_base,
+            smem_base,
             tid,
             acc0,
             acc1,
@@ -2803,6 +3038,7 @@ class W4A16GemmKernel:
             c_tmp_f32_flat,
             locks_i32_flat,
             smem_base,
+            smem_base,
             tid,
             output_n_tile,
             block_valid_rows0,
@@ -2821,6 +3057,7 @@ class W4A16GemmKernel:
             c_bf16_flat,
             c_tmp_f32_flat,
             locks_i32_flat,
+            smem_base,
             smem_base,
             tid,
             output_n_tile,
@@ -2927,6 +3164,7 @@ class W4A16GemmKernel:
             b_i32_flat,
             scales_i32_flat,
             smem_base,
+            smem_base,
             tid,
             k_tiles,
             reduce_k_tile,
@@ -2977,6 +3215,7 @@ class W4A16GemmKernel:
             scales_i32_flat,
             trellis_lut_addr,
             smem_base,
+            smem_base,
             tid,
             acc0,
             acc1,
@@ -3016,6 +3255,7 @@ class W4A16GemmKernel:
             c_tmp_f32_flat,
             locks_i32_flat,
             smem_base,
+            smem_base,
             tid,
             output_n_tile,
             block_valid_rows,
@@ -3028,6 +3268,327 @@ class W4A16GemmKernel:
         )
 
     @cute.jit
+    def _run_tile_large_m_pipelined(
+        self,
+        a_bf16_flat: cute.Tensor,
+        a_alt_bf16_flat: cute.Tensor,
+        b_i32_flat: cute.Tensor,
+        c_bf16_flat: cute.Tensor,
+        scales_i32_flat: cute.Tensor,
+        global_scale: cute.Tensor,
+        packed_route_indices: cute.Tensor,
+        topk_weights_flat: cute.Tensor,
+        c_tmp_f32_flat: cute.Tensor,
+        locks_i32_flat: cute.Tensor,
+        trellis_lut_addr: Int64,
+        smem_base: Int32,
+        tid: Int32,
+        route_block_idx: Int32,
+        expert_idx: Int32,
+        output_n_tile: Int32,
+        active_size_m: Int32,
+        prefetched: Int32,
+        parity: Int32,
+        has_next: Int32,
+        next_route_block_idx: Int32,
+        next_expert_idx: Int32,
+        next_output_n_tile: Int32,
+        dynamic_pair_override: cutlass.Constexpr[int],
+    ):
+        """One whole-K mn-tile with the next tile's prologue overlapped.
+
+        Same arithmetic as ``_run_tile_large_m`` (same k-tile order, same
+        stage assignment ``k-tile i -> pipe i % _STAGES``, same fold and
+        store); the differences are in when the loads are issued:
+
+        * ``prefetched != 0``: this tile's route metadata (parity block
+          ``parity``) and its first ``_STAGES - 1`` stages were issued by the
+          previous tile, so the prologue only waits for stage 0.
+        * ``has_next != 0``: the next tile's packed route indices are loaded
+          into the other metadata block during this tile's MMA loop; after
+          the loop its A read rows / valid count are derived and, when the
+          reduction scratch does not alias the B stages, its first stages
+          are issued before the fold (otherwise after the output drain).
+        """
+        meta_base = smem_base + parity * Int32(self.sh_meta_stride_bytes)
+        next_meta_base = smem_base + (Int32(1) - parity) * Int32(
+            self.sh_meta_stride_bytes
+        )
+        global_scale_f32 = self._expert_global_scale(global_scale, expert_idx)
+        block_valid_rows = Int32(0)
+        if prefetched == Int32(0):
+            block_valid_rows = self._read_moe_block_data(
+                packed_route_indices,
+                topk_weights_flat,
+                meta_base,
+                tid,
+                route_block_idx,
+                global_scale_f32,
+                active_size_m,
+            )
+        else:
+            # Written by the previous tile's epilogue behind a CTA barrier.
+            block_valid_rows = ld_shared_i32_relaxed(
+                meta_base + Int32(self.sh_valid_count_off * 16)
+            )
+        (
+            a_gl_stride,
+            b_gl_stride,
+            s_gl_stride,
+            scales_expert_off,
+            b_gl_rd_base,
+            a_gl_rd_row,
+            a_gl_rd_col0,
+            a_sh_wr,
+            a_rows_per_iter,
+            b_sh_rd,
+            s_sh_rd,
+        ) = self._tile_stream_offsets(tid, expert_idx, output_n_tile)
+        a_sh_rd = self._a_shared_read_offset(tid, 16)
+        acc0 = [
+            cute.make_rmem_tensor((_SCALAR_ACC_FRAGMENT_WIDTH,), cutlass.Float32)
+            for _ in range(32 // _SCALAR_ACC_FRAGMENT_WIDTH)
+        ]
+        for frag in cutlass.range_constexpr(32 // _SCALAR_ACC_FRAGMENT_WIDTH):
+            acc0[frag].fill(0.0)
+        acc1 = acc0
+        acc2 = acc0
+        acc3 = acc0
+        if cutlass.const_expr(self.cta_m_blocks > 1):
+            acc1 = [
+                cute.make_rmem_tensor((_SCALAR_ACC_FRAGMENT_WIDTH,), cutlass.Float32)
+                for _ in range(32 // _SCALAR_ACC_FRAGMENT_WIDTH)
+            ]
+            for frag in cutlass.range_constexpr(32 // _SCALAR_ACC_FRAGMENT_WIDTH):
+                acc1[frag].fill(0.0)
+        if cutlass.const_expr(self.cta_m_blocks > 2):
+            acc2 = [
+                cute.make_rmem_tensor((_SCALAR_ACC_FRAGMENT_WIDTH,), cutlass.Float32)
+                for _ in range(32 // _SCALAR_ACC_FRAGMENT_WIDTH)
+            ]
+            for frag in cutlass.range_constexpr(32 // _SCALAR_ACC_FRAGMENT_WIDTH):
+                acc2[frag].fill(0.0)
+        if cutlass.const_expr(self.cta_m_blocks > 3):
+            acc3 = [
+                cute.make_rmem_tensor((_SCALAR_ACC_FRAGMENT_WIDTH,), cutlass.Float32)
+                for _ in range(32 // _SCALAR_ACC_FRAGMENT_WIDTH)
+            ]
+            for frag in cutlass.range_constexpr(32 // _SCALAR_ACC_FRAGMENT_WIDTH):
+                acc3[frag].fill(0.0)
+
+        k_tiles = Int32(self.k_tiles)
+        if prefetched == Int32(0):
+            self._issue_initial_tiles(
+                a_bf16_flat,
+                a_alt_bf16_flat,
+                b_i32_flat,
+                scales_i32_flat,
+                smem_base,
+                meta_base,
+                tid,
+                k_tiles,
+                Int32(0),
+                block_valid_rows,
+                Int32(0),
+                False,
+                a_gl_stride,
+                b_gl_stride,
+                s_gl_stride,
+                scales_expert_off,
+                b_gl_rd_base,
+                a_gl_rd_row,
+                a_gl_rd_col0,
+                a_sh_wr,
+                a_rows_per_iter,
+                output_n_tile,
+                expert_idx,
+                dynamic_pair_override,
+            )
+        # Stage 0 of this tile is the oldest of the three outstanding groups.
+        cute.arch.cp_async_wait_group(_STAGES - 2)
+        cute.arch.sync_threads()
+        if has_next != Int32(0):
+            # The other metadata block was last read by the previous tile's
+            # output drain, which ended behind a CTA barrier.
+            self._issue_route_metadata_load(
+                packed_route_indices, next_meta_base, tid, next_route_block_idx
+            )
+
+        b_scale_cur = cute.make_rmem_tensor((2, 4), Uint32)
+        b_scale_next = cute.make_rmem_tensor((2, 4), Uint32)
+        self._load_b_scale_register_bundle(
+            b_scale_cur,
+            smem_base,
+            tid,
+            b_sh_rd,
+            s_sh_rd,
+            Int32(0),
+            Int32(0),
+            Int32(0),
+            dynamic_pair_override,
+        )
+        a_regs = cute.make_rmem_tensor((self.cta_m_blocks, 4), Uint32)
+        a_regs_next = cute.make_rmem_tensor((self.cta_m_blocks, 4), Uint32)
+        self._load_a_register_bundle(
+            a_regs,
+            smem_base,
+            a_sh_rd,
+            Int32(0),
+            Int32(0),
+            False,
+        )
+        self._run_mma_pipeline(
+            a_bf16_flat,
+            a_alt_bf16_flat,
+            b_i32_flat,
+            scales_i32_flat,
+            trellis_lut_addr,
+            smem_base,
+            meta_base,
+            tid,
+            acc0,
+            acc1,
+            acc2,
+            acc3,
+            b_scale_cur,
+            b_scale_next,
+            a_regs,
+            a_regs_next,
+            b_sh_rd,
+            s_sh_rd,
+            a_sh_rd,
+            k_tiles,
+            Int32(0),
+            block_valid_rows,
+            a_gl_stride,
+            b_gl_stride,
+            s_gl_stride,
+            scales_expert_off,
+            b_gl_rd_base,
+            a_gl_rd_row,
+            a_gl_rd_col0,
+            a_sh_wr,
+            a_rows_per_iter,
+            output_n_tile,
+            expert_idx,
+            dynamic_pair_override,
+            False,
+        )
+        # The MMA loop ends behind a CTA barrier: every stage has been read
+        # and no cp.async group other than the route-index load is pending.
+
+        next_valid_rows = Int32(0)
+        next_a_gl_stride = Int32(0)
+        next_b_gl_stride = Int32(0)
+        next_s_gl_stride = Int32(0)
+        next_scales_expert_off = Int32(0)
+        next_b_gl_rd_base = Int32(0)
+        if has_next != Int32(0):
+            next_global_scale_f32 = self._expert_global_scale(
+                global_scale, next_expert_idx
+            )
+            next_valid_rows = self._finish_route_metadata(
+                topk_weights_flat,
+                next_meta_base,
+                tid,
+                next_global_scale_f32,
+                active_size_m,
+            )
+            (
+                next_a_gl_stride,
+                next_b_gl_stride,
+                next_s_gl_stride,
+                next_scales_expert_off,
+                next_b_gl_rd_base,
+                _,
+                _,
+                _,
+                _,
+                _,
+                _,
+            ) = self._tile_stream_offsets(tid, next_expert_idx, next_output_n_tile)
+            if cutlass.const_expr(self.sh_red_dealiased):
+                # A and B stages are free (the fold and the drain use the
+                # de-aliased reduction scratch and this tile's metadata block).
+                self._issue_initial_tiles(
+                    a_bf16_flat,
+                    a_alt_bf16_flat,
+                    b_i32_flat,
+                    scales_i32_flat,
+                    smem_base,
+                    next_meta_base,
+                    tid,
+                    k_tiles,
+                    Int32(0),
+                    next_valid_rows,
+                    Int32(0),
+                    False,
+                    next_a_gl_stride,
+                    next_b_gl_stride,
+                    next_s_gl_stride,
+                    next_scales_expert_off,
+                    next_b_gl_rd_base,
+                    a_gl_rd_row,
+                    a_gl_rd_col0,
+                    a_sh_wr,
+                    a_rows_per_iter,
+                    next_output_n_tile,
+                    next_expert_idx,
+                    dynamic_pair_override,
+                )
+
+        self._finish_tile(
+            acc0,
+            acc1,
+            acc2,
+            acc3,
+            c_bf16_flat,
+            c_tmp_f32_flat,
+            locks_i32_flat,
+            smem_base,
+            meta_base,
+            tid,
+            output_n_tile,
+            block_valid_rows,
+            Int32(0),
+            global_scale_f32,
+            Int32(1),
+            Int32(0),
+            Int32(0),
+            False,
+        )
+        if cutlass.const_expr(not self.sh_red_dealiased):
+            # The B stages alias the reduction scratch: issue the next tile's
+            # stages once the drain (which ends behind a CTA barrier) is done.
+            if has_next != Int32(0):
+                self._issue_initial_tiles(
+                    a_bf16_flat,
+                    a_alt_bf16_flat,
+                    b_i32_flat,
+                    scales_i32_flat,
+                    smem_base,
+                    next_meta_base,
+                    tid,
+                    k_tiles,
+                    Int32(0),
+                    next_valid_rows,
+                    Int32(0),
+                    False,
+                    next_a_gl_stride,
+                    next_b_gl_stride,
+                    next_s_gl_stride,
+                    next_scales_expert_off,
+                    next_b_gl_rd_base,
+                    a_gl_rd_row,
+                    a_gl_rd_col0,
+                    a_sh_wr,
+                    a_rows_per_iter,
+                    next_output_n_tile,
+                    next_expert_idx,
+                    dynamic_pair_override,
+                )
+
+    @cute.jit
     def _run_mma_pipeline(
         self,
         a_bf16_flat: cute.Tensor,
@@ -3036,6 +3597,7 @@ class W4A16GemmKernel:
         scales_i32_flat: cute.Tensor,
         trellis_lut_addr: Int64,
         smem_base: Int32,
+        meta_base: Int32,
         tid: Int32,
         acc0,
         acc1,
@@ -3094,6 +3656,7 @@ class W4A16GemmKernel:
                             b_i32_flat,
                             scales_i32_flat,
                             smem_base,
+                            meta_base,
                             tid,
                             pipe,
                             kk,
@@ -3217,6 +3780,7 @@ class W4A16GemmKernel:
         scales_i32_flat: cute.Tensor,
         trellis_lut_addr: Int64,
         smem_base: Int32,
+        meta_base: Int32,
         tid: Int32,
         acc0,
         acc1,
@@ -3275,6 +3839,7 @@ class W4A16GemmKernel:
                             b_i32_flat,
                             scales_i32_flat,
                             smem_base,
+                            meta_base,
                             tid,
                             pipe,
                             kk,
@@ -3499,6 +4064,7 @@ class W4A16GemmKernel:
         c_tmp_f32_flat: cute.Tensor,
         locks_i32_flat: cute.Tensor,
         smem_base: Int32,
+        meta_base: Int32,
         tid: Int32,
         output_n_tile: Int32,
         block_valid_rows: Int32,
@@ -3553,6 +4119,7 @@ class W4A16GemmKernel:
                     acc0,
                     c_bf16_flat,
                     smem_base,
+                    meta_base,
                     tid,
                     output_n_tile,
                     block_valid_rows,
@@ -3567,6 +4134,7 @@ class W4A16GemmKernel:
                     acc3,
                     c_bf16_flat,
                     smem_base,
+                    meta_base,
                     tid,
                     output_n_tile,
                     block_valid_rows,
@@ -4946,6 +5514,7 @@ class W4A16GemmKernel:
         b_i32_flat: cute.Tensor,
         scales_i32_flat: cute.Tensor,
         smem_base: Int32,
+        meta_base: Int32,
         tid: Int32,
         pipe: Int32,
         tile_idx: Int32,
@@ -4981,7 +5550,7 @@ class W4A16GemmKernel:
             route_index = Int32(0)
             if metadata_row >= Int32(0) and metadata_row < route_rows:
                 route_index = ld_shared_i32_relaxed(
-                    smem_base
+                    meta_base
                     + Int32(self.sh_rd_route_off * 16)
                     + metadata_row * Int32(4)
                 )
@@ -5290,6 +5859,7 @@ class W4A16GemmKernel:
         b_i32_flat: cute.Tensor,
         scales_i32_flat: cute.Tensor,
         smem_base: Int32,
+        meta_base: Int32,
         tid: Int32,
         pipe: cutlass.Constexpr[int],
         kk: cutlass.Constexpr[int],
@@ -5319,6 +5889,7 @@ class W4A16GemmKernel:
                 b_i32_flat,
                 scales_i32_flat,
                 smem_base,
+                meta_base,
                 tid,
                 pipe,
                 tile_idx,
@@ -5349,6 +5920,7 @@ class W4A16GemmKernel:
         b_i32_flat: cute.Tensor,
         scales_i32_flat: cute.Tensor,
         smem_base: Int32,
+        meta_base: Int32,
         tid: Int32,
         k_tiles: Int32,
         reduce_k_tile: Int32,
@@ -5368,6 +5940,68 @@ class W4A16GemmKernel:
         expert_idx: Int32,
         dynamic_pair_override: cutlass.Constexpr[int],
     ):
+        self._issue_initial_tiles(
+            a_bf16_flat,
+            a_alt_bf16_flat,
+            b_i32_flat,
+            scales_i32_flat,
+            smem_base,
+            meta_base,
+            tid,
+            k_tiles,
+            reduce_k_tile,
+            block_valid_rows,
+            block_valid_rows1,
+            paired_m8,
+            a_gl_stride,
+            b_gl_stride,
+            s_gl_stride,
+            scales_expert_off,
+            b_gl_rd_base,
+            a_gl_rd_row,
+            a_gl_rd_col0,
+            a_sh_wr,
+            a_rows_per_iter,
+            output_n_tile,
+            expert_idx,
+            dynamic_pair_override,
+        )
+        cute.arch.cp_async_wait_group(_STAGES - 2)
+        cute.arch.sync_threads()
+
+    @cute.jit
+    def _issue_initial_tiles(
+        self,
+        a_bf16_flat: cute.Tensor,
+        a_alt_bf16_flat: cute.Tensor,
+        b_i32_flat: cute.Tensor,
+        scales_i32_flat: cute.Tensor,
+        smem_base: Int32,
+        meta_base: Int32,
+        tid: Int32,
+        k_tiles: Int32,
+        reduce_k_tile: Int32,
+        block_valid_rows: Int32,
+        block_valid_rows1: Int32,
+        paired_m8: cutlass.Constexpr[bool],
+        a_gl_stride: Int32,
+        b_gl_stride: Int32,
+        s_gl_stride: Int32,
+        scales_expert_off: Int32,
+        b_gl_rd_base: Int32,
+        a_gl_rd_row: Int32,
+        a_gl_rd_col0: Int32,
+        a_sh_wr: Int32,
+        a_rows_per_iter: Int32,
+        output_n_tile: Int32,
+        expert_idx: Int32,
+        dynamic_pair_override: cutlass.Constexpr[int],
+    ):
+        """Issue the first ``_STAGES - 1`` k-tiles of a tile as cp.async groups.
+
+        One group per pipeline stage (empty groups past ``k_tiles`` keep the
+        group accounting of ``cp_async_wait_group(_STAGES - 2)`` uniform).
+        """
         for pipe in cutlass.range_constexpr(_STAGES - 1):
             if Int32(pipe) < k_tiles:
                 self._stage_k_tile_async(
@@ -5376,6 +6010,7 @@ class W4A16GemmKernel:
                     b_i32_flat,
                     scales_i32_flat,
                     smem_base,
+                    meta_base,
                     tid,
                     Int32(pipe),
                     reduce_k_tile + Int32(pipe),
@@ -5397,8 +6032,6 @@ class W4A16GemmKernel:
                 )
             else:
                 cute.arch.cp_async_commit_group()
-        cute.arch.cp_async_wait_group(_STAGES - 2)
-        cute.arch.sync_threads()
 
     @cute.jit
     def _prefetch_lookahead_tile(
@@ -5408,6 +6041,7 @@ class W4A16GemmKernel:
         b_i32_flat: cute.Tensor,
         scales_i32_flat: cute.Tensor,
         smem_base: Int32,
+        meta_base: Int32,
         tid: Int32,
         pipe: cutlass.Constexpr[int],
         tile_idx: Int32,
@@ -5437,6 +6071,7 @@ class W4A16GemmKernel:
                 b_i32_flat,
                 scales_i32_flat,
                 smem_base,
+                meta_base,
                 tid,
                 Int32((pipe + _STAGES - 1) % _STAGES),
                 reduce_k_tile + fetch_tile,
@@ -5664,6 +6299,7 @@ class W4A16GemmKernel:
         self,
         c_bf16_flat: cute.Tensor,
         smem_base: Int32,
+        meta_base: Int32,
         c_gl_stride: Int32,
         c_gl_wr: Int32,
         c_gl_wr_delta: Int32,
@@ -5679,7 +6315,7 @@ class W4A16GemmKernel:
             if row < block_valid_rows:
                 metadata_row = metadata_row_base + row
                 route_index = ld_shared_i32_relaxed(
-                    smem_base + Int32(self.sh_route_off * 16) + metadata_row * Int32(4)
+                    meta_base + Int32(self.sh_route_off * 16) + metadata_row * Int32(4)
                 )
                 true_idx = Int64(route_index) * Int64(c_gl_stride) + Int64(
                     c_gl_wr % c_gl_stride
@@ -5689,7 +6325,7 @@ class W4A16GemmKernel:
                 )
                 if cutlass.const_expr(self.mul_topk_weights):
                     scale_bf2 = ld_shared_u32(
-                        smem_base
+                        meta_base
                         + Int32(self.sh_topk_off * 16)
                         + metadata_row * Int32(4)
                     )
@@ -5752,6 +6388,7 @@ class W4A16GemmKernel:
         self,
         c_bf16_flat: cute.Tensor,
         smem_base: Int32,
+        meta_base: Int32,
         c_gl_stride: Int32,
         c_gl_stride_covered: Int32,
         c_gl_wr: Int32,
@@ -5769,7 +6406,7 @@ class W4A16GemmKernel:
             if row < block_valid_rows and col_word < c_gl_stride:
                 metadata_row = metadata_row_base + row
                 route_index = ld_shared_i32_relaxed(
-                    smem_base + Int32(self.sh_route_off * 16) + metadata_row * Int32(4)
+                    meta_base + Int32(self.sh_route_off * 16) + metadata_row * Int32(4)
                 )
                 true_idx = Int64(route_index) * Int64(c_gl_stride) + Int64(col_word)
                 q0, q1, q2, q3 = ld_shared_v4_u32(
@@ -5777,7 +6414,7 @@ class W4A16GemmKernel:
                 )
                 if cutlass.const_expr(self.mul_topk_weights):
                     scale_bf2 = ld_shared_u32(
-                        smem_base
+                        meta_base
                         + Int32(self.sh_topk_off * 16)
                         + metadata_row * Int32(4)
                     )
@@ -5836,6 +6473,7 @@ class W4A16GemmKernel:
         acc,
         c_bf16_flat: cute.Tensor,
         smem_base: Int32,
+        meta_base: Int32,
         tid: Int32,
         output_n_tile: Int32,
         block_valid_rows: Int32,
@@ -5929,6 +6567,7 @@ class W4A16GemmKernel:
             self._drain_output_smem_tail(
                 c_bf16_flat,
                 smem_base,
+                meta_base,
                 c_gl_stride,
                 c_gl_stride_covered,
                 c_gl_wr,
@@ -5943,6 +6582,7 @@ class W4A16GemmKernel:
             self._drain_output_smem(
                 c_bf16_flat,
                 smem_base,
+                meta_base,
                 c_gl_stride,
                 c_gl_wr,
                 c_gl_wr_delta,
@@ -6185,6 +6825,7 @@ class W4A16GemmKernel:
         acc3,
         c_bf16_flat: cute.Tensor,
         smem_base: Int32,
+        meta_base: Int32,
         tid: Int32,
         output_n_tile: Int32,
         block_valid_rows: Int32,
@@ -6269,6 +6910,7 @@ class W4A16GemmKernel:
             self._drain_output_smem_tail(
                 c_bf16_flat,
                 smem_base,
+                meta_base,
                 c_gl_stride,
                 c_gl_stride_covered,
                 c_gl_wr,
@@ -6284,6 +6926,7 @@ class W4A16GemmKernel:
             self._drain_output_smem(
                 c_bf16_flat,
                 smem_base,
+                meta_base,
                 c_gl_stride,
                 c_gl_wr,
                 c_gl_wr_delta,
