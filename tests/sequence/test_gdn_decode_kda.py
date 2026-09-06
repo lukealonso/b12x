@@ -681,6 +681,101 @@ def test_kda_cuda_graph_replay_preserves_addresses() -> None:
     )
 
 
+@pytest.mark.parametrize("recurrent_block_v", [16, 32])
+@pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float32])
+def test_kda_tiles_reuse_compiled_kernels_with_mutable_live_counts(
+    recurrent_block_v: int,
+    state_dtype: torch.dtype,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from b12x._lib.runtime_control import (
+        freeze_kernel_resolution,
+        unfreeze_kernel_resolution,
+    )
+    from b12x.sequence.gdn_decode import _kernels
+
+    device = require_sm120()
+    binding = _make_case(
+        device=device,
+        state_dtype=state_dtype,
+        recurrent_block_v=recurrent_block_v,
+    )
+    initial_state = binding.recurrent_state.clone()
+    gdn.run_kda(binding)
+    kernel = _kernels._packed_sequential_kda_decode_kernel
+    cache = kernel.device_caches[torch.cuda.current_device()][0]
+    compiled = {key: id(value) for key, value in cache.items()}
+    assert compiled
+
+    def refuse_compile(*args, **kwargs):
+        pytest.fail("KDA live counts triggered compilation after warmup")
+
+    monkeypatch.setattr(kernel, "compile", refuse_compile)
+    addresses = tuple(
+        tensor.data_ptr()
+        for tensor in (
+            binding.scratch,
+            binding.mixed_qkv,
+            binding.raw_g,
+            binding.raw_beta,
+            binding.recurrent_state,
+            binding.output,
+        )
+    )
+    freeze_kernel_resolution("KDA tile policy live-count qualification")
+    try:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            gdn.run_kda(binding)
+        for starts, sequences, tokens in (([0, 3, 4], 2, 4), ([0, 2, 3], 2, 3), ([0, 1, 1], 1, 1)):
+            binding.query_start_loc.copy_(
+                torch.tensor(starts, dtype=torch.int32, device=device)
+            )
+            binding.num_seqs.fill_(sequences)
+            binding.num_tokens.fill_(tokens)
+            binding.num_accepted_tokens.fill_(1)
+            binding.mixed_qkv.copy_(torch.randn_like(binding.mixed_qkv).mul_(0.2))
+            binding.raw_g.copy_(torch.randn_like(binding.raw_g).mul_(0.2))
+            binding.raw_beta.copy_(torch.randn_like(binding.raw_beta).mul_(0.2))
+            state_reference = initial_state.clone()
+            expected = _reference(binding, state_reference)
+            binding.recurrent_state.copy_(initial_state)
+            gdn.run_kda(binding)
+            assert {key: id(value) for key, value in cache.items()} == compiled
+            binding.recurrent_state.copy_(initial_state)
+            binding.output.fill_(float("nan"))
+            torch.cuda.synchronize(device)
+            before = torch.cuda.memory_stats(device)
+            graph.replay()
+            torch.cuda.synchronize(device)
+            after = torch.cuda.memory_stats(device)
+            for key in ("allocation.all.allocated", "allocated_bytes.all.allocated"):
+                assert before[key] == after[key]
+            assert binding.error_code.item() == 0
+            assert bool(torch.isfinite(binding.output).all())
+            assert int(torch.count_nonzero(binding.output[:tokens])) > 0
+            torch.testing.assert_close(binding.output, expected, rtol=1e-2, atol=2e-2)
+            torch.testing.assert_close(
+                binding.recurrent_state,
+                state_reference,
+                rtol=1e-2 if state_dtype == torch.bfloat16 else 1e-5,
+                atol=8e-3 if state_dtype == torch.bfloat16 else 2e-5,
+            )
+        assert tuple(
+            tensor.data_ptr()
+            for tensor in (
+                binding.scratch,
+                binding.mixed_qkv,
+                binding.raw_g,
+                binding.raw_beta,
+                binding.recurrent_state,
+                binding.output,
+            )
+        ) == addresses
+    finally:
+        unfreeze_kernel_resolution()
+
+
 def test_kda_torch_compile_fullgraph_keeps_outer_op_opaque() -> None:
     device = require_sm120()
     binding = _make_case(device=device)

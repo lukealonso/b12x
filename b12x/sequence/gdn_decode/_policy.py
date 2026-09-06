@@ -74,17 +74,23 @@ def _heuristic(
 
 
 def _validate(
-    _query: GdnQuery,
+    query: GdnQuery,
     config: GdnConfig,
     _device: DeviceIdentity | None,
 ) -> None:
     if config.backend not in {"cutedsl", "triton"}:
         raise ValueError(f"unsupported GDN backend {config.backend!r}")
+    if not isinstance(config.recurrent_block_v, int) or isinstance(
+        config.recurrent_block_v, bool
+    ):
+        raise TypeError("GDN recurrent_block_v must be an integer")
     if config.recurrent_block_v not in {16, 32}:
         raise ValueError(
             "GDN recurrent_block_v must be 16 or 32, got "
             f"{config.recurrent_block_v}"
         )
+    if query.key_heads != query.value_heads and config.recurrent_block_v != 32:
+        raise ValueError("Qwen GDN requires recurrent_block_v=32")
 
 
 GDN_POLICY = ComponentPolicy(

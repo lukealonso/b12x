@@ -3,6 +3,8 @@ from __future__ import annotations
 from contextlib import AbstractContextManager
 from types import SimpleNamespace
 
+import pytest
+
 from benchmarks.benchmark_gdn_decode import QWEN38_GDN_CASES
 from benchmarks.benchmark_paged_attention import BENCHMARK_PROFILES
 from benchmarks.benchmark_qsa import PROFILES as QSA_PROFILES
@@ -61,7 +63,7 @@ from b12x.policy.generation.providers.norm_sequence import (
     _mtp_feedback_cases,
 )
 from b12x.policy.generation.registry import ComponentGeneratorRegistry
-from b12x.sequence.gdn_decode._policy import GDN_POLICY, GdnQuery
+from b12x.sequence.gdn_decode._policy import GDN_POLICY, GdnConfig, GdnQuery
 
 
 class _FixedGdnSession(AbstractContextManager["_FixedGdnSession"]):
@@ -340,6 +342,43 @@ def test_gdn_backend_identifies_decay_contract_from_head_geometry() -> None:
     assert GDN_POLICY.heuristic(glm, None).backend == "triton"
     assert GDN_POLICY.heuristic(qwen, None).recurrent_block_v == 32
     assert GDN_POLICY.heuristic(glm, None).recurrent_block_v == 32
+
+
+@pytest.mark.parametrize(
+    ("value_heads", "tile", "error", "message"),
+    [
+        (8, 16.0, TypeError, "must be an integer"),
+        (8, True, TypeError, "must be an integer"),
+        (8, "16", TypeError, "must be an integer"),
+        (8, 64, ValueError, "must be 16 or 32"),
+        (24, 16, ValueError, "Qwen GDN requires recurrent_block_v=32"),
+    ],
+)
+def test_gdn_policy_rejects_unsupported_tile_overrides(
+    value_heads, tile, error, message
+) -> None:
+    query = GdnQuery(
+        gate_activation="sigmoid",
+        qk_l2norm=True,
+        state_dtype="float32",
+        key_heads=8,
+        value_heads=value_heads,
+        max_seqs=4,
+        max_tokens=16,
+        state_index_columns=4,
+    )
+    device = DeviceIdentity(
+        vendor="NVIDIA",
+        compute_capability=(12, 0),
+        sm_count=188,
+        product_name="Synthetic GDN",
+    )
+    config = GdnConfig(
+        backend="triton" if value_heads == 8 else "cutedsl",
+        recurrent_block_v=tile,
+    )
+    with pytest.raises(error, match=message):
+        PolicyContext.for_identity(device).resolve(GDN_POLICY, query, override=config)
 
 
 def test_rtx_pro_6000_profile_covers_glm_5_3_kda_serving_capacities() -> None:
