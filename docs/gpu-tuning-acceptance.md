@@ -29,8 +29,8 @@ acceptance conditions below are met.
 | Serving invariants | Compile and cache identities exclude live request quantities. Each cache family has a production-path test that warms planned capacity, freezes resolution, varies live counts, and verifies correctness, graph replay, stable storage, and zero replay allocation. Relevant boundary and high-pool-offset cases pass. |
 | Measurement | Providers prepare eligible candidates before racing them. State resets and cache preparation have consistent placement outside the timed interval. Balanced ordering, raw samples, clock identity, source identity, and physical device identity survive worker transport and resume. Precision selectors retain their independent correctness and confirmation requirements. |
 | Qualification | Published regions pass exhaustive declared-lattice legality checks and independent production-candidate holdouts. The ordinary spatial gates remain 0.5% geometric-mean regret and 2% worst regret, including required family and boundary partitions. Held-out measurements do not influence the fitted policy. |
-| Regression | The frozen source passes catalog/profile consistency, public-plan integration, affected GPU correctness, frozen-resolution, and relevant sanitizer checks. Changed hot paths have production graph timing against the preserved baseline, with repeated measurements for apparent regressions. Failures and missing checks have explicit dispositions. |
-| Delivery | Reviewed commits contain the implementation, compact qualified assets, tests, and present-state documentation. Raw evidence remains outside the package and is bound by source and artifact hashes. Embedded profiles describe the source and protocol actually qualified. |
+| Regression | The frozen source passes catalog/profile consistency, public-plan integration, affected GPU correctness, frozen-resolution, and relevant sanitizer checks. Changed hot paths have production graph timing against the preserved baseline. No confirmed per-case slowdown exceeds 2%; apparent regressions require repeated measurements. Failures and missing checks have explicit dispositions. |
+| Delivery | One reviewed PR is merged into master with the implementation, compact qualified assets, tests, and present-state documentation. Raw evidence remains outside the package and is bound by source and artifact hashes. Embedded profiles describe the source and protocol actually qualified. |
 
 The census enumerates specialization families and their dimensions. The runtime
 qualification manifest enumerates the concrete device, geometry, recipe, capacity,
@@ -39,16 +39,35 @@ as the other.
 
 ## Qualification decisions
 
+The full registered MoE model/TP corpus is required on RTX PRO 6000 Blackwell
+Max-Q and GB10. It contains 421 physical geometries, 13 recipe/activation
+families, 57,681 queries, and 230,724 routing cases per hardware target.
+`--full-corpus` measures every registered routing case with its independent
+correctness gate. The staged generator measures 196,794 routing cases; those
+measurements alone cannot satisfy full-corpus acceptance. Checkpoints and
+estimates distinguish the two modes. A finite corpus does not qualify every
+intermediate capacity synthesized into a dispatch range.
+
 GQA's bounded decode domain requires the unchanged 300-query qualification on
-the target GB10 devices before accepting a profile for that domain. The explicit
-global-timer protocol is research-only until its generation path and independent
-holdouts pass. Its timestamp kernels perturb scheduling, so its durations remain
-distinct from CUDA-event durations in stored evidence.
+RTX and both GB10 hosts, Chroniton and Graviton, using the frozen integration
+source. The domain contains 264 training queries and 36 independent holdouts.
+The explicit global-timer protocol is implemented and selectable; its timestamp
+kernels perturb scheduling, so its durations remain distinct from CUDA-event
+durations in stored evidence. A passing measurement of another source snapshot
+does not qualify the integration source.
 
 Block-FP8 region qualification must sample the observed capacity transitions.
 Queries used to diagnose a failed fit become training data only in a separately
 identified search contract with fresh holdouts. Previously inspected holdouts
 cannot certify that refit as independent evidence.
+
+The block-FP8 domain is the 225-query Cartesian product of token capacities
+256 through 512 in steps of 32 and input/output widths 2048 through 4096 in
+steps of 512, with BF16 output. Training uses capacities 256, 320, 384, 448,
+and 512 at input/output widths 2048, 3072, and 4096: 45 queries. The remaining
+180 queries are independent holdouts. Every query inspected in the 27-query
+diagnostic belongs to training. Capacity and geometry holdout partitions must
+each satisfy the unchanged regret limits.
 
 An unqualified region is excluded from profile emission. AUTO policy resolution
 continues to use its existing heuristic for uncovered queries. Such a disposition

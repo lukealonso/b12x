@@ -12198,7 +12198,7 @@ def run_w4a16_moe(
         _W4A16_SMALL_M_DIRECT_MAX_M if mapped_direct else _MAX_DIRECT_TOPK_ROUTE_M
     )
     direct_layout_ok = weight_layout == "packed" or (
-        mapped_direct and full_rotation and weight_layout == "trellis_t256"
+        full_rotation and weight_layout == "trellis_t256"
     )
     direct_topk_eligible = (
         (not collect_activation_amax)
@@ -12247,7 +12247,7 @@ def run_w4a16_moe(
         )
 
     route_slots_for_scratch = int(m) * int(topk) * int(block_size_m)
-    required_m_blocks = int(m) * int(topk) if use_direct_topk_routes else 0
+    required_m_blocks = policy_m * int(topk) if use_direct_topk_routes else 0
     if fused_launch is not None and not use_direct_topk_routes:
         route_slots_capacity = max_packed_route_slots(
             int(fused_launch.size_m) * int(topk),

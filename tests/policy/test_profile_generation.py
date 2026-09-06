@@ -83,6 +83,18 @@ def test_timing_clock_is_explicit_and_invalidates_checkpoint_identity(tmp_path):
         GenerationSettings(timing_clock="unknown")
 
 
+def test_full_corpus_has_an_explicit_checkpoint_identity(tmp_path):
+    context = GenerationContext(device=_DEVICE, device_ordinal=0, work_dir=tmp_path,
+                                source_revision="same-source", settings=GenerationSettings())
+    full = replace(context, settings=replace(context.settings, full_corpus=True))
+    assert not context.checkpoint_metadata_matches(full.checkpoint_metadata())
+    assert not full.checkpoint_metadata_matches(context.checkpoint_metadata())
+    assert _parser().parse_args(["--full-corpus"]).full_corpus
+    assert not _parser().parse_args([]).full_corpus
+    with pytest.raises(TypeError, match="full_corpus"):
+        GenerationSettings(full_corpus=1)
+
+
 def test_checkpoint_resume_requires_identical_source_and_protocol(tmp_path) -> None:
     relaxed = GenerationContext(
         device=_DEVICE,

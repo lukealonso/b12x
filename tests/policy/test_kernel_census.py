@@ -68,6 +68,42 @@ def test_inventory_accounts_for_every_explicit_production_compile_site():
     assert inventory["unowned_compile_sites"] == []
 
 
+def test_inventory_records_memoized_functions_and_persistent_cache_keys(tmp_path):
+    package = tmp_path / "b12x"
+    package.mkdir()
+    (package / "example.py").write_text('''
+from functools import lru_cache as memo
+from dataclasses import field
+_COMPILED = {}
+_LAST_KERNEL = None
+@memo(maxsize=8)
+def prepare(capacity, *, dtype):
+    return build(capacity, dtype)
+class Workspace:
+    planned_launches: dict = field(default_factory=dict)
+    def get(self, rows, capacity):
+        key = (capacity,)
+        if key not in self.planned_launches:
+            self.planned_launches[key] = prepare(capacity, dtype="bf16")
+        return self.planned_launches.get(key)
+def launch(rows):
+    local_config = {}
+    return _COMPILED.get((rows,))
+''')
+    report = inventory_sources(tmp_path)
+    assert report["counts"]["memoized_functions"] == 1
+    assert report["memoized_functions"][0]["key_arguments"] == ["capacity", "dtype"]
+    assert {item["id"] for item in report["persistent_state"]} == {
+        "b12x.example._COMPILED", "b12x.example._LAST_KERNEL", "b12x.example.Workspace.planned_launches",
+    }
+    accesses = report["state_access_sites"]
+    assert {item["operation"] for item in accesses} == {"contains", "store", "get"}
+    assert any(item["key"] == "(rows,)" for item in accesses)
+    planned = next(item for item in accesses if item["receiver"] == "self.planned_launches")
+    assert report["state_scope_bindings"][planned["scope_ids"][0]]["key"] == ["(capacity,)"]
+    json.dumps(report, sort_keys=True)
+
+
 def test_compilation_requests_are_deduplicated_context_local_and_restored():
     def kernel():
         pass

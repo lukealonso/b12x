@@ -29,11 +29,14 @@ confirmation constraints; it cannot emit an unmeasured precision selector.
 Registration establishes ownership and executable measurement tasks, rather
 than complete coverage of internal kernels, recipes, or compilation specializations.
 
-**Unsupported by the shared generator:** a complete kernel-specialization
-census and a common preparation and candidate-interleaving lifecycle for every
-provider. Several decision domains still delegate enumeration to their
-component provider. Independent region qualification for all components remains
-required. Spatial emission requires a provider-owned legality validator for
+**Implemented:** providers use the shared preparation, reset, and balanced
+candidate timing lifecycle. Specialization tooling inventories source entry
+points, compile specs, memoized functions, persistent host state, and possible
+cache accesses. It can also verify supplied cached objects, observation stores,
+and CUDA launch traces. Complete ownership, alias resolution, and instantiated
+GPU coverage remain unqualified. Several decision domains delegate enumeration
+to their component provider. Independent region qualification for all components
+remains required. Spatial emission requires a provider-owned legality validator for
 unmeasured queries. NVFP4 quantization, fused MoE, GQA, varlen attention, KDA
 prefill, BF16 vocabulary projection, and block-FP8 linear provide validators and
 production fixture factories for their supported shape contracts. HyperConnection
@@ -390,12 +393,14 @@ cohort do. Fresh and reused work are reported separately. See
 [GPU component profiles](gpu-profiles.md) for the generator and integration
 interfaces.
 
-**Implemented:** `generation/timing.py` owns the shared CUDA-event sampler,
-bounded repetition count, and grouped-median estimator. Grouped providers
+**Implemented:** `generation/replay.py` owns candidate preparation and balanced
+interleaving; `generation/timing.py` owns the shared sampler, bounded repetition
+count, and grouped-median estimator. Grouped providers
 retain unrounded samples and their grouping in `metrics.timing`. State resets
-and cold-L2 flushes stay outside each timed replay. Providers with paired,
-amortized, or benchmark-owned timing retain their distinct protocols; their
-timing and preparation lifecycles are not yet fully unified. A stored median
+and cold-L2 flushes stay outside each timed replay. Precision selection retains
+its independent paired confirmation and correctness requirements. CUDA events
+are the default clock; explicit global-timer sampling has a separate observation
+identity. A stored median
 alone is insufficient evidence for diagnosing timing variation or certifying
 small regret differences.
 

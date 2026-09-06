@@ -201,6 +201,27 @@ payload:
 ./scripts/generate_gpu_profile.py --overwrite --embed
 ```
 
+`--full-corpus` requires every registered MoE routing case to be measured with
+an independent correctness check. Its complete estimate is available before
+execution:
+
+```bash
+./scripts/generate_gpu_profile.py --full-corpus --dry-run
+./scripts/generate_gpu_profile.py --full-corpus --work-dir /tmp/b12x-profile-work
+```
+
+The MoE corpus contains 421 geometries and 230,724 routing cases per target.
+The staged default measures 196,794 cases and checks additional routes only at
+selected capacities. These modes have distinct checkpoint identities. A failed
+candidate correctness gate blocks full-corpus profile emission; resume retains
+the evidence for inspection.
+
+`--timing-clock cuda_event` is the default. The explicit `globaltimer` option
+places device timestamp kernels around the same production graphs. Both clocks
+use balanced candidate ordering and preserve raw groups. Clock selection is
+part of observation and checkpoint identity: durations from different clocks
+are not interchangeable, and timestamp kernels can affect scheduling.
+
 Identical GPUs can measure one profile concurrently. CUDA ordinals are relative
 to `CUDA_VISIBLE_DEVICES`; `all` selects every visible GPU:
 
@@ -236,6 +257,15 @@ Historical JSON remains readable, but missing or mismatched provenance prevents
 qualification reuse. Embedded profiles contain the decision DAG and selected
 configurations, without the measurement corpus.
 See [representation and generation measurements](gpu-policy-efficiency.md).
+
+`scripts/inspect_kernel_specializations.py --output /tmp/kernel-census.json`
+enumerates CuTe entry points, Triton JIT functions and launches, compile specs,
+explicit cache-key methods, memoized functions, and persistent host state.
+State access records retain key expressions and shared scope bindings. Possible
+receiver-name matches do not prove alias resolution or kernel ownership.
+Optional `--manifest`, `--observations`, and `--trace-sqlite` inputs add cached
+object integrity, requested specialization, and executed-launch evidence;
+these are distinct coverage claims.
 
 No `--components` argument is needed for a full device profile; the default is
 all registered components. `--components` exists only for targeted development

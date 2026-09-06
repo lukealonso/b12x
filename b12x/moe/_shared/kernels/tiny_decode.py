@@ -71,7 +71,6 @@ class MoETinyDecodeKernelBackend:
         self.w13_layout = w13_layout
         self._cfg_key = None
         self._c = None
-        self.grid_x = 0
 
     def configure(
         self,
@@ -92,7 +91,6 @@ class MoETinyDecodeKernelBackend:
             raise ValueError("tiny_decode requires k % 256 == 0 and n % 32 == 0")
         if m < 1 or m > 4:
             raise ValueError("tiny_decode supports 1 <= m <= 4")
-        rt = m * num_topk
         kt13 = k // 128
         kt2 = -(-n // 128)
         nt13 = -(-(2 * n) // 256)
@@ -104,13 +102,11 @@ class MoETinyDecodeKernelBackend:
         # split does not change results.
         fc2_kt_per_task = _FC2_KT_PER_TASK if kt2 % _FC2_KT_PER_TASK == 0 else 1
         cfg = dict(
-            m=m,
             k=k,
             n=n,
             two_n=2 * n,
             num_topk=num_topk,
             weight_E=weight_E,
-            rt=rt,
             nt13=nt13,
             kt13=kt13,
             fc1_ktg=kt13 // _FC1_KT_PER_TASK,
@@ -129,14 +125,9 @@ class MoETinyDecodeKernelBackend:
             w2_words=(k // 256) * kt2 * 4096,
             sfb13_bytes=nt13 * kt13 * 1024,
             sfb2_bytes=(k // 256) * kt2 * 1024,
-            fc1_tasks=rt * nt13 * (kt13 // _FC1_KT_PER_TASK),
-            fc2_tasks=rt * (k // 256) * (kt2 // fc2_kt_per_task),
         )
         self._c = cfg
         self._cfg_key = tuple(sorted(cfg.items()))
-        self.grid_x = (
-            cfg["fc1_tasks"] if self.compile_time_phase == 1 else cfg["fc2_tasks"]
-        )
 
     @property
     def __cache_key__(self):
@@ -145,7 +136,6 @@ class MoETinyDecodeKernelBackend:
             self.w13_layout,
             self.compile_time_phase,
             self._cfg_key,
-            self.grid_x,
         )
 
     @cute.jit
@@ -467,10 +457,12 @@ class MoETinyDecodeKernelBackend:
         tid_ptr: cute.Pointer,
         tw_ptr: cute.Pointer,
         out_ptr: cute.Pointer,
+        m: Int32,
         stream,
     ):
         c = self._c
-        a_input = cute.make_tensor(x_ptr, cute.make_layout(Int32(c["m"] * c["k"])))
+        rt = m * Int32(c["num_topk"])
+        a_input = cute.make_tensor(x_ptr, cute.make_layout(m * Int32(c["k"])))
         w13 = cute.make_tensor(
             w13_ptr, cute.make_layout(Int64(c["weight_E"] * c["w13_words"] * 4))
         )
@@ -478,7 +470,7 @@ class MoETinyDecodeKernelBackend:
             sfb13_ptr, cute.make_layout(Int64(c["weight_E"] * c["sfb13_bytes"]))
         )
         inter = cute.make_tensor(
-            inter_ptr, cute.make_layout(Int32(c["rt"] * c["two_n"]))
+            inter_ptr, cute.make_layout(rt * Int32(c["two_n"]))
         )
         w2 = cute.make_tensor(
             w2_ptr, cute.make_layout(Int64(c["weight_E"] * c["w2_words"] * 4))
@@ -486,9 +478,11 @@ class MoETinyDecodeKernelBackend:
         sfb2 = cute.make_tensor(
             sfb2_ptr, cute.make_layout(Int64(c["weight_E"] * c["sfb2_bytes"]))
         )
-        topk_ids = cute.make_tensor(tid_ptr, cute.make_layout(Int32(c["rt"])))
-        topk_weights = cute.make_tensor(tw_ptr, cute.make_layout(Int32(c["rt"])))
-        out = cute.make_tensor(out_ptr, cute.make_layout(Int32(c["m"] * c["k"])))
+        topk_ids = cute.make_tensor(tid_ptr, cute.make_layout(rt))
+        topk_weights = cute.make_tensor(tw_ptr, cute.make_layout(rt))
+        out = cute.make_tensor(out_ptr, cute.make_layout(m * Int32(c["k"])))
+        tasks_per_route = (c["nt13"] * c["fc1_ktg"] if self.compile_time_phase == 1
+                           else c["nt2"] * c["fc2_ktg"])
 
         self.kernel(
             a_input,
@@ -501,7 +495,7 @@ class MoETinyDecodeKernelBackend:
             topk_weights,
             out,
         ).launch(
-            grid=(Int32(self.grid_x), Int32(1), Int32(1)),
+            grid=(rt * Int32(tasks_per_route), Int32(1), Int32(1)),
             block=(_BLOCK_THREADS, 1, 1),
             stream=stream,
         )
@@ -520,6 +514,7 @@ class MoETinyDecodeKernelBackend:
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
         out: torch.Tensor,
+        m: int,
     ):
         def ptr(dt, t, align=16):
             return make_ptr(
@@ -539,6 +534,7 @@ class MoETinyDecodeKernelBackend:
             ptr(cutlass.Int32, topk_ids, 4),
             ptr(cutlass.Float32, topk_weights, 4),
             ptr(cutlass.BFloat16, out),
+            Int32(m),
             stream,
         )
         compiled_fc1(*args)

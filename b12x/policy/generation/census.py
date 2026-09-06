@@ -75,10 +75,117 @@ def _bindings(node):
     return dict(sorted(values.items()))
 
 
+def _host_state_inventory(tree, *, module, relative, resolve):
+    declarations, memoized, accesses = [], [], []
+
+    class StateVisitor(ast.NodeVisitor):
+        def __init__(self):
+            self.scope = []
+            self.functions = []
+
+        def location(self, node):
+            return {"path": relative, "symbol": ".".join(self.scope), "line": node.lineno,
+                    "source_sha256": hashlib.sha256(ast.dump(node, include_attributes=False).encode()).hexdigest()}
+
+        def visit_ClassDef(self, node):
+            self.scope.append(node.name)
+            self.generic_visit(node)
+            self.scope.pop()
+
+        def visit_FunctionDef(self, node):
+            self.scope.append(node.name)
+            self.functions.append(node)
+            for decorator in node.decorator_list:
+                callee = resolve(decorator.func if isinstance(decorator, ast.Call) else decorator)
+                if callee in {"functools.cache", "functools.lru_cache"}:
+                    memoized.append({**self.location(node), "id": f"{module}.{'.'.join(self.scope)}",
+                        "decorator": _text(decorator),
+                        "key_arguments": [arg.arg for arg in (*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs)],
+                        "vararg": None if node.args.vararg is None else node.args.vararg.arg,
+                        "kwarg": None if node.args.kwarg is None else node.args.kwarg.arg,
+                        "qualification": "unobserved"})
+            self.generic_visit(node)
+            self.functions.pop()
+            self.scope.pop()
+
+        def declaration(self, node, target, value, annotation=None):
+            name = _text(target)
+            instance = isinstance(target, ast.Attribute) and _text(target.value) == "self"
+            if self.functions and not instance:
+                return
+            constructor = resolve(value.func) if isinstance(value, ast.Call) else None
+            collection = isinstance(value, (ast.Dict, ast.Set, ast.DictComp, ast.SetComp))
+            collection |= constructor in {"dict", "set", "collections.defaultdict", "collections.OrderedDict",
+                                          "weakref.WeakKeyDictionary", "weakref.WeakValueDictionary"}
+            if constructor in {"dataclasses.field", "field"}:
+                collection |= any(kw.arg == "default_factory" and resolve(kw.value) in {"dict", "set"}
+                                  for kw in value.keywords)
+            annotation_name = resolve(annotation.value) if isinstance(annotation, ast.Subscript) else _text(annotation)
+            collection |= annotation_name in {"dict", "set", "typing.Dict", "typing.Set"}
+            named_cache = "cache" in name.lower() or name.lower().startswith("_last_kernel")
+            if not collection and not named_cache:
+                return
+            owner = self.scope[:-1] if self.functions else self.scope
+            identity = ".".join((module, *owner, name.removeprefix("self.")))
+            declarations.append({**self.location(node), "id": identity, "name": name,
+                "annotation": _text(annotation), "initializer": _text(value),
+                "kind": "persistent_collection" if collection else "named_cache_state",
+                "disposition": "requires ownership and cache-role review"})
+
+        def visit_Assign(self, node):
+            for target in node.targets:
+                self.declaration(node, target, node.value)
+            self.generic_visit(node)
+
+        def visit_AnnAssign(self, node):
+            self.declaration(node, node.target, node.value, node.annotation)
+            self.generic_visit(node)
+
+        def access(self, node, receiver, key, operation):
+            accesses.append({**self.location(node), "receiver": _text(receiver), "key": _text(key),
+                "operation": operation, "functions": tuple(self.functions)})
+
+        def visit_Subscript(self, node):
+            self.access(node, node.value, node.slice, type(node.ctx).__name__.lower())
+            self.generic_visit(node)
+
+        def visit_Call(self, node):
+            if isinstance(node.func, ast.Attribute) and node.func.attr in {"get", "setdefault", "pop", "add", "discard"} and node.args:
+                self.access(node, node.func.value, node.args[0], node.func.attr)
+            self.generic_visit(node)
+
+        def visit_Compare(self, node):
+            for left, op, right in zip((node.left, *node.comparators), node.ops, node.comparators, strict=False):
+                if isinstance(op, (ast.In, ast.NotIn)):
+                    self.access(node, right, left, "contains")
+            self.generic_visit(node)
+
+    StateVisitor().visit(tree)
+    names = defaultdict(list)
+    for item in declarations:
+        names[item["name"].split(".")[-1]].append(item["id"])
+    matched, scope_bindings = [], {}
+    for item in accesses:
+        possible = sorted(set(names.get(item["receiver"].split(".")[-1], ())))
+        if possible:
+            functions = item.pop("functions")
+            scope_ids = []
+            for function in functions:
+                scope_id = f"{module}:{function.lineno}:{function.name}"
+                if scope_id not in scope_bindings:
+                    scope_bindings[scope_id] = _bindings(function)
+                scope_ids.append(scope_id)
+            item["scope_ids"] = scope_ids
+            matched.append({**item, "possible_state_ids": possible})
+    return declarations, memoized, matched, scope_bindings
+
+
 def inventory_sources(root: Path):
     """Enumerate every CuTe kernel, Triton JIT function, and compiler call."""
     root = Path(root).resolve()
     entries, sites, contracts, modules, indexed_calls = [], [], [], {}, []
+    persistent_state, memoized_functions, state_accesses = [], [], []
+    state_scope_bindings = {}
     for path in sorted((root / "b12x").rglob("*.py")):
         source = path.read_bytes()
         tree = ast.parse(source, filename=str(path))
@@ -179,6 +286,13 @@ def inventory_sources(root: Path):
                 self.generic_visit(node)
 
         Visitor().visit(tree)
+        declarations, memoized, accesses, scopes = _host_state_inventory(
+            tree, module=module, relative=relative, resolve=resolve,
+        )
+        persistent_state.extend(declarations)
+        memoized_functions.extend(memoized)
+        state_accesses.extend(accesses)
+        state_scope_bindings.update(scopes)
         modules[relative] = hashlib.sha256(source).hexdigest()
     triton_targets = {item["id"] for item in entries if item["dialect"] == "triton"}
     triton_launches = [item for item in indexed_calls if item["target"] in triton_targets]
@@ -187,10 +301,18 @@ def inventory_sources(root: Path):
             "qualification": "source inventory does not establish instantiated specialization or GPU coverage",
             "counts": {"modules": len(modules), "entry_points": len(entries), "compile_sites": len(sites),
                        "cache_contracts": len(contracts), "triton_launch_sites": len(triton_launches),
+                       "memoized_functions": len(memoized_functions),
+                       "persistent_state_declarations": len(persistent_state), "state_access_sites": len(state_accesses),
                        "unresolved_indexed_calls": len(unresolved),
                        "dialects": dict(Counter(item["dialect"] for item in entries))},
             "source_files": modules, "entry_points": entries, "compile_sites": sites, "cache_contracts": contracts,
             "triton_launch_sites": triton_launches,
+            "memoized_functions": memoized_functions, "persistent_state": persistent_state,
+            "state_access_sites": state_accesses,
+            "state_scope_bindings": state_scope_bindings,
+            "state_discovery_limits": "Persistent collection declarations and named cache state are syntax evidence. "
+                "Accesses are matched by receiver name within a module; aliases and dynamic attributes need manual review. "
+                "Collections are not assumed to cache kernels, and a possible state match does not prove data flow.",
             "unresolved_indexed_calls": unresolved,
             "unowned_compile_sites": [item["id"] for item in sites if item["compile_spec"] is None]}
 

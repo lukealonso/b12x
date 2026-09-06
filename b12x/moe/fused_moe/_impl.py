@@ -1430,6 +1430,8 @@ def _w4a16_weight_layout_for_source(
     source_format = _normalize_fp4_source_format(source_format)
     if source_format in _TRELLIS_SOURCE_FORMATS:
         return "trellis_t256"
+    if source_format == "modelopt_nvfp4":
+        return "modelopt"
     if (
         source_format == "fp4_e8m0_k32"
         and intermediate_size is not None
@@ -2442,13 +2444,14 @@ def _w4a16_direct_routing_supported(query: MoeDecodeQuery) -> bool:
             query.source_format, intermediate_size=query.intermediate_size,
         )
     )
-    if weight_layout == "trellis_t256":
-        return False
     from b12x.moe._shared.kernels.w4a16.kernel import (
         _MAX_DIRECT_TOPK_ROUTE_M,
         _TC_DECODE_MAX_M,
         _small_m_direct_supported,
     )
+
+    if weight_layout == "trellis_t256":
+        return query.num_tokens <= _MAX_DIRECT_TOPK_ROUTE_M
 
     if weight_layout == "modelopt":
         source_format = _normalize_fp4_source_format(query.source_format)
@@ -2482,6 +2485,8 @@ def _heuristic_w4a16_route_mode(
     query: MoeDecodeQuery,
     device: DeviceIdentity | None,
 ) -> str:
+    if query.source_format in _TRELLIS_SOURCE_FORMATS:
+        return "packed"
     if not _w4a16_direct_routing_supported(query):
         return "packed"
     if (
@@ -7409,6 +7414,7 @@ def _plan_full_rotation_w4a16_launches(
     caps: TPMoEScratchCaps,
     core_plan: _TPCoreWorkspacePlan,
     capacity_tokens: int,
+    route_mode: str,
 ) -> tuple[
     tuple[tuple[int, object], ...],
     tuple[tuple[torch.dtype, bool, object], ...],
@@ -7486,7 +7492,7 @@ def _plan_full_rotation_w4a16_launches(
         )
         fused_token_counts = (capacity_tokens,)
 
-        def compile_fused(token_count: int) -> object:
+        def compile_fused(token_count: int, *, mapped: bool = False) -> object:
             return compile_w4a16_fused_moe(
                 size_m=token_count,
                 hidden_size=core_plan.k,
@@ -7498,7 +7504,8 @@ def _plan_full_rotation_w4a16_launches(
                 zero_fc2_output=False,
                 moe_block_size=block_size_m,
                 # The fused kernel and route arena share the declared capacity.
-                max_m_blocks=capacity_m_blocks,
+                max_m_blocks=(token_count * core_plan.num_topk
+                              if route_mode == "direct" else capacity_m_blocks),
                 element_dtype="fp16",
                 fast_math=caps.w4a16_fast_math,
                 sms=sms,
@@ -7514,13 +7521,16 @@ def _plan_full_rotation_w4a16_launches(
                 force_tile_config=core_plan.trellis_tile_config,
                 intermediate_rotation=True,
                 full_rotation=True,
+                direct_topk_routes=route_mode == "direct",
+                use_expert_map=mapped and route_mode == "direct",
                 coupled_hadamard=core_plan.coupled_hadamard,
                 rotation_input_dtype=rotation_input_dtype,
             )
 
         fused_launches = tuple(
-            (token_count, compile_fused(token_count))
+            (token_count, compile_fused(token_count, mapped=mapped))
             for token_count in fused_token_counts
+            for mapped in ((False, True) if route_mode == "direct" else (False,))
         )
         topk_sum_launches = tuple(
             (
@@ -8099,6 +8109,7 @@ def plan_tp_moe_scratch(
             caps=caps,
             core_plan=core_workspace_plan,
             capacity_tokens=capacity_tokens,
+            route_mode=launch_plan.policy_resolution.config.w4a16_route_mode,
         )
         mixed_trellis_launches = _plan_projection_mixed_trellis_launches(
             caps=caps,
@@ -11598,7 +11609,9 @@ def _get_tiny_decode_kernel(
     ):
         kernel = kernel_cls()
         kernel.configure(m, k, n, num_topk, weight_E, device=device)
-        cache_key = ("tiny_decode",) + kernel.__cache_key__
+        device_index = (torch.cuda.current_device() if device is None or device.index is None
+                        else device.index)
+        cache_key = ("tiny_decode", device_index) + kernel.__cache_key__
         cached = _TINY_DECODE_KERNEL_CACHE.get(cache_key)
         if cached is not None:
             compiled_phases.append(cached)
@@ -11621,10 +11634,11 @@ def _get_tiny_decode_kernel(
             dummy(cutlass.Int32),
             dummy(cutlass.Float32),
             dummy(cutlass.BFloat16),
+            Int32(4),
             current_cuda_stream(),
             compile_spec=KernelCompileSpec.from_key(
                 "integration.tp_moe.tiny_decode",
-                1,
+                2,
                 cache_key,
             ),
         )
@@ -11674,6 +11688,7 @@ def _launch_tiny_decode_flat(
         topk_ids=launch_ids,
         topk_weights=flat_weights,
         out=scatter_output.reshape(-1),
+        m=m,
     )
 
 

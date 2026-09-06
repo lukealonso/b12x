@@ -11,6 +11,7 @@ from b12x.moe import fused_moe
 from b12x.policy import (
     DeviceIdentity,
     PolicyContext,
+    PolicyMode,
     PolicyResolution,
     PolicySource,
 )
@@ -536,7 +537,7 @@ def test_typed_packed_planning_keeps_representation_axes_independent(
         ("w4a16", "fp4_e8m0_k32", "w31", "mma_packed"),
         ("nvfp4", "modelopt_nvfp4", "w31", "source_native"),
         ("w4a8_nvfp4", "modelopt_nvfp4", "w31", "source_native"),
-        ("w4a16", "modelopt_nvfp4", "w13", "mma_packed"),
+        ("w4a16", "modelopt_nvfp4", "w13", "source_native"),
     ),
 )
 def test_vllm_1_2_6_planning_contract_remains_supported(
@@ -1041,9 +1042,9 @@ def test_gb10_qwen38_flash_next_decode_reports_profile_provenance(
 
 @pytest.mark.parametrize(
     ("num_tokens", "route_mode"),
-    ((1, "direct"), (2, "direct"), (4, "direct"), (8, "packed")),
+    ((1, "direct"), (2, "direct"), (4, "direct"), (8, "direct")),
 )
-def test_gb10_uniform_nvfp4_a16_uses_packed_layout_heuristic(
+def test_gb10_uniform_nvfp4_a16_uses_native_layout_heuristic(
     num_tokens: int,
     route_mode: str,
 ) -> None:
@@ -1055,7 +1056,7 @@ def test_gb10_uniform_nvfp4_a16_uses_packed_layout_heuristic(
         n=1024,
         activation="silu",
         quant_mode="w4a16",
-        context=_policy_context(_GB10_IDENTITY),
+        context=PolicyContext.for_identity(_GB10_IDENTITY, mode=PolicyMode.HEURISTIC_ONLY),
     )
 
     assert resolution.source is PolicySource.HEURISTIC
