@@ -72,7 +72,13 @@ def require_cute_combine_norm(
             raise ValueError(
                 "Qwen3.8 HyperConnection combine+norm tensors must use BF16"
             )
-        if not tensor.is_contiguous():
+        if tensor is injection_logits:
+            if tensor.ndim != 2 or tensor.stride(1) != 1 or tensor.stride(0) < streams:
+                raise ValueError(
+                    "Qwen3.8 HyperConnection injection logits require unit column "
+                    "stride and disjoint rows"
+                )
+        elif not tensor.is_contiguous():
             raise ValueError(
                 "Qwen3.8 HyperConnection combine+norm tensors must be contiguous"
             )

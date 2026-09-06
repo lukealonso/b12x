@@ -13,7 +13,16 @@ def _byte_interval(tensor: torch.Tensor) -> tuple[int, int]:
     start = int(tensor.untyped_storage().data_ptr()) + int(
         tensor.storage_offset()
     ) * int(tensor.element_size())
-    return start, start + int(tensor.numel()) * int(tensor.element_size())
+    span = (
+        0
+        if tensor.numel() == 0
+        else 1
+        + sum(
+            (int(size) - 1) * int(stride)
+            for size, stride in zip(tensor.shape, tensor.stride(), strict=True)
+        )
+    )
+    return start, start + span * int(tensor.element_size())
 
 
 def _require_disjoint(
@@ -247,7 +256,9 @@ def _scaled_silu_op(
     block: int,
 ) -> None:
     _require_disjoint("bottleneck", out, (("projected_down", projected_down),))
-    _scaled_silu_launch(projected_down, out, streams, block)
+    from ._cute import scaled_silu
+
+    scaled_silu(projected_down, out, streams=streams)
 
 
 @_scaled_silu_op.register_fake
@@ -304,15 +315,15 @@ def _combine_op(
 ) -> torch.Tensor:
     combined = torch.empty_like(state)
     if int(state.shape[0]) != 0:
-        _combine_launch(
+        from ._cute import combine
+
+        combine(
             state,
             block_output,
             injection_logits,
             combined,
-            streams,
-            hidden_size,
-            block_h,
-            num_warps,
+            streams=streams,
+            hidden_size=hidden_size,
         )
     return combined
 

@@ -231,7 +231,16 @@ def _byte_interval(tensor: torch.Tensor) -> tuple[int, int]:
     start = int(tensor.untyped_storage().data_ptr()) + int(
         tensor.storage_offset()
     ) * int(tensor.element_size())
-    return start, start + int(tensor.numel()) * int(tensor.element_size())
+    span = (
+        0
+        if tensor.numel() == 0
+        else 1
+        + sum(
+            (int(size) - 1) * int(stride)
+            for size, stride in zip(tensor.shape, tensor.stride(), strict=True)
+        )
+    )
+    return start, start + span * int(tensor.element_size())
 
 
 def _overlaps(left: torch.Tensor, right: torch.Tensor) -> bool:
@@ -246,6 +255,7 @@ def _validate_input(
     shape: tuple[int, ...],
     caps: HyperConnectionCaps,
     name: str,
+    row_strided: bool = False,
 ) -> None:
     if tuple(tensor.shape) != shape:
         raise ValueError(f"{name} must have shape {shape}, got {tuple(tensor.shape)}")
@@ -254,7 +264,10 @@ def _validate_input(
             f"{name} must use dtype={caps.dtype} and device={caps.device}; "
             f"got dtype={tensor.dtype}, device={tensor.device}"
         )
-    if not tensor.is_contiguous():
+    if row_strided:
+        if tensor.stride(1) != 1 or tensor.stride(0) < tensor.shape[1]:
+            raise ValueError(f"{name} requires unit column stride and disjoint rows")
+    elif not tensor.is_contiguous():
         raise ValueError(f"{name} must be contiguous")
 
 
@@ -335,6 +348,7 @@ def run_scaled_silu_impl(
         shape=(binding.tokens, caps.lowrank),
         caps=caps,
         name="projected_down",
+        row_strided=True,
     )
     _validate_output_disjoint(
         "bottleneck",
@@ -409,6 +423,7 @@ def _validate_combine_inputs(
         shape=(tokens, caps.streams),
         caps=caps,
         name="injection_logits",
+        row_strided=True,
     )
 
 
