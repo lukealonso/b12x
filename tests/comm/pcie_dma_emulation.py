@@ -35,6 +35,11 @@ import torch
 from b12x.comm.pcie import pcie_dma
 
 _DTYPE_CODES = {0: torch.bfloat16, 1: torch.float16, 2: torch.float32}
+_MIXED_MODES = {
+    "bf16_bf16_f32": (torch.bfloat16, torch.float32),
+    "bf16_f32_f32": (torch.float32, torch.float32),
+    "bf16_f32_bf16": (torch.float32, torch.bfloat16),
+}
 
 
 def _view(ptr: int, elems: int, dtype: torch.dtype) -> torch.Tensor:
@@ -197,6 +202,25 @@ class EmulatedKernels:
         _view(dst, elems, dtype).copy_((av + bv).to(dtype))
         self.adds += 1
 
+    def dma_add_mixed(
+        self, dst_ptr: int, a_ptr: int, b_ptr: int, elems: int, mode: str
+    ) -> None:
+        if mode not in _MIXED_MODES:
+            raise ValueError(mode)
+        self._issue(
+            self._add_mixed, int(dst_ptr), int(a_ptr), int(b_ptr), int(elems), mode
+        )
+
+    def _add_mixed(self, dst: int, a: int, b: int, elems: int, mode: str) -> None:
+        b_dtype, out_dtype = _MIXED_MODES[mode]
+        av = _view(a, elems, torch.bfloat16).float()
+        bv = _view(b, elems, b_dtype).float()
+        _view(dst, elems, out_dtype).copy_((av + bv).to(out_dtype))
+        self.adds += 1
+
+    def prepare_reduce_scatter(self, *, wire: str) -> None:
+        return None
+
     # The lossless ring binds the compressed-wire codecs by attribute even
     # when it never calls them; the emulation covers the lossless wire only.
     def _unsupported(self, *args: Any, **kwargs: Any) -> None:
@@ -279,6 +303,7 @@ class EmulatedRing:
             ring._replay_seen = {}
             ring._replay_capture_stream = None
             ring._op_seq = 0
+            ring._rs_prepared_wires = set()
             ring._replay_in_place = True
             ring._replay_slot_bytes = 2 * pcie_dma._align_up(
                 ring.max_bytes, pcie_dma.SCRATCH_ALIGN
@@ -352,3 +377,29 @@ def ring_all_reduce_reference(inputs: list[torch.Tensor], world: int) -> torch.T
         order = [(chunk + i) % world for i in range(world)]
         out[sl] = _chain_sum(terms, order, dtype).to(dtype)
     return out.view_as(inputs[0])
+
+
+def column_reduce_scatter_reference(
+    inputs: list[torch.Tensor], world: int, wire: str, cols: int | None = None
+) -> list[torch.Tensor]:
+    """Per-rank column block of the ring reduce-scatter: block ``c`` is summed
+    as ``(((x[c+1] + x[c+2]) + ...) + x[c])``; ``wire="bf16"`` rounds after
+    every add, ``wire="fp32"`` once at the end. The last block is zero past
+    the input width. ``cols`` is the block width (default ``ceil(K/world)``)."""
+    rows, width = inputs[0].shape
+    if cols is None:
+        cols = (width + world - 1) // world
+    blocks = []
+    for c in range(world):
+        start = c * cols
+        terms = []
+        for x in inputs:
+            block = x.new_zeros((rows, cols))
+            valid = min(cols, width - start)
+            if valid > 0:
+                block[:, :valid] = x[:, start : start + valid]
+            terms.append(block)
+        order = [(c + 1 + i) % world for i in range(world)]
+        acc = _chain_sum(terms, order, torch.bfloat16 if wire == "bf16" else None)
+        blocks.append(acc.to(torch.bfloat16))
+    return blocks

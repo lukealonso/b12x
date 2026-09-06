@@ -1,20 +1,35 @@
 #!/usr/bin/env python3
 """Numerical comparison of the nine-rank PCIe all-reduce kernels.
 
-Every kernel accumulates the nine bf16 contributions in fp32 and rounds once
-to bf16, but in different orders: the one-shot in ascending rank order, the
-two-shot (pull/push) from the shard owner onwards, the island9 kernel as
-(ranks 0-3 + 8) + (ranks 4-7). The script feeds heavy-tailed activations
-(Gaussian bulk, sparse outliers up to 1e4, per-rank scale spread) through
-each kernel and measures, against the correctly rounded fp64 sum:
+The decode-size kernels accumulate the nine bf16 contributions in fp32 and
+round once to bf16, but in different orders: the one-shot in ascending rank
+order, the two-shot (pull/push) from the shard owner onwards, the island9
+kernel as (ranks 0-3 + 8) + (ranks 4-7). The prefill-size DMA ring
+(``dma-ring``) rounds to bf16 after every reduce-scatter hop (eight
+roundings at nine ranks). The column reduce-scatter of the same ring
+(``dma-rs-bf16``: eight roundings in column-block order; ``dma-rs-fp32``:
+fp32 running sum on the wire, one rounding) returns one column block per
+rank; the script gathers the blocks so every kernel is compared on the full
+``[rows, width]`` sum. The script feeds heavy-tailed activations (Gaussian
+bulk, sparse outliers up to 1e4, per-rank scale spread) through each kernel
+and measures, against the correctly rounded fp64 sum:
 
 * elements whose bf16 output differs from the correctly rounded sum,
 * the largest error in bf16 ulps and the relative L2 error,
 * elements on which the kernels differ from each other.
 
+With ``--norm``, the script also measures the latent RMSNorm that consumes
+the reduced tensor: the served arithmetic (fp32 variance over the ring's
+bf16 latent, ``bf16(bf16(x * s) * w)``) against the column-block scheme
+(variance from fp64 per-block partial sums combined across ranks with an
+fp64 all-reduce, ``bf16(x * s * w)`` rounded once), both against the fp64
+RMSNorm of the fp64 sum.
+
 The result is a JSON record per kernel (rank 0 prints and writes it).
 
-    B12X_RUN_PCIE_TP9_TEST=1 python benchmarks/precision_pcie_tp9_allreduce.py --output out.json
+    B12X_RUN_PCIE_TP9_TEST=1 python benchmarks/precision_pcie_tp9_allreduce.py \
+        --rows 4608 --width 3584 --samples 8 --norm \
+        --kernels dma-ring,dma-rs-bf16,dma-rs-fp32,twoshot-push --output out.json
 """
 
 from __future__ import annotations
@@ -30,6 +45,14 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 WORLD = 9
+ALL_KERNELS = (
+    "oneshot",
+    "twoshot-push",
+    "island9-push",
+    "dma-ring",
+    "dma-rs-bf16",
+    "dma-rs-fp32",
+)
 
 
 def _activations(rows: int, width: int, rank: int, seed: int, device: torch.device) -> torch.Tensor:
@@ -51,7 +74,56 @@ def _ulps(actual: torch.Tensor, reference: torch.Tensor) -> torch.Tensor:
     return (actual.float() - reference.float()).abs() / ulp
 
 
+def _record(results: dict, name: str, out: torch.Tensor, reference: torch.Tensor,
+            reference64: torch.Tensor) -> None:
+    record = results.setdefault(name, {"mismatch_elements": 0, "elements": 0,
+                                       "max_ulp": 0.0, "rel_l2_sum": 0.0, "samples": 0})
+    diff = out != reference
+    record["mismatch_elements"] += int(diff.sum().item())
+    record["elements"] += out.numel()
+    record["max_ulp"] = max(record["max_ulp"], float(_ulps(out, reference).max().item()))
+    err = (out.double() - reference64).norm() / reference64.norm().clamp_min(1e-30)
+    record["rel_l2_sum"] += float(err.item())
+    record["samples"] += 1
+
+
+def _gather_column_blocks(block: torch.Tensor, width: int, group) -> torch.Tensor:
+    """Assemble the full ``[rows, width]`` sum from every rank's column block."""
+    blocks = [torch.empty_like(block) for _ in range(WORLD)]
+    dist.all_gather(blocks, block, group=group)
+    cols = block.shape[1]
+    full = torch.empty((block.shape[0], width), dtype=block.dtype, device=block.device)
+    for rank, part in enumerate(blocks):
+        start = rank * cols
+        valid = min(cols, width - start)
+        if valid > 0:
+            full[:, start : start + valid] = part[:, :valid]
+    return full
+
+
+def _served_rms_norm(latent: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+    """The served in-place RMSNorm arithmetic on a bf16 latent: fp32 variance,
+    ``bf16(bf16(x * s) * w)`` (two roundings per element)."""
+    x = latent.float()
+    variance = x.square().mean(dim=-1, keepdim=True)
+    s = torch.rsqrt(variance + eps)
+    return ((x * s).to(torch.bfloat16).float() * weight.float()).to(torch.bfloat16)
+
+
+def _column_block_rms_norm(
+    block: torch.Tensor, weight_block: torch.Tensor, width: int, eps: float, group
+) -> torch.Tensor:
+    """The column-block RMSNorm: fp64 per-block sum of squares combined with an
+    fp64 all-reduce, ``bf16(x * s * w)`` rounded once (mirrors the vLLM
+    ``KimiRoutedOutputTransform`` column-block path)."""
+    sumsq = block.double().square().sum(dim=-1, keepdim=True)
+    dist.all_reduce(sumsq, group=group)
+    s = torch.rsqrt(sumsq / width + eps).float()
+    return (block.float() * s * weight_block.float()).to(torch.bfloat16)
+
+
 def _worker(rank: int, port: int, args: argparse.Namespace) -> None:
+    from b12x.comm.pcie.pcie_dma import PCIeDmaAllReduce
     from b12x.comm.pcie.pcie_island9 import PCIeIsland9AllReduce
     from b12x.comm.pcie.pcie_oneshot import PCIeOneshotAllReducePool
     from b12x.comm.pcie.pcie_twoshot_bf16 import PCIeTwoShotBF16
@@ -68,25 +140,58 @@ def _worker(rank: int, port: int, args: argparse.Namespace) -> None:
     )
     group = dist.group.WORLD
     rows, width = args.rows, args.width
+    selected = [name for name in ALL_KERNELS if name in args.kernels]
     results: dict[str, dict] = {}
     outputs: dict[str, list[torch.Tensor]] = {}
+    closers = []
 
     kernels = {}
-    pool = PCIeOneshotAllReducePool.from_process_group(
-        process_group=group, device=device, max_input_bytes=rows * width * 2,
-        max_concurrent_channels=1,
-    )
-    pool.prepare_channels(("eager",))
-    kernels["oneshot"] = lambda inp, out: pool.all_reduce(inp, out=out, channel_id="eager")
-    twoshot = PCIeTwoShotBF16.from_exchange_group(
-        exchange_group=group, device=device, max_rows=49149, row_elems=8,
-    )
-    twoshot.all_reduce_mode = "push"
-    kernels["twoshot-push"] = lambda inp, out: twoshot.all_reduce(inp, out=out)
-    island9 = PCIeIsland9AllReduce.from_exchange_group(
-        exchange_group=group, device=device, max_rows=49149, row_elems=8,
-    )
-    kernels["island9-push"] = lambda inp, out: island9.all_reduce(inp, out=out)
+    if "oneshot" in selected:
+        pool = PCIeOneshotAllReducePool.from_process_group(
+            process_group=group, device=device, max_input_bytes=rows * width * 2,
+            max_concurrent_channels=1,
+        )
+        pool.prepare_channels(("eager",))
+        kernels["oneshot"] = lambda inp, out: pool.all_reduce(inp, out=out, channel_id="eager")
+    if "twoshot-push" in selected:
+        twoshot = PCIeTwoShotBF16.from_exchange_group(
+            exchange_group=group, device=device, max_rows=49149, row_elems=8,
+        )
+        twoshot.all_reduce_mode = "push"
+        kernels["twoshot-push"] = lambda inp, out: twoshot.all_reduce(inp, out=out)
+        closers.append(twoshot.close)
+    if "island9-push" in selected:
+        island9 = PCIeIsland9AllReduce.from_exchange_group(
+            exchange_group=group, device=device, max_rows=49149, row_elems=8,
+        )
+        kernels["island9-push"] = lambda inp, out: island9.all_reduce(inp, out=out)
+        closers.append(island9.close)
+    dma = None
+    if any(name.startswith("dma-") for name in selected):
+        dma = PCIeDmaAllReduce(exchange_group=group, device=device, max_bytes=rows * width * 2)
+        dma.min_bytes = 0
+        closers.append(dma.close)
+        if "dma-ring" in selected:
+            kernels["dma-ring"] = lambda inp, out: dma.all_reduce(inp, out=out)
+        if "dma-rs-bf16" in selected:
+            kernels["dma-rs-bf16"] = lambda inp, out: out.copy_(
+                _gather_column_blocks(dma.reduce_scatter_columns(inp, wire="bf16"), width, group)
+            )
+        if "dma-rs-fp32" in selected:
+            kernels["dma-rs-fp32"] = lambda inp, out: out.copy_(
+                _gather_column_blocks(dma.reduce_scatter_columns(inp, wire="fp32"), width, group)
+            )
+
+    norm_weight = None
+    if args.norm:
+        generator = torch.Generator(device="cpu").manual_seed(4242)
+        norm_weight = (1.0 + 0.1 * torch.randn(width, generator=generator)).to(torch.bfloat16).to(device)
+        cols = (width + WORLD - 1) // WORLD
+        weight_block = torch.zeros(cols, dtype=torch.bfloat16, device=device)
+        start = rank * cols
+        valid = min(cols, width - start)
+        if valid > 0:
+            weight_block[:valid] = norm_weight[start : start + valid]
 
     for seed in range(args.samples):
         inp = _activations(rows, width, rank, seed, device)
@@ -100,15 +205,22 @@ def _worker(rank: int, port: int, args: argparse.Namespace) -> None:
             call(inp, out)
             torch.cuda.synchronize(device)
             outputs.setdefault(name, []).append(out.clone())
-            record = results.setdefault(name, {"mismatch_elements": 0, "elements": 0,
-                                               "max_ulp": 0.0, "rel_l2_sum": 0.0, "samples": 0})
-            diff = out != reference
-            record["mismatch_elements"] += int(diff.sum().item())
-            record["elements"] += out.numel()
-            record["max_ulp"] = max(record["max_ulp"], float(_ulps(out, reference).max().item()))
-            err = (out.double() - reference64).norm() / reference64.norm().clamp_min(1e-30)
-            record["rel_l2_sum"] += float(err.item())
-            record["samples"] += 1
+            _record(results, name, out, reference, reference64)
+        if args.norm and norm_weight is not None:
+            eps = args.eps
+            s64 = torch.rsqrt(reference64.square().mean(dim=-1, keepdim=True) + eps)
+            norm64 = reference64 * s64 * norm_weight.double()
+            norm_ref = norm64.to(torch.bfloat16)
+            if "dma-ring" in kernels:
+                served = _served_rms_norm(outputs["dma-ring"][-1], norm_weight, eps)
+                _record(results, "norm/dma-ring", served, norm_ref, norm64)
+            for name in ("dma-rs-fp32", "dma-rs-bf16"):
+                if name in kernels and dma is not None:
+                    wire = name.rsplit("-", 1)[1]
+                    block = dma.reduce_scatter_columns(inp, wire=wire)
+                    normed_block = _column_block_rms_norm(block, weight_block, width, eps, group)
+                    normed = _gather_column_blocks(normed_block, width, group)
+                    _record(results, f"norm/{name}", normed, norm_ref, norm64)
     for name, record in results.items():
         record["rel_l2_mean"] = record["rel_l2_sum"] / max(record["samples"], 1)
         del record["rel_l2_sum"]
@@ -127,11 +239,11 @@ def _worker(rank: int, port: int, args: argparse.Namespace) -> None:
             dist.all_gather(peers, out, group=group)
             mismatch += sum(int((p != peers[0]).sum().item()) for p in peers[1:])
         consistency[name] = mismatch
-    twoshot.close()
-    island9.close()
+    for close in closers:
+        close()
     if rank == 0:
         summary = {"rows": rows, "width": width, "samples": args.samples,
-                   "per_kernel": results, "kernels_differ_on": cross,
+                   "kernels": names, "per_kernel": results, "kernels_differ_on": cross,
                    "cross_rank_inconsistent_elements": consistency}
         print(json.dumps(summary, indent=2), flush=True)
         if args.output:
@@ -142,12 +254,22 @@ def _worker(rank: int, port: int, args: argparse.Namespace) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--rows", type=int, default=16)
     parser.add_argument("--width", type=int, default=7168)
     parser.add_argument("--samples", type=int, default=64)
+    parser.add_argument("--kernels", default=",".join(ALL_KERNELS),
+                        help="comma-separated subset of " + ", ".join(ALL_KERNELS))
+    parser.add_argument("--norm", action="store_true",
+                        help="also measure the latent RMSNorm consuming the reduced tensor")
+    parser.add_argument("--eps", type=float, default=1e-5)
     parser.add_argument("--output", default="")
     args = parser.parse_args()
+    args.kernels = {name.strip() for name in args.kernels.split(",") if name.strip()}
+    unknown = args.kernels - set(ALL_KERNELS)
+    if unknown:
+        raise SystemExit(f"unknown kernels: {sorted(unknown)}")
     if os.getenv("B12X_RUN_PCIE_TP9_TEST") != "1":
         raise SystemExit("requires nine idle GPUs and B12X_RUN_PCIE_TP9_TEST=1")
     with socket.socket() as probe:
