@@ -338,6 +338,106 @@ def test_pack_topk_routes_by_expert_handles_large_prefill_plan_shape() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("use_expert_map", [False, True])
+def test_large_prefill_stable_route_pack_is_repeatable(
+    monkeypatch,
+    use_expert_map: bool,
+) -> None:
+    monkeypatch.setenv("B12X_W4A16_STABLE_ROUTE_PACK", "1")
+    tokens = 4096
+    topk = 16
+    num_experts = 896
+    block_size = 16
+    generator = torch.Generator(device="cuda").manual_seed(20260822)
+    topk_ids = torch.randint(
+        0,
+        num_experts,
+        (tokens, topk),
+        dtype=torch.int32,
+        device="cuda",
+        generator=generator,
+    )
+    topk_ids[0, 0] = -1
+    topk_ids[-1, -1] = num_experts
+    expert_map = None
+    if use_expert_map:
+        expert_map = torch.arange(
+            num_experts, dtype=torch.int32, device="cuda"
+        )
+        expert_map[1::2] = -1
+
+    _, capacity_routes, capacity_blocks = route_pack_capacity(
+        topk_ids.numel(),
+        block_size,
+        num_experts,
+        topk=topk,
+    )
+    workspaces = {
+        "packed_route_indices": torch.empty(
+            capacity_routes, dtype=torch.int32, device="cuda"
+        ),
+        "block_expert_ids": torch.empty(
+            capacity_blocks, dtype=torch.int32, device="cuda"
+        ),
+        "packed_route_count": torch.empty(1, dtype=torch.int32, device="cuda"),
+        "expert_offsets": torch.empty(
+            num_experts + 1, dtype=torch.int32, device="cuda"
+        ),
+        "expert_counts": torch.empty(
+            num_experts, dtype=torch.int32, device="cuda"
+        ),
+    }
+
+    def run() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return pack_topk_routes_by_expert(
+            topk_ids,
+            block_size,
+            num_experts,
+            expert_map=expert_map,
+            **workspaces,
+        )
+
+    first_routes, first_blocks, first_count = run()
+    first_routes = first_routes.clone()
+    first_blocks = first_blocks.clone()
+    first_count = first_count.clone()
+
+    for _ in range(3):
+        routes, blocks, count = run()
+        assert torch.equal(routes, first_routes)
+        assert torch.equal(blocks, first_blocks)
+        assert torch.equal(count, first_count)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_routes, graph_blocks, graph_count = run()
+    for _ in range(3):
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(graph_routes, first_routes)
+        assert torch.equal(graph_blocks, first_blocks)
+        assert torch.equal(graph_count, first_count)
+
+    raw_ids = topk_ids.cpu().reshape(-1).to(torch.int64)
+    mapped_ids = raw_ids
+    valid = (raw_ids >= 0) & (raw_ids < num_experts)
+    if expert_map is not None:
+        host_map = expert_map.cpu().to(torch.int64)
+        mapped_ids = host_map[raw_ids.clamp(0, num_experts - 1)]
+        valid &= (mapped_ids >= 0) & (mapped_ids < num_experts)
+
+    sentinel = int(topk_ids.numel())
+    packed_routes = first_routes[first_routes < sentinel].cpu().to(torch.int64)
+    assert torch.equal(
+        packed_routes.sort().values,
+        torch.nonzero(valid, as_tuple=False).flatten(),
+    )
+    for expert in range(num_experts):
+        expert_routes = packed_routes[mapped_ids[packed_routes] == expert]
+        assert torch.equal(expert_routes, expert_routes.sort().values)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
 @pytest.mark.parametrize("block_size", [8, 16, 32, 48, 64])
 def test_pack_topk_routes_by_expert_applies_expert_map(

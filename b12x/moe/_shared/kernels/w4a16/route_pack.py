@@ -6,6 +6,7 @@ import triton
 import triton.language as tl
 import torch
 
+from b12x._lib.env import env_flag
 from b12x.moe._shared.kernels.w4a16.host import route_pack_capacity
 
 
@@ -17,6 +18,9 @@ _SMALL_PREFIX_MAX_ROUTE_BLOCKS = 512
 
 
 _FAST_COUNT_BLOCK_T = 1024
+_STABLE_SORT_MIN_ROUTES = 4096
+_STABLE_SORT_BLOCK_T = 4096
+_STABLE_SORT_EXPERTS_PER_PROGRAM = 1
 
 
 @triton.jit
@@ -291,6 +295,73 @@ def _pack_topk_routes_sort_kernel(
     tl.store(packed_route_indices + ranks, offsets, mask=valid)
 
 
+@triton.jit
+def _pack_topk_routes_stable_kernel(
+    topk_ids,
+    expert_map,
+    packed_route_indices,
+    expert_offsets,
+    live_numel,
+    NUMEL_CAPACITY: tl.constexpr,
+    NUM_EXPERTS: tl.constexpr,
+    HAS_EXPERT_MAP: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+    EXPERTS_PER_PROGRAM: tl.constexpr,
+):
+    """Pack each expert's routes in ascending token-major route order."""
+    expert_ids = (
+        tl.program_id(0) * EXPERTS_PER_PROGRAM
+        + tl.arange(0, EXPERTS_PER_PROGRAM)
+    )
+    expert_mask = expert_ids < NUM_EXPERTS
+    output_starts = tl.load(
+        expert_offsets + expert_ids,
+        mask=expert_mask,
+        other=0,
+    )
+    output_counts = tl.zeros((EXPERTS_PER_PROGRAM,), dtype=tl.int32)
+    lanes = tl.arange(0, BLOCK_T)
+
+    for start in tl.range(0, NUMEL_CAPACITY, BLOCK_T):
+        offsets = start + lanes
+        raw_ids = tl.load(
+            topk_ids + offsets,
+            mask=offsets < live_numel,
+            other=-1,
+        ).to(tl.int32)
+        valid = (
+            (offsets < live_numel)
+            & (raw_ids >= 0)
+            & (raw_ids < NUM_EXPERTS)
+        )
+        ids = raw_ids
+        if HAS_EXPERT_MAP:
+            safe_ids = tl.minimum(tl.maximum(raw_ids, 0), NUM_EXPERTS - 1)
+            ids = tl.load(expert_map + safe_ids, mask=valid, other=-1).to(
+                tl.int32
+            )
+            valid = valid & (ids >= 0) & (ids < NUM_EXPERTS)
+
+        matches = (
+            expert_mask[:, None]
+            & valid[None, :]
+            & (expert_ids[:, None] == ids[None, :])
+        )
+        match_i32 = matches.to(tl.int32)
+        local_ranks = tl.cumsum(match_i32, axis=1) - 1
+        output_indices = (
+            output_starts[:, None]
+            + output_counts[:, None]
+            + local_ranks
+        )
+        tl.store(
+            packed_route_indices + output_indices,
+            offsets[None, :],
+            mask=matches,
+        )
+        output_counts += tl.sum(match_i32, axis=1)
+
+
 def pack_topk_routes_by_expert(
     topk_ids: torch.Tensor,
     block_size: int,
@@ -523,17 +594,38 @@ def pack_topk_routes_by_expert(
             SEARCH_STEPS=block_e.bit_length(),
             num_warps=4,
         )
-    _pack_topk_routes_sort_kernel[sort_grid](
-        topk_ids,
-        expert_map_tensor,
-        packed_route_indices,
-        expert_offsets,
-        numel,
-        NUM_EXPERTS=int(num_experts),
-        HAS_EXPERT_MAP=expert_map is not None,
-        BLOCK_T=_SORT_BLOCK_T,
-        num_warps=4,
-    )
+    if (
+        env_flag("W4A16_STABLE_ROUTE_PACK")
+        and numel >= _STABLE_SORT_MIN_ROUTES
+    ):
+        stable_grid = (
+            triton.cdiv(num_experts, _STABLE_SORT_EXPERTS_PER_PROGRAM),
+        )
+        _pack_topk_routes_stable_kernel[stable_grid](
+            topk_ids,
+            expert_map_tensor,
+            packed_route_indices,
+            expert_offsets,
+            numel,
+            NUMEL_CAPACITY=numel_capacity,
+            NUM_EXPERTS=int(num_experts),
+            HAS_EXPERT_MAP=expert_map is not None,
+            BLOCK_T=_STABLE_SORT_BLOCK_T,
+            EXPERTS_PER_PROGRAM=_STABLE_SORT_EXPERTS_PER_PROGRAM,
+            num_warps=8,
+        )
+    else:
+        _pack_topk_routes_sort_kernel[sort_grid](
+            topk_ids,
+            expert_map_tensor,
+            packed_route_indices,
+            expert_offsets,
+            numel,
+            NUM_EXPERTS=int(num_experts),
+            HAS_EXPERT_MAP=expert_map is not None,
+            BLOCK_T=_SORT_BLOCK_T,
+            num_warps=4,
+        )
     return packed_route_indices, block_expert_ids, packed_route_count
 
 
