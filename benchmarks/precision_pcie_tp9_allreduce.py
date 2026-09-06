@@ -128,6 +128,31 @@ def _worker(rank: int, port: int, args: argparse.Namespace) -> None:
             raise SystemExit(f"unknown kernels: {sorted(unknown)}")
         kernels = {name: call for name, call in kernels.items() if name in selected}
 
+    # A kernel that does not serve this (rows, width) is dropped with its
+    # reason instead of aborting the run: the two-shot and island runtimes
+    # accept decode-size inputs only (`accepts`), and every rank must drop
+    # the same kernels or the survivors would deadlock in their collectives.
+    skipped: dict[str, str] = {}
+    acceptors = {"twoshot-push": twoshot, "island9-push": island9}
+    probe = torch.zeros(rows, width, dtype=torch.bfloat16, device=device)
+    for name in list(kernels):
+        runtime = acceptors.get(name)
+        if runtime is None:
+            continue
+        try:
+            ok = bool(runtime.accepts(probe))
+            reason = f"input not accepted by {type(runtime).__name__}.all_reduce"
+        except Exception as exc:  # noqa: BLE001 - reported, not raised
+            ok, reason = False, f"{type(exc).__name__}: {exc}"
+        verdict = torch.tensor([0 if ok else 1], device=device)
+        dist.all_reduce(verdict, group=group)
+        if int(verdict.item()):
+            skipped[name] = reason
+            del kernels[name]
+    del probe
+    if not kernels:
+        raise SystemExit(f"no selected kernel serves rows={rows} width={width}: {skipped}")
+
     for seed in range(args.samples):
         inp = _activations(rows, width, rank, seed, device)
         # Correctly rounded reference: fp64 sum of the nine bf16 inputs.
@@ -192,6 +217,7 @@ def _worker(rank: int, port: int, args: argparse.Namespace) -> None:
     if rank == 0:
         summary = {"rows": rows, "width": width, "samples": args.samples,
                    "dma_granule_rows": args.dma_granule_rows,
+                   "skipped": skipped,
                    "per_kernel": results, "kernels_differ_on": cross,
                    "cross_rank_inconsistent_elements": consistency}
         print(json.dumps(summary, indent=2), flush=True)
