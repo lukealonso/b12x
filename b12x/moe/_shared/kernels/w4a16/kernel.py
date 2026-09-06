@@ -135,7 +135,24 @@ from b12x.moe._shared.kernels.micro import (
 
 _ALLOWED_ROUTED_SIZES = _W4A16_ALLOWED_ROUTED_SIZES
 _PACK_FACTOR = 8
-_STAGES = 4
+
+
+def _w4a16_pipeline_stages() -> int:
+    """Depth of the cp.async A/B/scale pipeline of every W4A16 launch.
+
+    ``B12X_W4A16_STAGES`` (default 4; 2..8). Every k-tile is assigned to pipe
+    ``i % stages`` and the fold order is unchanged, so the stage count does
+    not change any arithmetic order; it trades shared memory for latency
+    hiding. The value is read once at import: every kernel geometry of a
+    process shares it (the shared-memory footprint functions use it too).
+    """
+    value = int(os.environ.get("B12X_W4A16_STAGES", "4"))
+    if not 2 <= value <= 8:
+        raise ValueError(f"B12X_W4A16_STAGES must be in 2..8, got {value}")
+    return value
+
+
+_STAGES = _w4a16_pipeline_stages()
 
 
 def _w4a16_small_m_splitk_enabled() -> bool:
@@ -581,6 +598,18 @@ def _shared_memory_footprint(
     return tmp_size + sh_a_size + sh_s_size + sh_block_meta_size
 
 
+def _w4a16_small_m_blocks_per_sm() -> int:
+    """Persistent CTAs per SM of the small-M (decode) W4A16 launch.
+
+    ``B12X_W4A16_SMALL_M_BLOCKS_PER_SM`` (default 1; 1..4), applied as an
+    upper bound below the register and shared-memory limits.
+    """
+    value = int(os.environ.get("B12X_W4A16_SMALL_M_BLOCKS_PER_SM", "1"))
+    if not 1 <= value <= 4:
+        raise ValueError(f"B12X_W4A16_SMALL_M_BLOCKS_PER_SM must be in 1..4, got {value}")
+    return value
+
+
 def _determine_blocks_per_sm(
     *,
     problem_m: int,
@@ -627,8 +656,13 @@ def _determine_blocks_per_sm(
         # extra GEMM throughput. Pin one persistent CTA per SM to minimize the
         # barrier participant count while still covering the machine for the
         # I_tp=1024 GEMMs. The split-K persistent loop is grid_x-agnostic, so this
-        # is numerically identical.
-        blocks_per_sm_limit = 1
+        # is numerically identical. ``B12X_W4A16_SMALL_M_BLOCKS_PER_SM`` raises
+        # the pin (up to the register/shared-memory limit) for measurements of
+        # the latency-hiding trade-off; the work assignment stays grid-agnostic.
+        blocks_per_sm_limit = min(
+            blocks_per_sm_limit, _w4a16_small_m_blocks_per_sm()
+        )
+        blocks_per_sm_limit = max(blocks_per_sm_limit, 1)
     elif cta_m_blocks == 1:
         blocks_per_sm_limit = max(min(blocks_per_sm_limit, 4), 1)
     else:
