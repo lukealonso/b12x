@@ -21,7 +21,7 @@ def _reset_error_kernel(error_code_ptr):
     tl.store(error_code_ptr, 0)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["token_count"])
 def _validate_metadata_kernel(
     token_ids_ptr,
     query_start_loc_ptr,
@@ -29,6 +29,7 @@ def _validate_metadata_kernel(
     num_seqs_ptr,
     num_tokens_ptr,
     error_code_ptr,
+    token_count,
     VOCAB_SIZE: tl.constexpr,
     MAX_ORDER: tl.constexpr,
     MAX_SEQS: tl.constexpr,
@@ -43,6 +44,7 @@ def _validate_metadata_kernel(
             | (num_seqs > MAX_SEQS)
             | (num_tokens < 0)
             | (num_tokens > MAX_TOKENS)
+            | (num_tokens > token_count)
             | ((num_seqs == 0) & (num_tokens > 0))
         )
         tl.atomic_or(
@@ -247,24 +249,28 @@ def _launch_hash_pipeline(
     heads_per_order: int,
     max_seqs: int,
     max_tokens: int,
+    token_count: int | None = None,
 ) -> None:
-    """Launch fixed-capacity request mapping and hash kernels."""
+    """Launch request mapping and hashing within preplanned storage."""
+    if token_count is None:
+        token_count = max_tokens
     head_count = (max_order - 1) * heads_per_order
     _reset_error_kernel[(1,)](error_code, num_warps=1)
-    _validate_metadata_kernel[(max(max_tokens, max_seqs),)](
+    _validate_metadata_kernel[(max(token_count, max_seqs),)](
         token_ids,
         query_start_loc,
         committed_history,
         num_seqs,
         num_tokens,
         error_code,
+        token_count,
         VOCAB_SIZE=vocab_size,
         MAX_ORDER=max_order,
         MAX_SEQS=max_seqs,
         MAX_TOKENS=max_tokens,
         num_warps=1,
     )
-    _request_ids_kernel[(max_tokens,)](
+    _request_ids_kernel[(token_count,)](
         query_start_loc,
         num_seqs,
         num_tokens,
@@ -273,7 +279,7 @@ def _launch_hash_pipeline(
         MAX_TOKENS=max_tokens,
         num_warps=1,
     )
-    _hash_ids_kernel[(max_tokens, head_count)](
+    _hash_ids_kernel[(token_count, head_count)](
         token_ids,
         query_start_loc,
         committed_history,

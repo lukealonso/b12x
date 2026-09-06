@@ -652,17 +652,53 @@ def test_cuda_public_run_exports_as_one_opaque_fullgraph_custom_op(
 
 @torch.inference_mode()
 @pytest.mark.parametrize("quant_mode", ["bf16", "fp8_e4m3_per_tensor", "nvfp4_group16"])
+@pytest.mark.parametrize("token_count", [None, 3])
 def test_cuda_graph_replay_uses_bound_storage_without_allocating(
     quant_mode: str,
+    token_count: int | None,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from triton.runtime.jit import JITFunction
+
+    from b12x.sequence.ple_embedding import _kernels
+    from b12x.sequence.ple_hash import _kernels as hash_kernels
+
     device = require_b12x()
     binding = _bind_small(_small_plan(device, quant_mode=quant_mode))
     ple_embedding.run(binding)
+
+    def reject_resolution(*args, **kwargs):
+        pytest.fail("Live launch bounds must reuse the warmed embedding kernels")
+
+    for module in (_kernels, hash_kernels):
+        for kernel in vars(module).values():
+            if isinstance(kernel, JITFunction):
+                monkeypatch.setattr(kernel, "_do_compile", reject_resolution)
+
+    binding.num_seqs.zero_()
+    binding.num_tokens.zero_()
+    for bound in (0, 1, 3, 5):
+        binding.out.fill_(37)
+        actual = ple_embedding.run(binding, token_count=bound)
+        assert bool((actual == 0).all().item())
+        assert bool((binding.out[bound:] == 37).all().item())
+    for bound in (-1, 6):
+        with pytest.raises(ValueError, match="planned token capacity"):
+            ple_embedding.run(binding, token_count=bound)
+
+    binding.num_seqs.fill_(2)
+    binding.num_tokens.fill_(4)
+    binding.out.fill_(37)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        captured = ple_embedding.run(binding)
+        captured = ple_embedding.run(binding, token_count=token_count)
     output_address = captured.data_ptr()
     scratch_address = binding.scratch.data_ptr()
+    if token_count is not None:
+        # Device metadata cannot exceed the launch bound even if it fits capacity.
+        graph.replay()
+        assert binding.error_code.item() & 1
+        assert bool((captured == 0).all().item())
 
     if quant_mode == "bf16":
         binding.weight.neg_()
@@ -697,7 +733,10 @@ def test_cuda_graph_replay_uses_bound_storage_without_allocating(
     assert captured.data_ptr() == output_address == binding.out.data_ptr()
     assert binding.scratch.data_ptr() == scratch_address
     assert allocated_after == allocated_before
-    torch.testing.assert_close(captured, expected, rtol=0, atol=0)
+    torch.testing.assert_close(captured, expected[:token_count], rtol=0, atol=0)
+    assert binding.error_code.item() == 0
+    if token_count is not None:
+        assert bool((binding.out[token_count:] == 37).all().item())
 
 
 @torch.inference_mode()

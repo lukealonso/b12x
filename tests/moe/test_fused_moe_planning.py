@@ -536,7 +536,7 @@ def test_typed_packed_planning_keeps_representation_axes_independent(
         ("w4a16", "fp4_e8m0_k32", "w31", "mma_packed"),
         ("nvfp4", "modelopt_nvfp4", "w31", "source_native"),
         ("w4a8_nvfp4", "modelopt_nvfp4", "w31", "source_native"),
-        ("w4a16", "modelopt_nvfp4", "w13", "source_native"),
+        ("w4a16", "modelopt_nvfp4", "w13", "mma_packed"),
     ),
 )
 def test_vllm_1_2_6_planning_contract_remains_supported(
@@ -1041,9 +1041,9 @@ def test_gb10_qwen38_flash_next_decode_reports_profile_provenance(
 
 @pytest.mark.parametrize(
     ("num_tokens", "route_mode"),
-    ((1, "packed"), (2, "packed"), (4, "packed"), (8, "packed")),
+    ((1, "direct"), (2, "direct"), (4, "direct"), (8, "packed")),
 )
-def test_gb10_glm53_w4a16_profile_selects_measured_route_kernel(
+def test_gb10_uniform_nvfp4_a16_uses_packed_layout_heuristic(
     num_tokens: int,
     route_mode: str,
 ) -> None:
@@ -1058,6 +1058,6 @@ def test_gb10_glm53_w4a16_profile_selects_measured_route_kernel(
         context=_policy_context(_GB10_IDENTITY),
     )
 
-    assert resolution.source is PolicySource.PREPLANNED
+    assert resolution.source is PolicySource.HEURISTIC
     assert resolution.config.backend == "w4a16"
     assert resolution.config.w4a16_route_mode == route_mode

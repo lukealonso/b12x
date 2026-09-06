@@ -394,16 +394,14 @@ def test_qwen_dense_inspection_is_fully_preplanned_on_gb10(
 
 @pytest.mark.parametrize("model", ("glm-5.2", "glm-5.3", "glm-5.3-flash"))
 @pytest.mark.parametrize("tp_size", (1, 2, 4, 8))
-def test_glm_inspection_is_fully_preplanned_on_gb10(
+def test_glm_inspection_reports_packed_a16_heuristics_on_gb10(
     model: str,
     tp_size: int,
 ) -> None:
     payload = inspect_model_policy(model, tp_size=tp_size, device="gb10")
 
     assert payload["profile_id"] == "nvidia.gb10.48sm"
-    assert {selection["source"] for selection in payload["selections"]} == {
-        "preplanned"
-    }
+    _assert_profile_coverage_with_uniform_nvfp4_a16_heuristics(payload)
 
 
 @pytest.mark.parametrize(
@@ -428,12 +426,20 @@ def test_glm_inspection_is_fully_preplanned_on_gb10(
         ("qwen3.8-flash-next-180b", 1),
     ),
 )
-def test_every_canonical_model_is_fully_preplanned_at_its_benchmark_tp(
+def test_canonical_model_profile_coverage_at_its_benchmark_tp(
     model: str,
     tp_size: int,
 ) -> None:
     payload = inspect_model_policy(model, tp_size=tp_size, device="gb10")
 
-    assert {selection["source"] for selection in payload["selections"]} == {
-        "preplanned"
-    }
+    _assert_profile_coverage_with_uniform_nvfp4_a16_heuristics(payload)
+
+
+def _assert_profile_coverage_with_uniform_nvfp4_a16_heuristics(payload):
+    for selection in payload["selections"]:
+        query = selection["query"]
+        uniform_nvfp4_a16 = (
+            query.get("quant_mode") == "w4a16"
+            and query.get("source_format") == "modelopt_nvfp4"
+        )
+        assert selection["source"] == ("heuristic" if uniform_nvfp4_a16 else "preplanned")

@@ -22,6 +22,7 @@ from b12x.gemm._shared.wo_mxfp8 import (
     _check_gpu_tensor,
     pack_mxfp8_scales_for_dense_gemm,
 )
+from ._a16 import NVFP4LinearWeight, pack_nvfp4_weight, workspace_size
 
 
 @dataclass(frozen=True)
@@ -47,7 +48,7 @@ class TensorFP8LinearWeight:
     out_features: int
 
 
-Weight: TypeAlias = MXFP8LinearWeight | TensorFP8LinearWeight
+Weight: TypeAlias = MXFP8LinearWeight | TensorFP8LinearWeight | NVFP4LinearWeight
 
 
 def _align_up(value: int, alignment: int) -> int:
@@ -391,17 +392,30 @@ def pack_tensor_fp8_linear_weight(
 def pack_weight(
     weight: torch.Tensor,
     scale: torch.Tensor,
+    *,
+    recipe: str | None = None,
+    global_scale: torch.Tensor | None = None,
+    global_scale_kind: str = "multiplier",
 ) -> Weight:
     """Pack a serialized dense weight for ``blockscaled.mm``.
 
     A scalar FP32 ``scale`` selects tensor-scaled FP8 and represents the
     combined activation/weight dequantization scale. A 2D uint8/UE8M0 scale
     selects ModelOpt MXFP8.
+
+    ``recipe='nvfp4'`` borrows packed uint8 values and swizzled E4M3 scales.
+    Pass the weight-only ``global_scale`` and its ``global_scale_kind``
+    (``'multiplier'`` or ``'reciprocal'``); no scale transformation occurs.
     """
 
-    if scale.dtype == torch.float32 and scale.numel() == 1:
+    if recipe == "nvfp4":
+        return pack_nvfp4_weight(weight, scale, global_scale,
+                                 global_scale_kind=global_scale_kind)
+    if recipe not in (None, "mxfp8", "tensor_fp8") or global_scale is not None or global_scale_kind != "multiplier":
+        raise ValueError("global_scale/kind are specific to recipe='nvfp4'")
+    if scale.dtype == torch.float32 and scale.numel() == 1 and recipe != "mxfp8":
         return pack_tensor_fp8_linear_weight(weight, scale)
-    if scale.dtype in (torch.uint8, torch.float8_e8m0fnu) and scale.ndim == 2:
+    if scale.dtype in (torch.uint8, torch.float8_e8m0fnu) and scale.ndim == 2 and recipe != "tensor_fp8":
         return pack_mxfp8_linear_weight(weight, scale)
     raise ValueError(
         "unsupported blockscaled weight scale: expected one FP32 combined "
@@ -745,7 +759,7 @@ def mxfp8_linear(
         output = torch.ops.b12x.blockscaled_packed_mxfp8(
             source_2d,
             packed_weight.weight.values,
-            packed_weight.weight.scale_rows,
+            packed_weight.weight.scale_rows if packed_weight.weight.scale_rows is not None else packed_weight.weight.scale_mma,
             packed_weight.weight.scale_mma,
             packed_weight.in_features,
             packed_weight.padded_in_features,
@@ -922,6 +936,35 @@ def blockscaled_mm(
 ) -> torch.Tensor:
     """Dispatch packed linear weights or preserve the raw ``dense_gemm`` API."""
 
+    if isinstance(rhs, NVFP4LinearWeight) or (
+        isinstance(rhs, MXFP8LinearWeight) and isinstance(lhs, torch.Tensor)
+        and lhs.dtype == torch.bfloat16
+    ):
+        if not isinstance(lhs, torch.Tensor):
+            raise TypeError("packed NVFP4 linear requires a BF16 source tensor")
+        options = dict(kwargs)
+        bias = options.pop("bias", None)
+        out_dtype = options.pop("out_dtype", None)
+        if out_dtype not in (None, torch.bfloat16):
+            raise ValueError("BF16 blockscaled linear output must be BF16")
+        _validate_bias(bias, out_features=rhs.out_features, out_dtype=torch.bfloat16,
+                       device=lhs.device)
+        if bias is not None and out is not None:
+            from ._a16 import _overlap
+            if _overlap(out, bias):
+                raise ValueError("out must not overlap bias")
+        from ._ops import linear
+        fp4 = isinstance(rhs, NVFP4LinearWeight)
+        result = linear(lhs, rhs.values if fp4 else rhs.weight.values,
+                        rhs.scale_mma if fp4 else rhs.weight.scale_mma,
+                        rhs.global_scale if fp4 else None, fp4=fp4,
+                        reciprocal=fp4 and rhs.global_scale_kind == "reciprocal",
+                        input_k=rhs.in_features, out=out, **options)
+        if bias is not None:
+            from ._a16 import _stream_context
+            with torch.cuda.device(lhs.device), _stream_context(options.get("stream"), lhs.device):
+                result.add_(bias)
+        return result
     if isinstance(rhs, MXFP8LinearWeight):
         if out is not None:
             raise ValueError("packed MXFP8 blockscaled.mm does not accept out")
@@ -1006,6 +1049,35 @@ def prewarm(
     """
 
     counts = sorted({int(value) for value in token_counts if int(value) > 0})
+
+    if isinstance(rhs, NVFP4LinearWeight) or (
+        isinstance(rhs, MXFP8LinearWeight) and rhs.out_features % 8 == 0
+        and (input_dtype if input_dtype is not None else out_dtype) == torch.bfloat16
+        and torch.cuda.get_device_capability(rhs.weight.values.device) in ((12, 0), (12, 1))
+    ):
+        if input_dtype not in (None, torch.bfloat16) or out_dtype != torch.bfloat16:
+            raise ValueError("NVFP4/MXFP8 BF16 warmup requires BF16 input/output")
+        if not counts:
+            return 0
+        options = dict(mm_kwargs)
+        mode = options.pop("mode", "auto")
+        if mode not in ("auto", "a16", "quantized"):
+            raise ValueError("mode must be 'auto', 'a16', or 'quantized'")
+        device = rhs.values.device if isinstance(rhs, NVFP4LinearWeight) else rhs.weight.values.device
+        workspace = options.pop("workspace", None)
+        from ._a16 import _stream_context
+        with torch.inference_mode(), torch.cuda.device(device), _stream_context(stream, device):
+            if workspace is None:
+                workspace = torch.empty(workspace_size(rhs, max(counts), _config=options.get("_config")),
+                                        dtype=torch.uint8, device=device)
+            for tokens in counts:
+                source = torch.zeros((tokens, rhs.in_features), dtype=torch.bfloat16, device=device)
+                output = torch.empty((tokens, rhs.out_features), dtype=torch.bfloat16, device=device)
+                blockscaled_mm(source, rhs, out=output, workspace=workspace,
+                               mode=mode, stream=stream, **options)
+                if isinstance(rhs, MXFP8LinearWeight) and mode == "auto":
+                    blockscaled_mm(source, rhs, mode=mode, stream=stream, **options)
+        return len(counts)
 
     if isinstance(rhs, tuple):
         if len(rhs) != 2:

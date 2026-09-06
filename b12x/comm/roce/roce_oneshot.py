@@ -826,7 +826,12 @@ class RoceOneshotAllReduce:
                 "RoCE all-gather launcher must be prepared before CUDA graph capture"
             )
         launcher = _allgather_cute.get_launcher(*key)
-        stage_counter, tail_counter = self._counter_addresses(self._blocks)
+        # Same size-aware geometry as the all-reduce: a small shard (top-k
+        # values and ids, MTP logits) launches a few blocks instead of the
+        # full grid, and each power-of-two grid has its own arrival counters
+        # so gathers and reductions of any size may interleave in one graph.
+        grid_blocks = _grid_blocks(nbytes // PACK_BYTES, self._threads, self._blocks)
+        stage_counter, tail_counter = self._counter_addresses(grid_blocks)
         launcher(
             input_address,
             output_address,
@@ -843,7 +848,7 @@ class RoceOneshotAllReduce:
             tail_counter,
             self._poison_address,
             self.spin_limit,
-            self._blocks,
+            grid_blocks,
         )
         if not capturing:
             self.check_health()

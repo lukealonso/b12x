@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from b12x.policy import (
     MOE_DECODE,
@@ -97,6 +97,14 @@ def validate_moe_decode_config(
     config: MoeDecodeConfig,
     _device: DeviceIdentity | None,
 ) -> None:
+    if query.quant_mode == "nvfp4_auto":
+        if query.source_format != "modelopt_nvfp4" or query.activation != "silu":
+            raise ValueError("automatic MoE precision requires ModelOpt NVFP4 weights and SiLU")
+        if config.backend == "w4a16" and config.w4a16_route_mode == "direct" and query.num_tokens > 8:
+            raise ValueError("source-native A16 direct decode requires capacity at most 8")
+        query = replace(
+            query, quant_mode="w4a16" if config.backend == "w4a16" else "nvfp4",
+        )
     if config.backend not in {"micro", "dynamic", "w4a16"}:
         raise ValueError(f"unsupported MoE backend {config.backend!r}")
     if query.quant_mode == "w4a16":
@@ -150,7 +158,7 @@ def make_moe_decode_policy(
 ) -> ComponentPolicy[MoeDecodeQuery, MoeDecodeConfig]:
     return ComponentPolicy(
         component_id=MOE_DECODE,
-        query_schema_version=3,
+        query_schema_version=4,
         config_schema_version=3,
         query_fields=frozenset(
             {

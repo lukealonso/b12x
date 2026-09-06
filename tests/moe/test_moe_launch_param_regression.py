@@ -132,6 +132,7 @@ def _direct_micro_launchable(
     weight_E: int = 256,
     k: int = 4096,
     num_topk: int = 10,
+    compile_time_phase: int = 0,
 ) -> bool:
     from b12x.moe.fused_moe._impl import (
         _DIRECT_MICRO_BLOCK_DIM,
@@ -153,6 +154,7 @@ def _direct_micro_launchable(
         activation="silu",
         quant_mode=quant_mode,
         device=torch.device("cuda"),
+        compile_time_phase=compile_time_phase,
     )
     return _compiled_direct_micro_accepts_block_dim(compiled, _DIRECT_MICRO_BLOCK_DIM)
 
@@ -161,6 +163,21 @@ def test_nvfp4_direct_micro_launches_qwen_bs8_shape() -> None:
     _skip_if_no_sm120()
 
     assert _direct_micro_launchable("nvfp4", 8, 256, weight_E=512)
+
+
+@pytest.mark.parametrize("compile_time_phase", [1, 2])
+def test_nvfp4_split_micro_compile_signature_matches_runtime_launch(
+    compile_time_phase: int,
+) -> None:
+    _skip_if_no_sm120()
+
+    assert _direct_micro_launchable(
+        "nvfp4",
+        1,
+        256,
+        weight_E=512,
+        compile_time_phase=compile_time_phase,
+    )
 
 
 @pytest.mark.parametrize("case", ["alphas", "scales"])

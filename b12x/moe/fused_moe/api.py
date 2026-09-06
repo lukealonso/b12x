@@ -248,7 +248,7 @@ def bind(plan: Plan | ExecutionPlan, **kwargs: Any) -> Binding:
                 "unit_scale_contract is derived from the canonical activation mode"
             )
         kwargs["unit_scale_contract"] = (
-            plan.experts.plan.activation.mode is ActivationMode.A16
+            plan.activation_mode is ActivationMode.A16
         )
         kwargs["experts"] = experts._impl
         return plan._impl.bind(**kwargs)

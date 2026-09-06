@@ -81,9 +81,7 @@ def _bf16_lookup_kernel(
     columns = tl.program_id(2) * BLOCK_D + tl.arange(0, BLOCK_D)
     column_mask = columns < HEAD_DIM
     num_tokens = tl.load(num_tokens_ptr).to(tl.int32)
-    token_live = (
-        (token < num_tokens) & (num_tokens >= 0) & (num_tokens <= MAX_TOKENS)
-    )
+    token_live = (token < num_tokens) & (num_tokens >= 0) & (num_tokens <= MAX_TOKENS)
     id_offset = token.to(tl.int64) * HEAD_COUNT + head.to(tl.int64)
     embedding_id = tl.load(ids_ptr + id_offset, mask=token_live, other=-1).to(tl.int64)
     local = (
@@ -190,9 +188,7 @@ def _nvfp4_lookup_kernel(
     columns = tl.program_id(2) * BLOCK_D + tl.arange(0, BLOCK_D)
     column_mask = columns < HEAD_DIM
     num_tokens = tl.load(num_tokens_ptr).to(tl.int32)
-    token_live = (
-        (token < num_tokens) & (num_tokens >= 0) & (num_tokens <= MAX_TOKENS)
-    )
+    token_live = (token < num_tokens) & (num_tokens >= 0) & (num_tokens <= MAX_TOKENS)
     id_offset = token.to(tl.int64) * HEAD_COUNT + head.to(tl.int64)
     embedding_id = tl.load(ids_ptr + id_offset, mask=token_live, other=-1).to(tl.int64)
     local = (
@@ -280,7 +276,7 @@ def _launch_bf16_lookup(
     shard_start: int,
     shard_end: int,
 ) -> None:
-    grid = (max_tokens, head_count, triton.cdiv(head_dim, _BLOCK_D))
+    grid = (out.shape[0], head_count, triton.cdiv(head_dim, _BLOCK_D))
     _bf16_lookup_kernel[grid](
         weight,
         ids,
@@ -312,7 +308,7 @@ def _launch_fp8_lookup(
     shard_start: int,
     shard_end: int,
 ) -> None:
-    grid = (max_tokens, head_count, triton.cdiv(head_dim, _BLOCK_D))
+    grid = (out.shape[0], head_count, triton.cdiv(head_dim, _BLOCK_D))
     _fp8_lookup_kernel[grid](
         weight,
         weight_scale,
@@ -346,7 +342,7 @@ def _launch_nvfp4_lookup(
     shard_start: int,
     shard_end: int,
 ) -> None:
-    grid = (max_tokens, head_count, triton.cdiv(head_dim, _BLOCK_D))
+    grid = (out.shape[0], head_count, triton.cdiv(head_dim, _BLOCK_D))
     _nvfp4_lookup_kernel[grid](
         weight,
         weight_scale,
@@ -546,6 +542,7 @@ def _launch_hash(
     heads_per_order: int,
     max_seqs: int,
     max_tokens: int,
+    token_count: int,
 ) -> None:
     _launch_hash_pipeline(
         token_ids,
@@ -565,6 +562,7 @@ def _launch_hash(
         heads_per_order,
         max_seqs,
         max_tokens,
+        token_count=token_count,
     )
 
 
@@ -626,6 +624,7 @@ def _bf16_pipeline_op(
         heads_per_order,
         max_seqs,
         max_tokens,
+        out.shape[0],
     )
     _launch_bf16_lookup(
         weight,
@@ -738,6 +737,7 @@ def _fp8_pipeline_op(
         heads_per_order,
         max_seqs,
         max_tokens,
+        out.shape[0],
     )
     _launch_fp8_lookup(
         weight,
@@ -853,6 +853,7 @@ def _nvfp4_pipeline_op(
         heads_per_order,
         max_seqs,
         max_tokens,
+        out.shape[0],
     )
     _launch_nvfp4_lookup(
         weight,
@@ -911,7 +912,7 @@ def _nvfp4_pipeline_fake(
     del ids_offset_bytes, request_ids_offset_bytes, error_code_offset_bytes
 
 
-def run_pipeline(binding: Binding) -> None:
+def run_pipeline(binding: Binding, *, token_count: int) -> None:
     """Launch one opaque hash, local gather, and inline dequantization op."""
     plan = binding.plan
     caps = plan.caps
@@ -925,7 +926,7 @@ def run_pipeline(binding: Binding) -> None:
         plan.prime_sizes,
         plan.table_offsets,
         binding.scratch,
-        binding.out,
+        binding.out[:token_count],
         caps.eos_token_id,
         caps.vocab_size,
         caps.max_order,

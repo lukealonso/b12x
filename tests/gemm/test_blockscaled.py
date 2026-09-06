@@ -503,6 +503,7 @@ def test_blockscaled_public_surface_and_compatibility_aliases() -> None:
 
     assert blockscaled.META.entry_points == (
         "Weight",
+        "NVFP4LinearWeight",
         "mm",
         "mm_mxfp4",
         "mm_nvfp4",
@@ -510,6 +511,9 @@ def test_blockscaled_public_surface_and_compatibility_aliases() -> None:
         "pack_weight",
         "prewarm",
         "is_supported",
+        "w4a16",
+        "w8a16",
+        "workspace_size",
     )
     assert mxfp8_linear.mm is blockscaled.mm
     assert mxfp8_linear.pack_weight is blockscaled.pack_weight
