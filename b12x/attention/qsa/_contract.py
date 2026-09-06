@@ -2747,6 +2747,21 @@ def _qsa_selected_op(
     from ._sparse_gqa import launch_sparse_paged_gqa
     from ._sparse_gqa_cute_config import BLOCK_N
 
+    # Storage addresses exist at the custom-op runtime boundary, not in tracing.
+    _require_mutation_alias_contract(
+        mutable=(("scratch", scratch), ("output", output)),
+        read_only=(
+            ("query", query),
+            ("request_ids", request_ids),
+            ("query_positions", query_positions),
+            ("selected_positions", selected_positions),
+            *(
+                (("selection_errors", selection_errors),)
+                if selection_errors is not None
+                else ()
+            ),
+        ),
+    )
     rows, q_heads, head_dim = map(int, query.shape)
     errors = selection_errors
     if errors is None:
@@ -2863,7 +2878,6 @@ def run_selected(
         raise ValueError(
             "captured positions and selection errors must be supplied together"
         )
-    captured_inputs: tuple[tuple[str, torch.Tensor], ...] = ()
     if selected_positions is None:
         selected_positions = binding.selected_positions
     else:
@@ -2885,7 +2899,6 @@ def run_selected(
             dtype=torch.int32,
             contiguous=True,
         )
-        captured_inputs = (("selection_errors", selection_errors),)
     for tensor, name, shape, dtype in (
         (query, "query", (rows, caps.q_heads, caps.head_dim), torch.bfloat16),
         (request_ids, "request_ids", (rows,), (torch.int32, torch.int64)),
@@ -2899,16 +2912,6 @@ def run_selected(
             dtype=dtype,
             contiguous=True,
         )
-    _require_mutation_alias_contract(
-        mutable=(("scratch", binding.scratch), ("output", binding.output)),
-        read_only=(
-            ("query", query),
-            ("request_ids", request_ids),
-            ("query_positions", query_positions),
-            ("selected_positions", selected_positions),
-            *captured_inputs,
-        ),
-    )
     layout = binding.plan._layout
     _qsa_selected_op(
         query,

@@ -1236,6 +1236,71 @@ def test_qsa_shared_pool_runs_under_fullgraph_compile_and_checks_runtime_aliases
         compiled(binding.output[:1], *arguments[1:])
 
 
+@pytest.mark.parametrize("captured", [False, True])
+def test_qsa_selected_fullgraph_compile_preserves_output_and_rejects_aliases(
+    captured: bool,
+) -> None:
+    """The custom-op boundary must trace without inspecting fake storage."""
+    device = require_sm120()
+    caps = _caps(
+        device,
+        max_batch=1,
+        max_raw_state_slots=1,
+        max_q_rows=1,
+        q_heads=24,
+        kv_heads=2,
+        head_dim=256,
+        max_speculative_tokens=3,
+        index_heads=4,
+        index_head_dim=128,
+        index_rotary_dim=64,
+    )
+    binding = _allocate_binding(caps)
+    binding.main_block_table[0, 0] = 0
+    binding.main_k_cache.normal_()
+    binding.main_v_cache.normal_()
+    binding.state_errors.zero_()
+    binding.selected_positions.fill_(-1)
+    binding.selected_positions[0, :16] = torch.arange(16, device=device)
+    selected = torch.full(
+        (1, caps.selection_width + caps.max_speculative_tokens),
+        -1,
+        dtype=torch.int32,
+        device=device,
+    )
+    selected[:, : caps.selection_width].copy_(binding.selected_positions)
+    errors = torch.zeros(1, dtype=torch.int32, device=device)
+    requests = torch.zeros(1, dtype=torch.int32, device=device)
+    positions = torch.full((1,), 15, dtype=torch.int64, device=device)
+    query = torch.randn(1, 24, 256, dtype=torch.bfloat16, device=device)
+
+    def attention(query):
+        return qsa.run_selected(
+            binding,
+            query=query,
+            request_ids=requests,
+            query_positions=positions,
+            selected_positions=selected if captured else None,
+            selection_errors=errors if captured else None,
+        )
+
+    expected = attention(query).clone()
+    compiled = torch.compile(attention, fullgraph=True)
+    result = compiled(query)
+    torch.testing.assert_close(result, expected, rtol=0, atol=0)
+    assert torch.isfinite(result).all()
+    assert torch.count_nonzero(result) > 0
+    assert result.data_ptr() == binding.output.data_ptr()
+    for _ in range(2):
+        query.normal_()
+        expected = attention(query).clone()
+        torch.testing.assert_close(compiled(query), expected, rtol=0, atol=0)
+    with pytest.raises(ValueError, match="output.*query"):
+        attention(binding.output)
+    with pytest.raises(ValueError, match="output.*query"):
+        compiled(binding.output)
+
+
 def test_qsa_shared_pool_cuda_graph_replay_has_stable_addresses_and_allocation() -> (
     None
 ):
@@ -1972,6 +2037,10 @@ def test_qsa_cute_scores_preserve_paged_contract_under_graph_replay(
         compressed_page_size=page_size,
     )
     torch.manual_seed(98797)
+    if high_page:
+        _require_free_cuda_bytes(
+            device, page_count * page_size * dim * torch.bfloat16.itemsize + 2**28
+        )
     cache = torch.empty(
         (page_count, page_size, dim), device=device, dtype=torch.bfloat16
     )
@@ -2876,6 +2945,23 @@ def test_qsa_split_transaction_matches_combined_across_streams_and_graph_replay(
     allocate = (
         _allocate_shared_compressed_raw_binding if shared_pool else _allocate_binding
     )
+    if high_page:
+        pool_bytes = (
+            4
+            * caps.num_main_cache_pages
+            * caps.main_page_size
+            * caps.kv_heads
+            * caps.head_dim
+            * caps.kv_dtype.itemsize
+        )
+        projection_width = (caps.index_heads + 1) * caps.index_head_dim
+        projection_bytes = (
+            ((rows - 1) * (2**31 + projection_width) + projection_width)
+            * torch.bfloat16.itemsize
+            if direct_views
+            else 0
+        )
+        _require_free_cuda_bytes(device, pool_bytes + projection_bytes + 2**29)
     reference = allocate(caps)
     candidate = allocate(caps)
     live_reqs = max(1, rows // 4)
@@ -3074,6 +3160,15 @@ def test_qsa_captured_selection_preserves_tail_errors_and_state_on_graph_replay(
         max_speculative_tokens=3,
         kv_dtype=kv_dtype,
     )
+    pool_bytes = (
+        2
+        * caps.num_main_cache_pages
+        * caps.main_page_size
+        * caps.kv_heads
+        * caps.head_dim
+        * caps.kv_dtype.itemsize
+    )
+    _require_free_cuda_bytes(device, pool_bytes + 2**29)
     binding = _allocate_binding(caps)
     binding.main_block_table[:, 0] = torch.arange(
         first_page, first_page + 4, dtype=torch.int32, device=device

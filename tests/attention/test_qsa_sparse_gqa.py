@@ -121,6 +121,76 @@ def test_cooperative_merge_preserves_order_bitwise_under_changed_graph_inputs(
         implementation.clear_caches()
 
 
+@pytest.mark.parametrize("selection_width", [2051, 2054])
+def test_split_prewarm_matches_planned_selection_capacity(selection_width: int) -> None:
+    """Warmup must cover both ordinary selection and a three-column MTP tail."""
+    from b12x._lib.runtime_control import (
+        freeze_kernel_resolution,
+        unfreeze_kernel_resolution,
+    )
+    from b12x.attention.paged import _selected_forward as implementation
+
+    device = require_sm120()
+    query = torch.randn(4, 6, 256, dtype=torch.bfloat16, device=device)
+    keys = torch.randn(1, 16, 1, 256, dtype=torch.bfloat16, device=device)
+    values = torch.randn_like(keys)
+    requests = torch.zeros(4, dtype=torch.int32, device=device)
+    positions = torch.full((4,), 15, dtype=torch.int64, device=device)
+    table = torch.zeros(1, 1, dtype=torch.int32, device=device)
+    selected = torch.full((4, selection_width), -1, dtype=torch.int32, device=device)
+    selected[:, :16] = torch.arange(16, device=device)
+    partials = torch.empty(4, 16, 6, 256, device=device)
+    lse = torch.empty(4, 16, 6, device=device)
+    implementation.clear_caches()
+    implementation.precompile_sparse_gqa_split(
+        query=query,
+        key_cache=keys,
+        value_cache=values,
+        request_ids=requests,
+        selection_width=selection_width,
+    )
+    freeze_kernel_resolution("planned selected-attention warmup capacity")
+    try:
+        for rows in (1, 4):
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                implementation.launch_sparse_gqa_split(
+                    query=query[:rows],
+                    key_cache=keys,
+                    value_cache=values,
+                    k_descale=None,
+                    v_descale=None,
+                    block_table=table,
+                    request_ids=requests[:rows],
+                    selected_positions=selected[:rows],
+                    query_positions=positions[:rows],
+                    partial_output=partials[:rows],
+                    partial_lse=lse[:rows],
+                    softmax_scale=1 / 16,
+                    splits=16,
+                )
+            for _ in range(2):
+                query.normal_()
+                graph.replay()
+                probability = torch.softmax(lse[:rows].double(), dim=1).nan_to_num()
+                actual = (partials[:rows].double() * probability[..., None]).sum(1)
+                scores = (
+                    torch.einsum(
+                        "rhd,nd->rhn", query[:rows].double(), keys[0, :, 0].double()
+                    )
+                    / 16
+                )
+                expected = torch.einsum(
+                    "rhn,nd->rhd", scores.softmax(-1), values[0, :, 0].double()
+                )
+                torch.testing.assert_close(actual, expected, atol=0.004, rtol=0.004)
+                assert torch.isfinite(actual).all()
+                assert torch.count_nonzero(actual) > 0
+    finally:
+        unfreeze_kernel_resolution()
+        implementation.clear_caches()
+
+
 def test_qsa_caps_do_not_gate_architecture_or_tensor_parallel_layout() -> None:
     values = dict(
         device="cuda:0",
