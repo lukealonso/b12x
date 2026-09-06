@@ -265,7 +265,12 @@ class _OneshotLaunch(_PackedMath):
         while index < size_packs:
             accumulator = cute.make_rmem_tensor((self._pack_elems,), cutlass.Float32)
             for peer_index in cutlass.range_constexpr(self._world_size):
-                peer_rank = (self._rank + peer_index) % self._world_size
+                if cutlass.const_expr(self._world_size == 9):
+                    # Independent rank-local reductions must return identical
+                    # bits even when inputs have widely separated exponents.
+                    peer_rank = peer_index
+                else:
+                    peer_rank = (self._rank + peer_index) % self._world_size
                 peer_base = Int64(peer_ptrs[peer_rank])
                 self._load_accumulate(
                     accumulator,
@@ -643,25 +648,33 @@ class _FusedOneshotLaunch(_PackedMath):
                     False,
                 )
         elif cutlass.const_expr(self._mode == "stage_push"):
-            self._load_accumulate(
-                accumulator,
-                input_base + index * Int64(16),
-                True,
-            )
             local_stage = Int64(peer_ptrs[self._rank])
-            initialized = True
-            for source_rank in cutlass.range_constexpr(self._world_size):
-                if cutlass.const_expr(source_rank != self._rank):
-                    self._load_accumulate(
-                        accumulator,
-                        local_stage
-                        + (Int64(source_rank) * shard_packs + index) * Int64(16),
-                        not initialized,
-                    )
-                    initialized = True
+            if cutlass.const_expr(self._world_size == 9):
+                for source_rank in cutlass.range_constexpr(self._world_size):
+                    source = local_stage + (
+                        Int64(source_rank) * shard_packs + index
+                    ) * Int64(16)
+                    if cutlass.const_expr(source_rank == self._rank):
+                        source = input_base + index * Int64(16)
+                    self._load_accumulate(accumulator, source, source_rank == 0)
+            else:
+                self._load_accumulate(accumulator, input_base + index * Int64(16), True)
+                for source_rank in cutlass.range_constexpr(self._world_size):
+                    if cutlass.const_expr(source_rank != self._rank):
+                        self._load_accumulate(
+                            accumulator,
+                            local_stage
+                            + (Int64(source_rank) * shard_packs + index) * Int64(16),
+                            False,
+                        )
         else:
             for peer_index in cutlass.range_constexpr(self._world_size):
-                peer_rank = (self._rank + peer_index) % self._world_size
+                if cutlass.const_expr(self._world_size == 9):
+                    # Independent rank-local reductions must return identical
+                    # bits even when inputs have widely separated exponents.
+                    peer_rank = peer_index
+                else:
+                    peer_rank = (self._rank + peer_index) % self._world_size
                 self._load_accumulate(
                     accumulator,
                     Int64(peer_ptrs[peer_rank]) + index * Int64(16),
@@ -1052,7 +1065,7 @@ def get_oneshot_launcher(
         1,
         1,
         current_cuda_stream(),
-        compile_spec=KernelCompileSpec.from_key("comm.pcie.oneshot", 1, cache_key),
+        compile_spec=KernelCompileSpec.from_key("comm.pcie.oneshot", 2, cache_key),
     )
 
     def run(
@@ -1223,7 +1236,7 @@ def get_fused_oneshot_launcher(
         1,
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key(
-            "comm.pcie.oneshot_fused_rmsnorm", 1, cache_key
+            "comm.pcie.oneshot_fused_rmsnorm", 2, cache_key
         ),
     )
 

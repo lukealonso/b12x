@@ -73,7 +73,9 @@ def recommended_max_bytes(world_size: int, *, default: int = DEFAULT_MAX_SIZE) -
     return default
 
 
-MAX_DIRECT_WORLD_SIZE = 8
+# Nine ranks use at most eight peer mappings per CUDA context. Larger groups
+# use the bounded-degree hierarchy instead of an all-peer pointer table.
+MAX_DIRECT_WORLD_SIZE = 9
 DIRECT_WORLD_SIZES = tuple(
     world_size
     for world_size in ONESHOT_WORLD_SIZES
@@ -96,7 +98,7 @@ def _algorithm_for_world_size(world_size: int) -> str:
 class PCIeAllReduce:
     """Select a peer-safe all-reduce implementation from the world size.
 
-    Worlds through TP8 use the low-latency all-peer oneshot runtime. TP12 and
+    Worlds through TP9 use the low-latency all-peer oneshot runtime. TP12 and
     TP16 use bounded-degree four-GPU islands so no CUDA context maps more than
     six peers. Other worlds fail closed instead of exceeding the CUDA peer
     connection limit.

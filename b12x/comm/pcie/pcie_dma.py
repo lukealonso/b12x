@@ -33,7 +33,7 @@ SUPPORTED_DTYPES = {
     torch.float16: 1,
     torch.float32: 2,
 }
-SUPPORTED_WORLD_SIZES = (2, 4, 6, 8, 10)
+SUPPORTED_WORLD_SIZES = (2, 4, 6, 8, 9, 10)
 FLAG_STRIDE = 128
 FLAG_SLOTS = 256
 MAX_PIECES = 8
@@ -172,6 +172,16 @@ class PCIeDmaAllReduce:
         if self.device.type != "cuda":
             raise ValueError("PCIe ring allreduce requires a CUDA device")
         self.max_bytes = int(max_bytes)
+        self._wire_input = None
+        self._wire_output = None
+        if self.world_size == 9:
+            # Eight-element shards keep vector accesses aligned for every
+            # supported dtype. Wire tails do not change the model tensors.
+            wire_bytes = _align_up(self.max_bytes, self.world_size * 8 * 4)
+            self._wire_input = torch.empty(
+                wire_bytes, dtype=torch.uint8, device=self.device
+            )
+            self._wire_output = torch.empty_like(self._wire_input)
         self._kernels = _load_kernels()
         self._ipc = CudaRTLibrary()
         self._ipc.cudaSetDevice(self.device.index or 0)
@@ -329,7 +339,8 @@ class PCIeDmaAllReduce:
         if inp.dtype not in SUPPORTED_DTYPES:
             return False
         numel = inp.numel()
-        if numel <= 0 or numel % (self.world_size * 8) != 0:
+        alignment = 8 if self.world_size == 9 else self.world_size * 8
+        if numel <= 0 or numel % alignment != 0:
             return False
         size_bytes = numel * inp.element_size()
         if size_bytes < self.min_bytes:
@@ -363,6 +374,24 @@ class PCIeDmaAllReduce:
             raise ValueError(
                 "output must match input shape/dtype/device and be contiguous"
             )
+        if self.world_size == 9 and inp.numel() % (self.world_size * 8):
+            numel = inp.numel()
+            wire_numel = _align_up(numel, self.world_size * 8)
+            wire_bytes = wire_numel * inp.element_size()
+            assert self._wire_input is not None and self._wire_output is not None
+            wire_in = self._wire_input[:wire_bytes].view(inp.dtype)
+            wire_out = self._wire_output[:wire_bytes].view(inp.dtype)
+            wire_in[:numel].copy_(inp.view(-1))
+            wire_in[numel:].zero_()
+            self._all_reduce_aligned(wire_in, wire_out)
+            out.view(-1).copy_(wire_out[:numel])
+            return out
+        return self._all_reduce_aligned(inp, out)
+
+    def _all_reduce_aligned(
+        self, inp: torch.Tensor, out: torch.Tensor
+    ) -> torch.Tensor:
+        """Reduce equal, eight-element-aligned shards into the supplied output."""
         kernels = self._kernels
         world = self.world_size
         rank = self.rank

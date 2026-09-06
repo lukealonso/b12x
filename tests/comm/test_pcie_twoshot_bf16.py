@@ -34,9 +34,9 @@ MAX_ROWS = int(os.getenv("B12X_TEST_TWOSHOT_BF16_MAX_ROWS", "512"))
 ROWS = (8, 16, 32, 64, 96, 128, 192, 256)
 
 
-def test_layout_is_tp4_only_and_scales_with_capacity() -> None:
-    for world_size in (2, 8):
-        with pytest.raises(ValueError, match="supports only world size 4"):
+def test_layout_rejects_unsupported_world_sizes_and_scales_with_capacity() -> None:
+    for world_size in (3, 16):
+        with pytest.raises(ValueError, match="supports world sizes"):
             _make_layout(64, ROW_ELEMS, world_size)
 
     base = _make_layout(64, ROW_ELEMS, 4)
@@ -48,9 +48,9 @@ def test_layout_is_tp4_only_and_scales_with_capacity() -> None:
     assert wider.slab_bytes > base.slab_bytes
 
 
-@pytest.mark.parametrize("world_size", (2, 8))
+@pytest.mark.parametrize("world_size", (3, 16))
 def test_private_launchers_reject_unsupported_world_sizes(world_size: int) -> None:
-    with pytest.raises(ValueError, match="require world size 4"):
+    with pytest.raises(ValueError, match="require a world size in"):
         get_twoshot_bf16_launcher(
             "reduce_scatter",
             world_size,
@@ -61,7 +61,7 @@ def test_private_launchers_reject_unsupported_world_sizes(world_size: int) -> No
             ROW_ELEMS,
             0,
         )
-    with pytest.raises(ValueError, match="require world size 4"):
+    with pytest.raises(ValueError, match="require a world size in"):
         get_twoshot_bf16_allreduce_launcher(
             world_size,
             0,

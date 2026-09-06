@@ -658,6 +658,15 @@ def test_runtime_accepts_head_major_input_and_output():
     torch.testing.assert_close(actual, partial_output[:, :16])
 
 
+def test_runtime_accepts_token_major_head_tail_capacity():
+    runtime = _make_runtime()
+    storage = torch.arange(2 * 40 * 64, dtype=torch.bfloat16).reshape(2, 40, 64)
+    partial_output = storage[:, :32]
+    partial_lse = torch.zeros(2, 32, dtype=torch.float32)
+    actual = runtime.lse_reduce_scatter(partial_output, partial_lse)
+    torch.testing.assert_close(actual, partial_output[:, :16])
+
+
 @pytest.mark.parametrize("world_size", (2, 4, 8, 16))
 def test_kimi_pair_topk_dispatches_compact_outputs(world_size: int) -> None:
     ext = _FakeExt()
@@ -803,7 +812,7 @@ def test_runtime_rejects_shape_dtype_and_capacity_mismatches():
             torch.zeros(5, 32, 64, dtype=torch.bfloat16),
             torch.zeros(5, 32, dtype=torch.float32),
         )
-    unsupported_view = torch.zeros(1, 33, 64, dtype=torch.bfloat16)[:, :32]
+    unsupported_view = torch.zeros(1, 32, 128, dtype=torch.bfloat16)[:, :, ::2]
     with pytest.raises(ValueError, match="packed token-major or head-major"):
         runtime.lse_reduce_scatter(unsupported_view, good_lse)
 

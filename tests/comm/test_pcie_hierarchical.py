@@ -31,7 +31,7 @@ from b12x.comm.pcie.pcie_hierarchical import (
 from b12x.comm.pcie.pcie_island_rs import PCIeIslandRSAllReduce
 
 
-@pytest.mark.parametrize("world_size", [2, 4, 6, 8])
+@pytest.mark.parametrize("world_size", [2, 4, 6, 8, 9])
 def test_allreduce_uses_direct_path_for_peer_safe_worlds(world_size: int) -> None:
     assert _algorithm_for_world_size(world_size) == "oneshot"
 

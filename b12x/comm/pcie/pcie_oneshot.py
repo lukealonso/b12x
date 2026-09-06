@@ -21,7 +21,7 @@ from ._cuda_ipc import CudaRTLibrary
 
 logger = logging.getLogger(__name__)
 
-SUPPORTED_WORLD_SIZES = (2, 4, 6, 8, 10)
+SUPPORTED_WORLD_SIZES = (2, 4, 6, 8, 9, 10)
 SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 DEFAULT_MAX_SIZE = 8 * 1024 * 1024
 DEFAULT_RANK_DATA_BYTES = 8 * 1024 * 1024
