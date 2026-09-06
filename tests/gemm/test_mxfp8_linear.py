@@ -218,6 +218,38 @@ def test_mm_default_fused_path_captures_with_k_padding() -> None:
     torch.testing.assert_close(actual, eager, rtol=0, atol=0)
 
 
+def test_mm_uses_quantizer_without_scale_padding_initialization(monkeypatch) -> None:
+    require_b12x()
+    require_mxf8_mma()
+    torch.manual_seed(20260903)
+
+    from b12x.gemm._shared import block_fp8
+
+    calls = 0
+    original = block_fp8._quantize_block_fp8_linear_input_for_immediate_gemm
+
+    def record_call(source: torch.Tensor):
+        nonlocal calls
+        calls += 1
+        return original(source)
+
+    monkeypatch.setattr(
+        block_fp8,
+        "_quantize_block_fp8_linear_input_for_immediate_gemm",
+        record_call,
+    )
+    source, _, packed = _make_inputs(9, 256, 384)
+
+    actual = mxfp8_linear.mm(source, packed)
+    expected = _reference_from_packed(source, packed)
+    torch.cuda.synchronize()
+
+    assert calls == 1
+    torch.testing.assert_close(
+        actual.float(), expected.to(actual.dtype).float(), rtol=0, atol=0
+    )
+
+
 def test_blockscaled_mm_accepts_prequantized_mxfp8_and_replays() -> None:
     require_b12x()
     require_mxf8_mma()

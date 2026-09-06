@@ -551,10 +551,15 @@ def _packed_mxfp8_op(
     tokens = int(source_2d.shape[0])
     source_for_quant = _pad_k(source_2d, int(padded_in_features))
     from b12x.gemm._shared.block_fp8 import (
-        quantize_block_fp8_linear_input_mxfp8,
+        _quantize_block_fp8_linear_input_for_immediate_gemm,
     )
 
-    x_q = quantize_block_fp8_linear_input_mxfp8(source_for_quant)
+    # This opaque op consumes the quantized rows immediately. The quantizer
+    # overwrites every logical row scale and every physical scale entry read by
+    # the GEMM, so initializing fresh scale storage first only adds two CUDA
+    # fills per projection. Keep the public allocating quantizer's initialized
+    # padding contract unchanged; use the private immediate-consumer path here.
+    x_q = _quantize_block_fp8_linear_input_for_immediate_gemm(source_for_quant)
     return dense_gemm(
         (x_q.values.reshape(tokens, padded_in_features, 1), x_q.scale_mma),
         (
