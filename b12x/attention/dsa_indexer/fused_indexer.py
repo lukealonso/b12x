@@ -58,7 +58,6 @@ from b12x.attention.dsa_indexer.persistent_topk import (
 )
 from b12x.attention.dsa_indexer.tiled_topk import (
     _SCAN_UNROLL,
-    _SMEM_CANDS,
     _SUPPORTED_TOPK,
     _THREADS_PER_CTA as _RADIX_THREADS,
     _convert_to_uint8,

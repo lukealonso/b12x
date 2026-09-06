@@ -908,6 +908,7 @@ def index_topk_fp8(
     scratch_values, scratch_raw_indices = scratch.get_indexer_contiguous_topk_buffers(
         row_count=q_rows,
     )
+    write_final_values = out_scores is not None
     final_values = out_scores if out_scores is not None else scratch_values[:, :topk]
     final_raw_indices = (
         out_indices if out_indices is not None else scratch_raw_indices[:, :topk]
@@ -1163,6 +1164,7 @@ def index_topk_fp8(
                     output_values=final_values,
                     output_indices=final_raw_indices,
                     output_gather_table=fold_indices.view(q_rows, total_slices * topk),
+                    write_values=write_final_values,
                 )
         else:
             run_tiled_topk(
@@ -1188,6 +1190,7 @@ def index_topk_fp8(
                     else None
                 ),
                 output_page_size=page_size,
+                write_values=not is_last or write_final_values,
             )
 
     return final_raw_indices

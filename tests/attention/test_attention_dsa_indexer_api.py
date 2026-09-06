@@ -8,6 +8,7 @@ import torch
 
 from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
 from b12x.attention import dsa_indexer
+from b12x.attention.dsa_indexer import tiled_topk as tiled_topk_module
 from b12x.attention.dsa_indexer.kernel import (
     PAGED_MQA_LOGITS_SCHEDULE_PAGES_PER_SPLIT,
     _split_index_k_cache_runtime_views,
@@ -136,6 +137,12 @@ def test_public_output_index_space_rejects_unknown_semantics() -> None:
             topk=2,
             output_index_space="request_relative",
         )
+
+
+def test_topk_candidate_capacity_is_compile_time_topk_policy() -> None:
+    assert tiled_topk_module._resolve_smem_candidate_capacity(topk=512) == 1024
+    assert tiled_topk_module._resolve_smem_candidate_capacity(topk=1024) == 8192
+    assert tiled_topk_module._resolve_smem_candidate_capacity(topk=2048) == 8192
 
 
 def _make_real_page_table(
@@ -1544,6 +1551,116 @@ def test_contiguous_tiled_topk_live_rows_do_not_resolve_new_kernel(
 
     assert actual.shape == (1536, topk)
     assert compile_cache_info()["compile_misses"] == warm_misses
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="CUDA required for indexer compile-cache coverage",
+)
+def test_row_topk_indices_only_preserves_value_buffer() -> None:
+    device = torch.device("cuda")
+    generator = torch.Generator(device="cpu").manual_seed(73_621)
+    rows, width, topk = 17, 1024, 512
+    row_logits = torch.randn(
+        (rows, width), generator=generator, dtype=torch.float32
+    ).to(device)
+    lengths = torch.full((rows,), width, dtype=torch.int32, device=device)
+    output_values = torch.full(
+        (rows, topk), 12345.0, dtype=torch.float32, device=device
+    )
+    output_indices = torch.empty((rows, topk), dtype=torch.int32, device=device)
+
+    run_row_topk(
+        row_logits=row_logits,
+        lengths=lengths,
+        topk=topk,
+        output_values=output_values,
+        output_indices=output_indices,
+        write_values=False,
+    )
+    torch.cuda.synchronize(device)
+
+    expected = torch.topk(row_logits, k=topk, dim=1, largest=True, sorted=False)
+    assert bool((output_values == 12345.0).all())
+    assert torch.equal(
+        torch.sort(output_indices, dim=1).values.to(torch.long),
+        torch.sort(expected.indices, dim=1).values,
+    )
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="CUDA required for padded row top-k coverage",
+)
+def test_row_topk_padded_overflow_is_unique_and_graph_safe() -> None:
+    """Validate a gathered row fold with fewer than top-k live candidates."""
+    device = torch.device("cuda")
+    generator = torch.Generator(device="cpu").manual_seed(73_623)
+    rows, width, topk = 2304, 2560, 512
+    live_counts = (
+        torch.arange(rows, dtype=torch.int64, device=device)
+        .div(4, rounding_mode="floor")
+        .clamp(min=1)
+    )
+    columns = torch.arange(width, dtype=torch.int64, device=device).view(1, -1)
+    live_mask = columns < live_counts.view(-1, 1)
+    row_logits = torch.randn(
+        (rows, width), generator=generator, dtype=torch.float32
+    ).to(device)
+    row_logits.masked_fill_(~live_mask, float("-inf"))
+    gather_table = (
+        torch.arange(width, dtype=torch.int32, device=device)
+        .expand(rows, -1)
+        .contiguous()
+    )
+    gather_table.masked_fill_(~live_mask, -1)
+    lengths = torch.full((rows,), width, dtype=torch.int32, device=device)
+    output_indices = torch.empty((rows, topk), dtype=torch.int32, device=device)
+
+    run_row_topk(
+        row_logits=row_logits,
+        lengths=lengths,
+        topk=topk,
+        output_indices=output_indices,
+        output_gather_table=gather_table,
+        write_values=False,
+    )
+    torch.cuda.synchronize(device)
+
+    freeze_kernel_resolution("padded row top-k graph replay must use the warmed kernel")
+    try:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            run_row_topk(
+                row_logits=row_logits,
+                lengths=lengths,
+                topk=topk,
+                output_indices=output_indices,
+                output_gather_table=gather_table,
+                write_values=False,
+            )
+    finally:
+        unfreeze_kernel_resolution()
+    for _ in range(8):
+        graph.replay()
+    torch.cuda.synchronize(device)
+
+    logical = output_indices.to(torch.int64)
+    valid = logical >= 0
+    assert torch.equal(valid.sum(dim=1), live_counts.clamp(max=topk))
+    assert not bool(((logical >= live_counts.view(-1, 1)) & valid).any())
+    occurrences = torch.zeros((rows, width), dtype=torch.int16, device=device)
+    occurrences.scatter_add_(1, logical.clamp_min(0), valid.to(torch.int16))
+    assert int(occurrences.max()) == 1
+
+    full_rows = live_counts >= topk
+    expected = torch.topk(
+        row_logits[full_rows], k=topk, dim=1, largest=True, sorted=False
+    ).indices
+    assert torch.equal(
+        torch.sort(logical[full_rows], dim=1).values,
+        torch.sort(expected, dim=1).values,
+    )
 
 
 @pytest.mark.skipif(

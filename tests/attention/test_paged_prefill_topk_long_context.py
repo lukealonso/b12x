@@ -1,19 +1,14 @@
-"""Regression test: paged prefill indexer top-k must stay correct on low-contrast rows.
+"""Correctness coverage for paged prefill top-k on crowded score buckets.
 
-The tiled radix-select top-k (``DSATiledTopkKernel``, reached via ``index_topk_fp8``
-/ ``packed_contiguous``) buckets candidates by the top bits of the score and stores the
-threshold bucket in a fixed shared buffer (``_SMEM_CANDS``). When a single bucket
-holds more candidates than that buffer -- e.g. many tokens with near-equal scores, as
-happens on low-contrast attention rows at longer context -- the pre-fix code silently
-dropped the overflow and kept the lowest-indexed (here lowest-scoring) survivors, so it
-selected tokens far below the true top-k threshold. The fix re-runs an exact, buffer-free
-MSD radix (``_exact_overflow_fallback``) whenever the bucket overflows.
+``DSATiledTopkKernel``, reached through ``index_topk_fp8`` with the
+``packed_contiguous`` route, stores a radix threshold bucket in bounded shared
+memory. A bucket wider than that capacity must use the buffer-free exact MSD
+radix rescan rather than dropping candidates.
 
 Cases (verified by score, not index, so a miss is genuine and not a tie-break):
 
-* ``seq_len`` sweep: 32768 and 32832 straddle the old 8-bit/8192-candidate
-  boundary, while 65536 verifies that the wider coarse radix remains exact at long
-  context without relying on the historical truncated result.
+* ``seq_len`` sweep: 32768, 32832, and 65536 cover long-context threshold
+  buckets on both sides of a page boundary.
 * all-equal scores: one coarse+fine bucket holds every token, so the fallback's tie-fill
   branch must fill the whole top-k from a single pivot key.
 * logical output (``output_physical_slots=False``): exercises the two-level fold, whose
@@ -46,7 +41,13 @@ _TOPK = 2048
 _PAGE_START = 3
 
 
-def _build_scene(device: torch.device, seq_len: int, scores: str) -> dict:
+def _build_scene(
+    device: torch.device,
+    seq_len: int,
+    scores: str,
+    *,
+    topk: int = _TOPK,
+) -> dict:
     """Build a paged prefill scene plus its fp32 reference top-k threshold.
 
     ``scores="monotonic"`` gives each token a strictly increasing score so the true
@@ -95,9 +96,10 @@ def _build_scene(device: torch.device, seq_len: int, scores: str) -> dict:
         real_page_table=real_page_table,
         seqlens=seqlens,
     )
-    kth_score = torch.topk(ref_logits, _TOPK, dim=1).values[:, -1]
+    kth_score = torch.topk(ref_logits, topk, dim=1).values[:, -1]
     return {
         "seq_len": seq_len,
+        "topk": topk,
         "width_blocks": width_blocks,
         "q_fp8": q_fp8,
         "weights": weights,
@@ -118,13 +120,14 @@ def _run_indexer(
 ) -> torch.Tensor:
     monkeypatch.setenv("B12X_PAGED_INDEX_SUPERTILE_K", str(supertile_k))
     seqlens = scene["seqlens"]
+    topk = int(scene["topk"])
     shared_page_table = scene["shared_page_table"]
     binding = _bind_paged_indexer(
         device=scene["q_fp8"].device,
         num_heads=_NUM_HEADS,
         rows=_ROWS,
         width_blocks=scene["width_blocks"],
-        topk=_TOPK,
+        topk=topk,
         real_page_table=shared_page_table.expand(_ROWS, -1),
         seqlens=seqlens,
         supertile_k=supertile_k,
@@ -140,14 +143,14 @@ def _run_indexer(
         shared_page_table=True,
     )
     selected = torch.empty(
-        (_ROWS, _TOPK), dtype=torch.int32, device=scene["q_fp8"].device
+        (_ROWS, topk), dtype=torch.int32, device=scene["q_fp8"].device
     )
     clear_indexer_caches()
     index_topk_fp8(
         q_fp8=scene["q_fp8"],
         weights=scene["weights"].unsqueeze(-1),
         index_k_cache=scene["index_k_cache"],
-        topk=_TOPK,
+        topk=topk,
         expected_num_q_heads=_NUM_HEADS,
         binding=binding,
         out_indices=selected,
@@ -161,6 +164,7 @@ def _assert_selects_true_topk(
     scene: dict, selected: torch.Tensor, *, output_physical_slots: bool
 ) -> None:
     seq_len = scene["seq_len"]
+    topk = int(scene["topk"])
     if output_physical_slots:
         # Physical slot -> logical (contiguous page table starting at _PAGE_START).
         raw_logical = selected.long() - _PAGE_START * _PAGE
@@ -182,7 +186,7 @@ def _assert_selects_true_topk(
     selected_score = torch.gather(scene["ref_logits"], 1, logical)
     n_below = int((selected_score < (scene["kth_score"][:, None] - 1e-4)).sum().item())
     assert n_below == 0, (
-        f"{n_below}/{_ROWS * _TOPK} selected tokens score below the true top-{_TOPK} "
+        f"{n_below}/{_ROWS * topk} selected tokens score below the true top-{topk} "
         f"threshold at seq_len={seq_len}"
     )
 
@@ -205,6 +209,16 @@ def test_paged_prefill_topk_all_equal_scores_tie_fill(monkeypatch) -> None:
     scene = _build_scene(device, 32768, "equal")
     selected = _run_indexer(
         monkeypatch, scene, supertile_k=32768, output_physical_slots=True
+    )
+    _assert_selects_true_topk(scene, selected, output_physical_slots=True)
+
+
+def test_paged_prefill_topk_512_all_equal_scores_tie_fill(monkeypatch) -> None:
+    """The top-k-512 buffer policy preserves exact tie-fill semantics."""
+    device = torch.device("cuda")
+    scene = _build_scene(device, 8192, "equal", topk=512)
+    selected = _run_indexer(
+        monkeypatch, scene, supertile_k=8192, output_physical_slots=True
     )
     _assert_selects_true_topk(scene, selected, output_physical_slots=True)
 

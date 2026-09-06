@@ -13,6 +13,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 import torch
 
 from benchmarks.common import make_l2_flush_fn
+import b12x.attention.dsa_indexer.tiled_topk as tiled_topk_module
 from b12x.attention.dsa_indexer._impl import uses_paged_mqa_schedule
 from b12x.attention.dsa_indexer.kernel import (
     run_paged_supertile_logits_kernel,
@@ -61,16 +62,24 @@ def _make_page_table(
     return table.contiguous()
 
 
+def _physical_slots(
+    page_ids: torch.Tensor,
+    page_offsets: torch.Tensor,
+) -> torch.Tensor:
+    """Return page-based token slots without 32-bit offset overflow."""
+    return page_ids.to(torch.int64) * 64 + page_offsets.to(torch.int64)
+
+
 def _validate_analytic_topk(
     *,
     indices: torch.Tensor,
-    scores: torch.Tensor,
+    scores: torch.Tensor | None,
     seqlens: torch.Tensor,
     topk: int,
     analytic_scores: torch.Tensor,
     real_page_table: torch.Tensor,
     output_physical_slots: bool,
-) -> float:
+) -> float | None:
     """Validate every target-shape row against a cheap analytic top-k oracle."""
     columns = torch.arange(topk, dtype=torch.int32, device=indices.device)
     valid_counts = torch.minimum(seqlens, torch.full_like(seqlens, int(topk)))
@@ -93,12 +102,14 @@ def _validate_analytic_topk(
     )
     expected_page_cols = torch.div(expected_logical, 64, rounding_mode="floor")
     expected_page_offsets = torch.remainder(expected_logical, 64)
-    expected_page_ids = torch.gather(
-        real_page_table,
-        1,
-        expected_page_cols.clamp_(min=0).to(torch.int64),
+    page_table_width = int(real_page_table.shape[1])
+    if page_table_width <= 0:
+        raise ValueError("analytic top-k validation requires a non-empty page table")
+    safe_page_cols = expected_page_cols.clamp(min=0, max=page_table_width - 1).to(
+        torch.int64
     )
-    expected_physical = expected_page_ids * 64 + expected_page_offsets
+    expected_page_ids = torch.gather(real_page_table, 1, safe_page_cols)
+    expected_physical = _physical_slots(expected_page_ids, expected_page_offsets)
     expected_indices = expected_physical if output_physical_slots else expected_logical
     expected_indices = torch.where(
         expected_valid, expected_indices, torch.full_like(expected_indices, -1)
@@ -120,6 +131,9 @@ def _validate_analytic_topk(
             f"actual_unique={len(actual_set)} expected_unique={len(expected_set)}"
         )
 
+    if scores is None:
+        return None
+
     safe_indices = indices.clamp(min=0)
     if output_physical_slots:
         score_indices = safe_indices
@@ -129,7 +143,7 @@ def _validate_analytic_topk(
         actual_page_ids = torch.gather(
             real_page_table, 1, actual_page_cols.to(torch.int64)
         )
-        score_indices = actual_page_ids * 64 + actual_page_offsets
+        score_indices = _physical_slots(actual_page_ids, actual_page_offsets)
     expected_scores = analytic_scores[score_indices.to(torch.int64)]
     actual_valid_scores = scores[valid_mask]
     expected_valid_scores = expected_scores[valid_mask]
@@ -270,6 +284,12 @@ def main() -> None:
     )
     parser.add_argument("--topk", type=int, default=512)
     parser.add_argument(
+        "--topk-candidate-capacity",
+        type=int,
+        choices=(1024, 8192),
+        help=("benchmark-only override for the compile-time shared candidate capacity"),
+    )
+    parser.add_argument(
         "--output-index-space",
         choices=("logical", "physical"),
         default="logical",
@@ -338,6 +358,20 @@ def main() -> None:
         help="use analytic inputs and validate every output row before timing",
     )
     parser.add_argument(
+        "--input-pattern",
+        choices=("random", "low-contrast", "equal"),
+        default="random",
+        help=(
+            "score-distribution stress case used when --check is absent; "
+            "low-contrast and equal inputs exercise crowded radix buckets"
+        ),
+    )
+    parser.add_argument(
+        "--indices-only",
+        action="store_true",
+        help="omit final top-k score output, matching sparse-attention serving",
+    )
+    parser.add_argument(
         "--nsys-capture",
         action="store_true",
         help="bracket one warmed graph replay with cudaProfilerStart/Stop",
@@ -349,6 +383,31 @@ def main() -> None:
     )
     parser.add_argument("--seed", type=int, default=91_100)
     args = parser.parse_args()
+
+    if (
+        args.topk_candidate_capacity is not None
+        and args.topk_candidate_capacity < args.topk
+    ):
+        raise ValueError(
+            "top-k candidate capacity must cover the requested top-k width, got "
+            f"{args.topk_candidate_capacity} < {args.topk}"
+        )
+    if args.topk_candidate_capacity is not None and args.mode != "supertile-topk":
+        raise ValueError(
+            "--topk-candidate-capacity applies only to --mode supertile-topk"
+        )
+    if args.topk_candidate_capacity is not None:
+        candidate_capacity = int(args.topk_candidate_capacity)
+
+        def resolve_candidate_capacity(*, topk: int) -> int:
+            if candidate_capacity < int(topk):
+                raise ValueError(
+                    "top-k candidate capacity must cover the requested width, got "
+                    f"{candidate_capacity} < {topk}"
+                )
+            return candidate_capacity
+
+        tiled_topk_module._resolve_smem_candidate_capacity = resolve_candidate_capacity
 
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
@@ -454,12 +513,27 @@ def main() -> None:
         weights = torch.randn((rows, num_heads), generator=gen, dtype=torch.float32).to(
             device
         )
-        k_source = (
-            torch.randn((cache_tokens, 128), generator=gen, dtype=torch.float32).to(
-                device
+        if args.input_pattern == "random":
+            k_source = (
+                torch.randn((cache_tokens, 128), generator=gen, dtype=torch.float32).to(
+                    device
+                )
+                / 3
             )
-            / 3
-        )
+        else:
+            k_source = torch.full(
+                (cache_tokens, 128),
+                0.25,
+                dtype=torch.float32,
+                device=device,
+            )
+            if args.input_pattern == "low-contrast":
+                k_source.add_(
+                    torch.randn(
+                        (cache_tokens, 128), generator=gen, dtype=torch.float32
+                    ).to(device)
+                    / 4096
+                )
         packed_index_k_cache = pack_paged_index_k_cache_reference(k_source)
     # Match vLLM's rank-3 allocation, whose page bytes are planar
     # [64*128 quant][64*4 scales], then reproduce its zero-copy flattening for
@@ -569,6 +643,22 @@ def main() -> None:
 
     out_indices = torch.empty((rows, topk), dtype=torch.int32, device=device)
     out_scores = torch.empty((rows, topk), dtype=torch.float32, device=device)
+    indices_only_scratch_scores = None
+    untouched_scratch_scores = None
+    if args.check and args.indices_only and bench_mode == "supertile-topk":
+        # index_topk_fp8 receives no output score tensor in indices-only mode.
+        # Its terminal fold instead targets the binding-owned workspace slice,
+        # so validate that exact slice rather than unrelated caller storage.
+        scratch_scores, _ = binding.scratch.get_indexer_contiguous_topk_buffers(
+            row_count=rows
+        )
+        indices_only_scratch_scores = scratch_scores[:, :topk]
+        indices_only_scratch_scores.copy_(
+            torch.arange(rows * topk, dtype=torch.float32, device=device).view(
+                rows, topk
+            )
+        )
+        untouched_scratch_scores = indices_only_scratch_scores.clone()
     fused_ctas = int(args.fused_ctas) if int(args.fused_ctas) > 0 else None
     fused_cache = None
     if bench_mode == "fused-topk":
@@ -638,7 +728,7 @@ def main() -> None:
                 num_heads=num_heads,
                 topk=topk,
                 out_indices=out_indices,
-                out_values=out_scores,
+                out_values=None if args.indices_only else out_scores,
                 ctas_per_group=fused_ctas,
                 merge_threshold=(
                     None
@@ -659,7 +749,7 @@ def main() -> None:
             topk=topk,
             expected_num_q_heads=num_heads,
             out_indices=out_indices,
-            out_scores=out_scores,
+            out_scores=None if args.indices_only else out_scores,
             supertile_k=supertile_k,
         )
 
@@ -775,18 +865,34 @@ def main() -> None:
     # First call compiles the CuTe DSL kernel before timing or capture.
     out = run()
     torch.cuda.synchronize()
-    oracle_max_abs = None
+    oracle_state = "not_run"
     if args.check:
         assert analytic_scores is not None
         oracle_max_abs = _validate_analytic_topk(
             indices=out_indices,
-            scores=out_scores,
+            scores=None if args.indices_only else out_scores,
             seqlens=seqlens,
             topk=topk,
             analytic_scores=analytic_scores,
             real_page_table=metadata.real_page_table,
             output_physical_slots=output_physical_slots,
         )
+        if args.indices_only:
+            if indices_only_scratch_scores is not None:
+                assert untouched_scratch_scores is not None
+                if not torch.equal(
+                    indices_only_scratch_scores, untouched_scratch_scores
+                ):
+                    raise AssertionError(
+                        "indices-only selector must leave its terminal workspace "
+                        "score slice untouched"
+                    )
+                oracle_state = "analytic_indices_pass(workspace_scores_untouched)"
+            else:
+                oracle_state = "analytic_indices_pass"
+        else:
+            assert oracle_max_abs is not None
+            oracle_state = f"analytic_pass(max_abs={oracle_max_abs:.3g})"
     l2_flush = make_l2_flush_fn(not args.no_l2_flush)
     if args.eager:
         samples_us = _event_time_us(
@@ -845,11 +951,6 @@ def main() -> None:
 
     median_us = statistics.median(samples_us)
     min_us = min(samples_us)
-    oracle_state = (
-        f"analytic_pass(max_abs={oracle_max_abs:.3g})"
-        if oracle_max_abs is not None
-        else "not_run"
-    )
     raw_us = ",".join(f"{sample:.2f}" for sample in samples_us)
 
     print(
@@ -860,10 +961,14 @@ def main() -> None:
         f"page_stride={page_stride} cache_page_stride_bytes={cache_page_stride_bytes} "
         f"cache_num_pages={cache_num_pages} "
         f"cache_span_mib={((cache_num_pages - 1) * cache_page_stride_bytes + logical_cache_page_bytes) / (1024 * 1024):.2f} "
-        f"topk={topk} supertile_k={supertile_k} "
+        f"topk={topk} "
+        f"topk_candidate_capacity={args.topk_candidate_capacity or 'policy'} "
+        f"supertile_k={supertile_k} "
         f"output_index_space={args.output_index_space} "
         f"requested_supertile_k={requested_supertile_k} "
         f"route={plan.layout.route} prefill_block_k={plan.layout.prefill_block_k} "
+        f"input_pattern={'analytic' if args.check else args.input_pattern} "
+        f"indices_only={bool(args.indices_only)} "
         f"scratch_mib={plan.layout.nbytes / (1024 * 1024):.2f} "
         f"output_shape={tuple(out.shape)} correctness={oracle_state} "
         f"median_us={median_us:.2f} min_us={min_us:.2f}"
