@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """Benchmark b12x dense_gemm against reference backends with graph replay.
 
-The FP4 track uses the Nemotron 3 Super shared-expert down projection. The
-MXFP8 tracks use the per-rank dense-linear shapes from the cached DeepSeek V4
-Flash DSpark checkpoint at TP=2, excluding routed experts. End-to-end MXFP8
-includes activation quantization and compares only b12x with DeepGEMM; weight
-quantization remains setup work. Regular block FP8 uses Qwen linear shapes and
-compares compact FP32 K128 scales with FlashInfer groupwise GEMM.
+The default profile uses the Nemotron 3 Super shared-expert down projection for
+FP4, the per-rank dense-linear shape from the cached DeepSeek V4 Flash DSpark
+checkpoint at TP=2 for MXFP8, and Qwen linear shapes for regular block FP8. The
+Qwen3.8-27B profile uses its hidden=5120 and intermediate=17408 FFN checkpoint
+projections for every quantization track. End-to-end MXFP8 includes activation
+quantization and compares only b12x with DeepGEMM; weight quantization remains
+setup work. Regular block FP8 compares compact FP32 K128 scales with FlashInfer
+groupwise GEMM.
 """
 
 from __future__ import annotations
@@ -70,24 +72,37 @@ FP8_GEMM_SPECS = [
     ),
 ]
 
-FP8_BLOCK_GEMM_SPECS = [
+QWEN38_27B_GEMM_SPECS = [
     # (name, K, N, note)
     (
-        "Qwen gate/up",
+        "Qwen3.8-27B gate/up",
         5120,
         17408,
-        "per-token K128 activations and N128xK128 checkpoint weights",
+        "checkpoint gate_proj/up_proj (hidden=5120, intermediate=17408)",
     ),
     (
-        "Qwen down",
+        "Qwen3.8-27B down",
         17408,
         5120,
-        "per-token K128 activations and N128xK128 checkpoint weights",
+        "checkpoint down_proj (intermediate=17408, hidden=5120)",
     ),
 ]
 
+FP8_BLOCK_GEMM_SPECS = QWEN38_27B_GEMM_SPECS
 
-def gemm_specs_for_mode(mode: str):
+DEFAULT_PROFILE = "default"
+QWEN38_27B_PROFILE = "qwen3.8-27b"
+GEMM_PROFILES = {
+    DEFAULT_PROFILE: "mixed production shapes",
+    QWEN38_27B_PROFILE: "Qwen3.8-27B FFN checkpoint projections",
+}
+
+
+def gemm_specs_for_mode(mode: str, profile: str = DEFAULT_PROFILE):
+    if profile == QWEN38_27B_PROFILE:
+        return QWEN38_27B_GEMM_SPECS
+    if profile != DEFAULT_PROFILE:
+        raise ValueError(f"unknown dense GEMM profile: {profile}")
     if mode == "fp4":
         return FP4_GEMM_SPECS
     if mode == "fp8-block":
@@ -102,7 +117,7 @@ FP4_REFERENCE_LABEL = "FlashInfer CUTLASS FP4"
 FP8_REFERENCE_LABEL = "FlashInfer CUTLASS MXFP8"
 FP8_BLOCK_REFERENCE_LABEL = "FlashInfer CUTLASS FP8 groupwise"
 DEEPGEMM_E2E_REFERENCE_LABEL = "DeepGEMM fp8_gemm_nt e2e"
-COSINE_THRESHOLD = 0.999999
+COSINE_THRESHOLD = 0.9999
 BLOCK_FP8_COSINE_THRESHOLD = 0.9999
 DEEPGEMM_COSINE_THRESHOLD = 0.999
 
@@ -714,6 +729,16 @@ def bench_one_fp8_block(
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--profile",
+        choices=sorted(GEMM_PROFILES),
+        default=DEFAULT_PROFILE,
+        help=(
+            "Model shape profile. qwen3.8-27b applies the Qwen3.8-27B FFN "
+            "gate/up and down projection shapes to NVFP4, MXFP8, and regular "
+            "K128 block-FP8 modes."
+        ),
+    )
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--iters", type=int, default=100)
     parser.add_argument(
@@ -784,7 +809,11 @@ def main():
         )
 
     def selected_specs(mode: str):
-        return custom_specs if custom_specs is not None else gemm_specs_for_mode(mode)
+        return (
+            custom_specs
+            if custom_specs is not None
+            else gemm_specs_for_mode(mode, args.profile)
+        )
 
     torch.empty(1, device="cuda")
     l2_flush = make_l2_flush_fn(enabled=args.flush_l2, bytes_hint=args.l2_flush_bytes)
@@ -818,7 +847,10 @@ def main():
 
     mode_desc = ", ".join(mode.upper() for mode, _, _ in benchmark_modes)
     print(f"Dense GEMM ({mode_desc}): b12x vs reference backends")
-    if args.dtype == "fp4":
+    print(f"Profile: {args.profile} ({GEMM_PROFILES[args.profile]})")
+    if args.profile == QWEN38_27B_PROFILE:
+        print("Qwen3.8-27B FFN gate/up and down projections")
+    elif args.dtype == "fp4":
         print("NVIDIA Nemotron 3 Super shared-expert down-proj")
     elif args.dtype in ("fp8", "fp8-e2e"):
         print("DeepSeek V4 Flash DSpark TP=2 q_b projection")

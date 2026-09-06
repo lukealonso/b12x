@@ -12,6 +12,7 @@ build/
 *.so
 run.log
 run*.log
+run*.ncu-rep
 time.log
 uv.lock
 *.ptx
