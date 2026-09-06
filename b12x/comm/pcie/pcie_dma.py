@@ -1540,6 +1540,18 @@ class PCIeDmaAllReduce:
                 recv = scratch_piece(rank, k, p)
                 own = in_piece(recv_block, p)
                 dst = out_base + p * piece_bytes if last else partial_piece(k, p)
+                if k >= 2 and not last:
+                    # Step k's add writes the partial buffer of parity k % 2,
+                    # which is the payload the copy engine is still reading for
+                    # step k - 1: two buffers alternate, so a send has exactly
+                    # one step of slack and nothing else in the schedule holds
+                    # the main stream behind the copy engine (the flag waits
+                    # only bind this rank to its predecessor's copies, and
+                    # add_done runs the other way). Without this edge a rank
+                    # whose outgoing hop is slower than the incoming chain
+                    # overwrites a payload in flight, and the block that
+                    # payload carries reaches its owner corrupted.
+                    main.wait_event(copied[slot(k - 1, p) - RS_SLOT_BASE])
                 if not fp32_wire or (k == 0 and last):
                     # bf16 payload in, bf16 out: the plain ring add (fp32 sum
                     # rounded once to bf16), which for a single-step ring is
