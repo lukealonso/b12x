@@ -1241,7 +1241,7 @@ def test_planned_full_rotation_matches_reference_and_captures(
         1.0e-9
     )
     cosine = torch.nn.functional.cosine_similarity(
-        mapped_eager.flatten(), reference.flatten(), dim=0
+        mapped_eager.float().flatten(), reference.float().flatten(), dim=0
     )
     assert float(relative_error) <= 2.0e-2
     assert float(cosine) >= 0.999

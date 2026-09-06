@@ -392,6 +392,8 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--timing-clock", choices=("cuda_event", "globaltimer"), default="cuda_event",
                         help="cold-replay timing instrumentation, retained in checkpoint identity")
+    parser.add_argument("--full-corpus", action="store_true",
+                        help="measure every registered MoE routing case with an independent correctness oracle")
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--repetitions", type=int, default=5)
     parser.add_argument("--groups", type=int, default=5)
@@ -511,6 +513,7 @@ def main(argv: list[str] | None = None) -> int:
             minimum_cosine=args.minimum_cosine,
             cold_l2=args.cold_l2,
             timing_clock=args.timing_clock,
+            full_corpus=args.full_corpus,
             max_candidate_seconds=args.max_candidate_seconds,
         ),
     )

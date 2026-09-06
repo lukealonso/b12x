@@ -2107,7 +2107,7 @@ def test_auto_precision_qualifies_each_capacity_and_preserves_exact_holes(tmp_pa
 
 @pytest.mark.parametrize("profile_id,route", [
     ("nvidia.gb10.48sm", "packed"),
-    ("nvidia.rtx.pro.6000.blackwell", "direct"),
+    ("nvidia.rtx.pro.6000.blackwell.max-q", "direct"),
 ])
 def test_embedded_auto_precision_retains_overrides_and_exact_capacity_coverage(profile_id, route):
     from dataclasses import replace

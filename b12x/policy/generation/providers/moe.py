@@ -365,8 +365,11 @@ def _has_tunable_backend(geometry: MoePhysicalGeometry) -> bool:
 
 def _measurement_cases(
     cases: Sequence[MoeSweepCase],
+    *, full_corpus: bool = False,
 ) -> tuple[MoeSweepCase, ...]:
     cases = tuple(cases)
+    if full_corpus:
+        return cases
     if not cases:
         return ()
     if _has_tunable_backend(cases[0].geometry):
@@ -577,7 +580,6 @@ class MoeDecodeGenerator:
             raise ValueError("MoE sweep cases reference unknown geometries")
 
     def estimate(self, context: GenerationContext) -> WorkEstimate:
-        del context
         cases_by_geometry: dict[tuple[object, ...], list[MoeSweepCase]] = defaultdict(
             list
         )
@@ -592,7 +594,7 @@ class MoeDecodeGenerator:
         measured = tuple(
             case
             for geometry in self._geometries
-            for case in _measurement_cases(cases_by_geometry[geometry.key])
+            for case in _measurement_cases(cases_by_geometry[geometry.key], full_corpus=context.settings.full_corpus)
         )
         query_count = len({_query_key(case) for case in self._cases})
         work_units = len(self._geometries) + len(coarse) + len(measured) + query_count
@@ -610,6 +612,7 @@ class MoeDecodeGenerator:
                 "runtime_route_cases": len(self._cases),
                 "runtime_queries": query_count,
                 "coarse_cases": len(coarse),
+                "full_corpus": context.settings.full_corpus,
             },
         )
 
@@ -617,7 +620,6 @@ class MoeDecodeGenerator:
         self,
         context: GenerationContext,
     ) -> tuple[MeasurementPartition, ...]:
-        del context
         cases_by_geometry: dict[tuple[object, ...], list[MoeSweepCase]] = defaultdict(
             list
         )
@@ -626,7 +628,7 @@ class MoeDecodeGenerator:
         partitions = []
         for geometry in self._geometries:
             cases = tuple(cases_by_geometry[geometry.key])
-            measured = _measurement_cases(cases)
+            measured = _measurement_cases(cases, full_corpus=context.settings.full_corpus)
             coarse = _coarse_cases(cases) if _has_tunable_backend(geometry) else ()
             query_count = len({_query_key(case) for case in cases})
             partitions.append(
@@ -690,7 +692,7 @@ class MoeDecodeGenerator:
             precision_identity = self._precision_identity
         cached = checkpoints.load(self.component_id, key)
         expected_ids = [candidate.candidate_id for candidate in candidates]
-        correctness = stage in {"screen", "search", "qualification"}
+        correctness = context.settings.full_corpus or stage in {"screen", "search", "qualification"}
         if context.provenance:
             reference = None
             if (cached is not None and cached.get("schema_version") == 3
@@ -937,7 +939,7 @@ class MoeDecodeGenerator:
         coarse_measurement_cases = 0
         for geometry_index, geometry in enumerate(self._geometries, start=1):
             geometry_cases = tuple(cases_by_geometry[geometry.key])
-            measurement_cases = _measurement_cases(geometry_cases)
+            measurement_cases = _measurement_cases(geometry_cases, full_corpus=context.settings.full_corpus)
             progress.start_stage(
                 self.component_id,
                 stage=(
@@ -1022,12 +1024,23 @@ class MoeDecodeGenerator:
                         context=context,
                         checkpoints=checkpoints,
                     )
+                    if context.settings.full_corpus:
+                        failures = [item.to_dict() for item in measurements
+                                    if not item.passes(context.settings.minimum_cosine)]
+                        if failures:
+                            raise RuntimeError(f"full-corpus MoE qualification failed for {case.case_id}: {failures}")
                     full_results.append((case, measurements))
                     progress.advance(
                         self.component_id,
                         detail=f"full {case.case_id}",
                     )
 
+        measured_case_ids = [case.case_id for case, _ in full_results]
+        if context.settings.full_corpus and (
+            len(measured_case_ids) != len(self._cases)
+            or set(measured_case_ids) != {case.case_id for case in self._cases}
+        ):
+            raise RuntimeError("full-corpus MoE qualification did not measure every registered case exactly once")
         results_by_query: dict[
             tuple[object, ...],
             list[tuple[MoeSweepCase, tuple[MoeMeasurement, ...]]],
@@ -1125,6 +1138,11 @@ class MoeDecodeGenerator:
                 "measurement_process_scope": "one_cuda_process_per_physical_geometry",
                 "winner_query_counts": dict(sorted(winner_counts.items())),
                 "route_measurements": len(full_results),
+                "full_corpus": context.settings.full_corpus,
+                "registered_route_cases": len(self._cases),
+                "registered_case_ids_sha256": hashlib.sha256(json.dumps(
+                    [case.case_id for case in self._cases], separators=(",", ":")
+                ).encode()).hexdigest(),
                 "single_candidate_route_cases": single_candidate_route_cases,
                 "gpu_measurement_cases": (
                     len(self._geometries) + coarse_measurement_cases + len(full_results)

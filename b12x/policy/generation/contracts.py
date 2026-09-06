@@ -23,6 +23,7 @@ class GenerationSettings:
     minimum_cosine: float = 0.998
     cold_l2: bool = True
     timing_clock: str = "cuda_event"
+    full_corpus: bool = False
     max_candidate_seconds: float = 2.0
 
     def __post_init__(self) -> None:
@@ -33,6 +34,8 @@ class GenerationSettings:
             raise ValueError("minimum_cosine must be in [-1, 1]")
         if self.timing_clock not in ("cuda_event", "globaltimer"):
             raise ValueError("timing_clock must be cuda_event or globaltimer")
+        if type(self.full_corpus) is not bool:
+            raise TypeError("full_corpus must be a boolean")
         if self.max_candidate_seconds <= 0:
             raise ValueError("max_candidate_seconds must be positive")
 
@@ -45,6 +48,7 @@ class GenerationSettings:
             "minimum_cosine": self.minimum_cosine,
             "cold_l2": self.cold_l2,
             "timing_clock": self.timing_clock,
+            "full_corpus": self.full_corpus,
             "max_candidate_seconds": self.max_candidate_seconds,
         }
 
