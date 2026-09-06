@@ -24,6 +24,8 @@ META = OpMeta(
         "Caps",
         "Plan",
         "Binding",
+        "MtpFeedbackConfig",
+        "MtpFeedbackQuery",
         "plan",
         "bind",
         "run",
@@ -51,6 +53,8 @@ if TYPE_CHECKING:  # static analysis only; runtime resolution is lazy
     from .api import (  # noqa: F401
         Binding,
         Caps,
+        MtpFeedbackConfig,
+        MtpFeedbackQuery,
         Plan,
         bind,
         is_supported,

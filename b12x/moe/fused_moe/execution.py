@@ -7,6 +7,7 @@ from dataclasses import dataclass
 import torch
 
 from ..._lib.scratch import ScratchBufferSpec
+from ...policy import MOE_DECODE, PolicyContext, PolicyResolution, get_auto_policy
 from .._shared.execution import MoEExecutionPlan
 from ._impl import (
     TPMoEPlan,
@@ -16,6 +17,8 @@ from ._impl import (
     plan_tp_moe_scratch,
 )
 from .weights import PreparedExperts
+from .planning import ActivationMode
+from ._policy import MOE_DECODE_POLICY, MoeDecodeQuery
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -97,6 +100,9 @@ class ExecutionPlan:
         caps: TPMoEScratchCaps,
         impl: TPMoEScratchPlan,
         variants: tuple[ExecutionVariant, ...],
+        policy: PolicyContext,
+        activation_mode: ActivationMode,
+        precision_resolution: PolicyResolution | None = None,
     ) -> None:
         self.experts = experts
         self.capacity = capacity
@@ -104,6 +110,9 @@ class ExecutionPlan:
         self._caps = caps
         self._impl = impl
         self.variants = variants
+        self.policy = policy
+        self.activation_mode = activation_mode
+        self.precision_resolution = precision_resolution
         self._prewarmed = False
 
     @property
@@ -140,6 +149,7 @@ def _variant(
     capacity: ExecutionCapacity,
     routing: RoutingSpec,
     quant_mode: str,
+    policy: PolicyContext,
 ) -> ExecutionVariant:
     activation = experts.plan.activation
     impl = plan_tp_moe_execution(
@@ -153,6 +163,7 @@ def _variant(
         swiglu_beta=activation.swiglu_beta,
         apply_router_weight_on_input=routing.apply_router_weight_on_input,
         deterministic_output=routing.deterministic_output,
+        policy_context=policy,
     )
     return ExecutionVariant(
         tokens=tokens,
@@ -168,6 +179,7 @@ def plan_execution(
     experts: PreparedExperts,
     capacity: ExecutionCapacity,
     routing: RoutingSpec | None = None,
+    policy: PolicyContext | None = None,
 ) -> ExecutionPlan:
     """Plan scratch and launch variants without compiling CUDA launches."""
 
@@ -178,11 +190,40 @@ def plan_execution(
     routing = routing or RoutingSpec()
     if not isinstance(routing, RoutingSpec):
         raise TypeError("routing must be a RoutingSpec")
+    policy = policy or get_auto_policy(experts.device)
+    if not isinstance(policy, PolicyContext):
+        raise TypeError("policy must be a PolicyContext")
+    policy.require_device(experts.device)
     quant_modes = experts.plan._impl.quant_modes
-    if len(quant_modes) != 1:
+    automatic = experts.plan.activation.mode is ActivationMode.AUTO
+    if len(quant_modes) != 1 and not (automatic and quant_modes == {"nvfp4", "w4a16"}):
         raise ValueError("canonical weight plans must resolve one activation mode")
-    quant_mode = next(iter(quant_modes))
     activation = experts.plan.activation
+    precision_resolution = None
+    execution_policy = policy
+    activation_mode = activation.mode
+    if automatic:
+        if routing.collect_activation_amax:
+            raise ValueError("activation calibration requires an explicit MoE precision")
+        precision_resolution = policy.resolve(
+            MOE_DECODE_POLICY,
+            MoeDecodeQuery(
+                quant_mode="nvfp4_auto", source_format="modelopt_nvfp4",
+                activation=activation.nonlinearity,
+                num_experts=experts.num_experts, hidden_size=experts.hidden_size,
+                intermediate_size=experts.intermediate_size,
+                top_k=capacity.top_k, num_tokens=capacity.max_tokens,
+                routed_rows=capacity.max_tokens * capacity.top_k,
+            ),
+        )
+        activation_mode = (
+            ActivationMode.A16 if precision_resolution.config.backend == "w4a16"
+            else ActivationMode.A4
+        )
+        quant_mode = "w4a16" if activation_mode is ActivationMode.A16 else "nvfp4"
+        execution_policy = policy.with_override(MOE_DECODE, precision_resolution.config)
+    else:
+        quant_mode = next(iter(quant_modes))
     counts = tuple(sorted({capacity.max_tokens, *capacity.warmup_token_counts}))
     caps = TPMoEScratchCaps(
         max_tokens=capacity.max_tokens,
@@ -199,6 +240,7 @@ def plan_execution(
         swiglu_beta=activation.swiglu_beta,
         collect_activation_amax=routing.collect_activation_amax,
         deterministic_output=routing.deterministic_output,
+        policy_context=execution_policy,
         frozen=True,
     )
     impl = plan_tp_moe_scratch(caps, prewarm_launches=False)
@@ -209,6 +251,7 @@ def plan_execution(
             capacity=capacity,
             routing=routing,
             quant_mode=quant_mode,
+            policy=execution_policy,
         )
         for tokens in counts
     )
@@ -219,6 +262,9 @@ def plan_execution(
         caps=caps,
         impl=impl,
         variants=variants,
+        policy=policy,
+        activation_mode=activation_mode,
+        precision_resolution=precision_resolution,
     )
 
 
@@ -233,6 +279,30 @@ def prewarm(plan: ExecutionPlan) -> None:
     if warmed.shapes_and_dtypes() != plan._impl.shapes_and_dtypes():
         raise RuntimeError("prewarming changed the planned scratch contract")
     plan._impl = warmed
+    if plan.experts.plan.activation.mode is ActivationMode.AUTO and plan.experts.device.type == "cuda":
+        from .api import run
+
+        scratch = {
+            spec.name: torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
+            for spec in plan.scratch_specs()
+        }
+        for count in plan._caps.core_token_counts:
+            x = torch.ones(
+                (count, plan.experts.hidden_size), dtype=torch.bfloat16, device=plan.experts.device,
+            )
+            output = torch.empty_like(x)
+            ids = torch.arange(count * plan.capacity.top_k, device=x.device).reshape(
+                count, plan.capacity.top_k,
+            ) % plan.experts.num_experts
+            weights = torch.full(ids.shape, 1.0 / plan.capacity.top_k, device=x.device)
+            for dtype in (torch.int32, torch.int64):
+                binding = plan._impl.bind(
+                    scratch=scratch, experts=plan.experts._impl, a=x, output=output,
+                    topk_ids=ids.to(dtype), topk_weights=weights, input_scales_static=True,
+                    unit_scale_contract=plan.activation_mode is ActivationMode.A16,
+                )
+                run(binding=binding)
+        torch.cuda.synchronize(plan.experts.device)
     plan._prewarmed = True
 
 

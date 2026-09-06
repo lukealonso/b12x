@@ -482,6 +482,7 @@ def _run_live_graph_check(
 def _reset_dispatch_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("B12X_MICRO_DYNAMIC_CUTOVER_PAIRS", raising=False)
     monkeypatch.delenv("B12X_DYNAMIC_TILE_MN", raising=False)
+    monkeypatch.delenv("B12X_DYNAMIC_EXTERNAL_ROUTE_PLAN", raising=False)
     monkeypatch.delenv("B12X_W4A8_TINY_DECODE", raising=False)
     from b12x.moe.fused_moe._impl import clear_tp_moe_caches
 
@@ -633,6 +634,84 @@ def test_standard_moe_qwen38_nvfp4_padding_live_graph_oracle(
     )
 
 
+@pytest.mark.parametrize(
+    ("m", "intermediate_size"),
+    [(1, 208), (2, 208), (2, 272)],
+)
+def test_standard_moe_micro_masks_source_native_w2_tail(
+    monkeypatch: pytest.MonkeyPatch,
+    m: int,
+    intermediate_size: int,
+) -> None:
+    """Bound micro FC2 loads by logical W2 rows, not padded scale rows."""
+
+    num_experts = 4
+    hidden_size = 512
+    topk = 4
+    device = require_b12x()
+    _reset_dispatch_environment(monkeypatch)
+    weights = _make_nvfp4_weights(
+        device,
+        seed=121,
+        num_experts=num_experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+    )
+    initial = _make_inputs(
+        device,
+        m=m,
+        seed=122,
+        route_shift=0,
+        num_experts=num_experts,
+        hidden_size=hidden_size,
+        topk=topk,
+    )
+    changed = _make_inputs(
+        device,
+        m=m,
+        seed=123,
+        route_shift=1,
+        num_experts=num_experts,
+        hidden_size=hidden_size,
+        topk=topk,
+    )
+    initial_reference = _nvfp4_oracle(
+        weights,
+        initial,
+        quant_scale_math="reciprocal_multiply",
+        num_experts=num_experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+    )
+    changed_reference = _nvfp4_oracle(
+        weights,
+        changed,
+        quant_scale_math="reciprocal_multiply",
+        num_experts=num_experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+    )
+    case = _prepare_and_bind(
+        weights,
+        initial,
+        quant_mode="nvfp4",
+        source_format="modelopt_nvfp4",
+        num_topk=topk,
+    )
+    assert case.scratch_plan.launch_plan.implementation == "micro"
+    assert case.binding.implementation == "micro"
+    _run_live_graph_check(
+        case,
+        initial=initial,
+        changed=changed,
+        initial_reference=initial_reference,
+        changed_reference=changed_reference,
+        context=f"standard-moe-micro-w2-tail-n{intermediate_size}-m{m}",
+        min_cos=0.999,
+        max_normalized_rmse=0.03,
+    )
+
+
 def test_standard_moe_dynamic_prefill_live_graph_oracle(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -666,6 +745,146 @@ def test_standard_moe_dynamic_prefill_live_graph_oracle(
         min_cos=0.999,
         max_normalized_rmse=0.03,
     )
+
+
+@pytest.mark.parametrize("tile_m", [16, 32, 64, 128])
+@pytest.mark.parametrize("intermediate_size", [112, 144])
+def test_standard_moe_nvfp4_n16_tail_dynamic_live_graph_oracle(
+    monkeypatch: pytest.MonkeyPatch,
+    tile_m: int,
+    intermediate_size: int,
+) -> None:
+    """Keep a 16-mod-32 gated FC1 half boundary exact in dynamic MoE."""
+
+    device = require_b12x()
+    _reset_dispatch_environment(monkeypatch)
+    monkeypatch.setenv("B12X_DYNAMIC_TILE_MN", f"{tile_m}x128")
+    monkeypatch.setenv("B12X_MICRO_DYNAMIC_CUTOVER_PAIRS", "0")
+    weights = _make_nvfp4_weights(
+        device,
+        seed=204,
+        intermediate_size=intermediate_size,
+    )
+    initial = _make_inputs(device, m=16, seed=205, route_shift=0)
+    changed = _make_inputs(device, m=16, seed=206, route_shift=2)
+    initial_reference = _nvfp4_oracle(
+        weights,
+        initial,
+        intermediate_size=intermediate_size,
+    )
+    changed_reference = _nvfp4_oracle(
+        weights,
+        changed,
+        intermediate_size=intermediate_size,
+    )
+    case = _prepare_and_bind(
+        weights,
+        initial,
+        quant_mode="nvfp4",
+        source_format="modelopt_nvfp4",
+    )
+    launch_plan = case.scratch_plan.launch_plan
+    assert launch_plan.implementation == "dynamic"
+    assert launch_plan.execution.tile_m == tile_m
+    assert case.binding.implementation == "dynamic"
+    _run_live_graph_check(
+        case,
+        initial=initial,
+        changed=changed,
+        initial_reference=initial_reference,
+        changed_reference=changed_reference,
+        context=f"standard-moe-dynamic-n{intermediate_size}-m{tile_m}",
+        min_cos=0.999,
+        max_normalized_rmse=0.03,
+    )
+
+
+@pytest.mark.parametrize("m", [4, 7])
+def test_standard_moe_external_route_plan_live_graph_oracle(
+    monkeypatch: pytest.MonkeyPatch,
+    m: int,
+) -> None:
+    """Consume a Triton-planned grouped route layout under live replay."""
+
+    num_experts = 32
+    hidden_size = 512
+    intermediate_size = 128
+    topk = 10
+    device = require_b12x()
+    _reset_dispatch_environment(monkeypatch)
+    monkeypatch.setenv("B12X_MICRO_DYNAMIC_CUTOVER_PAIRS", "0")
+    monkeypatch.setenv("B12X_DYNAMIC_EXTERNAL_ROUTE_PLAN", "1")
+    weights = _make_nvfp4_weights(
+        device,
+        seed=211,
+        num_experts=num_experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+    )
+    initial = _make_inputs(
+        device,
+        m=m,
+        seed=212,
+        route_shift=0,
+        num_experts=num_experts,
+        hidden_size=hidden_size,
+        topk=topk,
+    )
+    changed = _make_inputs(
+        device,
+        m=m,
+        seed=213,
+        route_shift=13,
+        num_experts=num_experts,
+        hidden_size=hidden_size,
+        topk=topk,
+    )
+    changed.topk_ids[-1, -2:].fill_(-1)
+    initial_reference = _nvfp4_oracle(
+        weights,
+        initial,
+        num_experts=num_experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+    )
+    changed_reference = _nvfp4_oracle(
+        weights,
+        changed,
+        num_experts=num_experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+    )
+    case = _prepare_and_bind(
+        weights,
+        initial,
+        quant_mode="nvfp4",
+        source_format="modelopt_nvfp4",
+        num_topk=topk,
+    )
+    launch_plan = case.scratch_plan.launch_plan
+    assert launch_plan.implementation == "dynamic"
+    assert case.binding.implementation == "dynamic"
+    assert launch_plan.execution.tile_m == 16
+    assert launch_plan.execution.tile_n == 128
+    _run_live_graph_check(
+        case,
+        initial=initial,
+        changed=changed,
+        initial_reference=initial_reference,
+        changed_reference=changed_reference,
+        context=f"standard-moe-external-route-plan-m{m}",
+        min_cos=0.999,
+        max_normalized_rmse=0.03,
+        replay_count=3,
+        require_bit_exact_replay=False,
+    )
+    expected_counts = torch.bincount(
+        changed.topk_ids[changed.topk_ids >= 0].to(torch.int64),
+        minlength=num_experts,
+    ).to(torch.int32)
+    torch.testing.assert_close(case.binding.row_counts, expected_counts)
+    expected_tiles = int(((expected_counts + 15) // 16).sum().item())
+    assert int(case.binding.expert_tile_base[-1].item()) == expected_tiles
 
 
 @pytest.mark.parametrize("m", [80, 96])

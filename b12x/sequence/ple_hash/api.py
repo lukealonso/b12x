@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from ..._lib.gating import default_is_supported
 from ._contracts import Binding, Caps, Plan, bind, plan, run
+from ._policy import PleHashConfig, PleHashQuery
 
 
 def is_supported(device=None) -> bool:
@@ -15,6 +16,8 @@ __all__ = [
     "Caps",
     "Plan",
     "Binding",
+    "PleHashConfig",
+    "PleHashQuery",
     "plan",
     "bind",
     "run",

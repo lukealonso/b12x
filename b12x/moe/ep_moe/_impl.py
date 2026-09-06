@@ -37,6 +37,7 @@ from b12x.moe._shared.kernels.w4a16.host import (
     route_block_sizes_for_capacity,
     route_pack_token_capacity,
 )
+from b12x.policy import PolicyContext, get_auto_policy
 
 # NOTE(one-time port): upstream, ep_moe and tp_moe were siblings in
 # b12x/integration/. The prepared-weights payload plumbing they share should
@@ -47,6 +48,7 @@ from ..fused_moe._impl import (
     _normalize_swiglu_params,
     _prepared_payload_for_runtime,
 )
+from ._policy import EP_MOE_POLICY, EpMoeQuery
 
 
 def _tensor_version(tensor: torch.Tensor) -> int | None:
@@ -258,6 +260,7 @@ class EPMoEScratchPlan:
     _layout: tuple[_EPBufferSpec, ...]
     _nbytes: int
     _scratch_specs: tuple[ScratchBufferSpec, ...]
+    policy_resolution: object | None = None
 
     def scratch_specs(self) -> tuple[ScratchBufferSpec, ...]:
         return self._scratch_specs
@@ -360,11 +363,30 @@ class EPMoEScratchPlan:
         )
 
 
-def plan_ep_moe_scratch(caps: EPMoEScratchCaps) -> EPMoEScratchPlan:
+def plan_ep_moe_scratch(
+    caps: EPMoEScratchCaps,
+    *,
+    policy: PolicyContext | None = None,
+) -> EPMoEScratchPlan:
     """Plan fixed-capacity scratch for replicated-input W4A16 EP."""
 
     if not isinstance(caps, EPMoEScratchCaps):
         raise TypeError("caps must be an EPMoEScratchCaps")
+    policy = policy or get_auto_policy(caps.device)
+    if not isinstance(policy, PolicyContext):
+        raise TypeError("policy must be a PolicyContext")
+    policy.require_device(caps.device)
+    resolution = policy.resolve(
+        EP_MOE_POLICY,
+        EpMoeQuery(
+            max_tokens=caps.max_tokens,
+            top_k=caps.num_topk,
+            num_experts=caps.global_num_experts,
+            hidden_size=caps.weight_plan.hidden_size,
+            intermediate_size=caps.weight_plan.intermediate_size,
+            activation=caps.weight_plan.activation,
+        ),
+    )
     routed_rows = int(caps.max_tokens) * int(caps.num_topk)
     route_capacity_rows = (
         route_pack_token_capacity(caps.max_tokens, caps.num_topk) * caps.num_topk
@@ -446,6 +468,7 @@ def plan_ep_moe_scratch(caps: EPMoEScratchCaps) -> EPMoEScratchPlan:
         _layout=layout,
         _nbytes=nbytes,
         _scratch_specs=scratch_specs,
+        policy_resolution=resolution,
     )
 
 

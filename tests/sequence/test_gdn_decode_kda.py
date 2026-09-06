@@ -32,11 +32,17 @@ def _make_case(
     heads: int = 2,
     columns: int = 3,
     max_tokens: int = 5,
+    tensor_tokens: int | None = None,
+    tensor_columns: int | None = None,
     state_dtype: torch.dtype = torch.float32,
     null_state_index: int | None = None,
+    metadata_validation: str = "transactional",
+    noncontiguous_beta: bool = False,
 ) -> gdn.KdaBinding:
     max_seqs = len(query_lengths)
     live_tokens = sum(query_lengths)
+    token_capacity = max_tokens if tensor_tokens is None else tensor_tokens
+    column_capacity = columns if tensor_columns is None else tensor_columns
     state_slots = max_seqs * columns + 1
     caps = gdn.Caps(
         device=device,
@@ -49,6 +55,7 @@ def _make_case(
         state_dtype=state_dtype,
         gate_activation="sigmoid",
         null_state_index=null_state_index,
+        kda_metadata_validation=metadata_validation,
     )
     plan = gdn.plan(caps)
     (scratch_spec,) = plan.scratch_specs()
@@ -58,24 +65,28 @@ def _make_case(
         device=device,
     )
     state_indices = torch.arange(
-        max_seqs * columns, dtype=torch.int64, device=device
-    ).view(max_seqs, columns)
+        max_seqs * column_capacity, dtype=torch.int64, device=device
+    ).view(max_seqs, column_capacity)
+    raw_beta = _randn((token_capacity, heads), device=device)
+    if noncontiguous_beta:
+        raw_beta_storage = torch.empty(
+            (token_capacity, heads + 3), dtype=raw_beta.dtype, device=device
+        )
+        raw_beta_storage[:, :heads].copy_(raw_beta)
+        raw_beta = raw_beta_storage[:, :heads]
     return gdn.bind_kda(
         plan,
         scratch=torch.empty(
             scratch_spec.shape, dtype=scratch_spec.dtype, device=device
         ),
-        mixed_qkv=_randn((max_tokens, caps.packed_qkv_width), device=device),
-        raw_g=_randn((max_tokens, heads, 128), device=device),
-        raw_beta=_randn((max_tokens, heads), device=device),
-        z=_randn((max_tokens, heads, 128), device=device),
+        mixed_qkv=_randn((token_capacity, caps.packed_qkv_width), device=device),
+        raw_g=_randn((token_capacity, heads, 128), device=device),
+        raw_beta=raw_beta,
+        z=_randn((token_capacity, heads, 128), device=device),
         A_log=_randn((heads,), device=device, dtype=torch.float32, scale=0.1),
-        dt_bias=_randn(
-            (heads, 128), device=device, dtype=torch.float32, scale=0.1
-        ),
+        dt_bias=_randn((heads, 128), device=device, dtype=torch.float32, scale=0.1),
         norm_weight=(
-            1.0
-            + _randn((128,), device=device, dtype=torch.float32, scale=0.05)
+            1.0 + _randn((128,), device=device, dtype=torch.float32, scale=0.05)
         ).contiguous(),
         recurrent_state=_randn(
             (state_slots, heads, 128, 128),
@@ -85,15 +96,50 @@ def _make_case(
         ),
         query_start_loc=query_start_loc,
         num_accepted_tokens=torch.tensor(
-            [2, 1], dtype=torch.int32, device=device
+            [min(2, length, column_capacity) for length in query_lengths],
+            dtype=torch.int32,
+            device=device,
         ),
         state_indices=state_indices,
         num_seqs=torch.tensor([max_seqs], dtype=torch.int32, device=device),
         num_tokens=torch.tensor([live_tokens], dtype=torch.int32, device=device),
         output=torch.empty(
-            (max_tokens, heads, 128), dtype=torch.bfloat16, device=device
+            (token_capacity, heads, 128), dtype=torch.bfloat16, device=device
         ),
     )
+
+
+def _rebind(binding: gdn.KdaBinding, **overrides: torch.Tensor) -> gdn.KdaBinding:
+    arguments = {
+        "scratch": binding.scratch,
+        "mixed_qkv": binding.mixed_qkv,
+        "raw_g": binding.raw_g,
+        "raw_beta": binding.raw_beta,
+        "z": binding.z,
+        "A_log": binding.A_log,
+        "dt_bias": binding.dt_bias,
+        "norm_weight": binding.norm_weight,
+        "recurrent_state": binding.recurrent_state,
+        "query_start_loc": binding.query_start_loc,
+        "num_accepted_tokens": binding.num_accepted_tokens,
+        "state_indices": binding.state_indices,
+        "num_seqs": binding.num_seqs,
+        "num_tokens": binding.num_tokens,
+        "output": binding.output,
+    }
+    arguments.update(overrides)
+    return gdn.bind_kda(binding.plan, **arguments)
+
+
+def _row_padded(tensor: torch.Tensor, padding: int = 3) -> torch.Tensor:
+    rows = tensor.shape[0]
+    row_elements = tensor[0].numel()
+    storage = torch.empty(
+        (rows, row_elements + padding), dtype=tensor.dtype, device=tensor.device
+    )
+    result = storage[:, :row_elements].view(tensor.shape)
+    result.copy_(tensor)
+    return result
 
 
 def _reference(binding: gdn.KdaBinding, state: torch.Tensor) -> torch.Tensor:
@@ -158,14 +204,14 @@ def test_reference_applies_per_key_lower_bounded_decay() -> None:
     )
     expected_state = initial_state[0, 0] * torch.exp(log_decay).unsqueeze(0)
     delta = value - expected_state.mv(k)
-    expected_state += (
-        delta * torch.sigmoid(raw_beta[0, 0].float())
-    ).unsqueeze(1) * k.unsqueeze(0)
+    expected_state += (delta * torch.sigmoid(raw_beta[0, 0].float())).unsqueeze(
+        1
+    ) * k.unsqueeze(0)
     core = expected_state.mv(q).to(torch.bfloat16)
     normalized = core.float() * torch.rsqrt(core.float().square().mean() + 1e-6)
-    expected = (
-        normalized * norm_weight * torch.sigmoid(z[0, 0].float())
-    ).to(torch.bfloat16)
+    expected = (normalized * norm_weight * torch.sigmoid(z[0, 0].float())).to(
+        torch.bfloat16
+    )
 
     torch.testing.assert_close(actual[0, 0], expected, rtol=0, atol=0)
     torch.testing.assert_close(state[0, 0], expected_state, rtol=0, atol=0)
@@ -181,12 +227,12 @@ def test_reference_keeps_kda_rmsnorm_in_fp32_until_final_store() -> None:
     mixed_qkv = torch.cat((q, k, value)).view(1, -1)
     raw_g = torch.full((1, 1, 128), -100, dtype=torch.bfloat16)
     raw_beta = torch.full((1, 1), 100, dtype=torch.bfloat16)
-    z = torch.linspace(-2, 2, 128, dtype=torch.float32).to(torch.bfloat16).view(
-        1, 1, 128
+    z = (
+        torch.linspace(-2, 2, 128, dtype=torch.float32)
+        .to(torch.bfloat16)
+        .view(1, 1, 128)
     )
-    norm_weight = torch.linspace(0.7, 1.4, 128, dtype=torch.float32).to(
-        torch.bfloat16
-    )
+    norm_weight = torch.linspace(0.7, 1.4, 128, dtype=torch.float32).to(torch.bfloat16)
     state = torch.zeros((1, 1, 128, 128), dtype=torch.float32)
 
     actual = gdn.reference.decode_kda(
@@ -207,9 +253,7 @@ def test_reference_keeps_kda_rmsnorm_in_fp32_until_final_store() -> None:
     )[0, 0]
 
     decoded = (core.float() * (128**-0.5)).to(torch.bfloat16)
-    normalized = decoded.float() * torch.rsqrt(
-        decoded.float().square().mean() + 1e-6
-    )
+    normalized = decoded.float() * torch.rsqrt(decoded.float().square().mean() + 1e-6)
     gate = torch.sigmoid(z[0, 0].float())
     expected = (normalized * norm_weight.float() * gate).to(torch.bfloat16)
     old_intermediate_bf16 = (
@@ -292,9 +336,9 @@ def test_kda_rmsnorm_kernel_avoids_intermediate_bf16_rounding() -> None:
     )
     core = output.clone()
     z = torch.full_like(output, 100)
-    norm_weight = torch.linspace(
-        0.7, 1.4, 128, dtype=torch.float32, device=device
-    ).to(torch.bfloat16)
+    norm_weight = torch.linspace(0.7, 1.4, 128, dtype=torch.float32, device=device).to(
+        torch.bfloat16
+    )
     num_tokens = torch.ones(1, dtype=torch.int32, device=device)
     error_code = torch.zeros(1, dtype=torch.int32, device=device)
 
@@ -305,11 +349,11 @@ def test_kda_rmsnorm_kernel_avoids_intermediate_bf16_rounding() -> None:
         num_tokens,
         error_code,
         eps,
+        1,
         stride_output_token=output.stride(0),
         stride_output_head=output.stride(1),
         stride_z_token=z.stride(0),
         stride_z_head=z.stride(1),
-        MAX_TOKENS=1,
         VALUE_HEADS=1,
         VALUE_HEAD_DIM=128,
         SIGMOID_GATE=True,
@@ -323,15 +367,13 @@ def test_kda_rmsnorm_kernel_avoids_intermediate_bf16_rounding() -> None:
     values = core[0, 0].float()
     normalized = values * torch.rsqrt(values.square().mean() + eps)
     expected = (normalized * norm_weight.float()).to(torch.bfloat16)
-    old_intermediate_bf16 = (
-        normalized.to(torch.bfloat16) * norm_weight
-    ).to(torch.bfloat16)
+    old_intermediate_bf16 = (normalized.to(torch.bfloat16) * norm_weight).to(
+        torch.bfloat16
+    )
     expected_delta = torch.count_nonzero(expected != old_intermediate_bf16)
     assert expected_delta >= 16
     new_error = (output[0, 0].float() - expected.float()).abs().sum()
-    old_error = (
-        output[0, 0].float() - old_intermediate_bf16.float()
-    ).abs().sum()
+    old_error = (output[0, 0].float() - old_intermediate_bf16.float()).abs().sum()
     assert new_error < old_error
 
 
@@ -354,6 +396,125 @@ def test_packed_kda_matches_reference(state_dtype: torch.dtype) -> None:
         atol=8e-3 if state_dtype == torch.bfloat16 else 2e-5,
     )
     assert torch.count_nonzero(actual[4:]) == 0
+
+
+def test_kda_binds_live_tensors_without_device_validation() -> None:
+    device = require_sm120()
+    binding = _make_case(
+        device=device,
+        query_lengths=(1, 1),
+        columns=3,
+        max_tokens=6,
+        tensor_tokens=2,
+        tensor_columns=1,
+        metadata_validation="trusted",
+        noncontiguous_beta=True,
+    )
+    binding = _rebind(
+        binding,
+        mixed_qkv=_row_padded(binding.mixed_qkv),
+        raw_g=_row_padded(binding.raw_g),
+        z=_row_padded(binding.z),
+        output=_row_padded(binding.output),
+    )
+    state_reference = binding.recurrent_state.clone()
+    expected = _reference(binding, state_reference)
+    binding.error_code.fill_(7)
+
+    actual = gdn.run_kda(binding)
+    torch.cuda.synchronize(device)
+
+    assert not binding.raw_beta.is_contiguous()
+    assert not binding.mixed_qkv.is_contiguous()
+    assert not binding.raw_g.is_contiguous()
+    assert not binding.z.is_contiguous()
+    assert not binding.output.is_contiguous()
+    assert actual.data_ptr() == binding.output.data_ptr()
+    assert binding.error_code.item() == 7
+    torch.testing.assert_close(actual, expected, rtol=1e-2, atol=2e-2)
+    torch.testing.assert_close(
+        binding.recurrent_state, state_reference, rtol=1e-5, atol=2e-5
+    )
+
+
+def test_kda_validation_uses_bound_tensor_capacity() -> None:
+    device = require_sm120()
+    binding = _make_case(
+        device=device,
+        query_lengths=(1, 1),
+        columns=3,
+        max_tokens=6,
+        tensor_tokens=2,
+        tensor_columns=1,
+    )
+    state_before = binding.recurrent_state.clone()
+    binding.num_tokens.fill_(3)
+
+    actual = gdn.run_kda(binding)
+    torch.cuda.synchronize(device)
+
+    assert torch.isnan(actual).all()
+    torch.testing.assert_close(binding.recurrent_state, state_before, rtol=0, atol=0)
+
+
+def test_kda_binding_rejects_invalid_live_contract() -> None:
+    device = require_sm120()
+    binding = _make_case(device=device)
+
+    with pytest.raises(ValueError, match="exceeds planned capacity"):
+        _rebind(
+            binding,
+            mixed_qkv=torch.empty(
+                binding.plan.caps.max_tokens + 1,
+                binding.plan.caps.packed_qkv_width,
+                dtype=torch.bfloat16,
+                device=device,
+            ),
+        )
+
+    with pytest.raises(TypeError, match="num_accepted_tokens must have dtype"):
+        _rebind(
+            binding,
+            num_accepted_tokens=binding.num_accepted_tokens.to(torch.int64),
+        )
+
+
+def test_live_kda_cuda_graph_replays_without_validation() -> None:
+    device = require_sm120()
+    binding = _make_case(
+        device=device,
+        query_lengths=(1, 1),
+        columns=3,
+        max_tokens=6,
+        tensor_tokens=2,
+        tensor_columns=1,
+        metadata_validation="trusted",
+    )
+
+    def launch() -> torch.Tensor:
+        return gdn.run_kda(_rebind(binding))
+
+    binding.error_code.fill_(11)
+    launch()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured_output = launch()
+
+    binding.mixed_qkv.copy_(torch.randn_like(binding.mixed_qkv).mul_(0.2))
+    binding.raw_g.copy_(torch.randn_like(binding.raw_g).mul_(0.2))
+    state_reference = binding.recurrent_state.clone()
+    expected = _reference(binding, state_reference)
+    output_ptr = captured_output.data_ptr()
+
+    graph.replay()
+    torch.cuda.synchronize(device)
+
+    assert captured_output.data_ptr() == output_ptr
+    assert binding.error_code.item() == 11
+    torch.testing.assert_close(captured_output, expected, rtol=1e-2, atol=2e-2)
+    torch.testing.assert_close(
+        binding.recurrent_state, state_reference, rtol=1e-5, atol=2e-5
+    )
 
 
 def test_glm53_tp8_head_geometry_matches_reference() -> None:
@@ -388,9 +549,7 @@ def test_kda_rejected_draft_restarts_from_accepted_checkpoint() -> None:
     binding.raw_beta.copy_(torch.randn_like(binding.raw_beta).mul_(0.2))
     binding.z.copy_(torch.randn_like(binding.z).mul_(0.2))
     state_reference = binding.recurrent_state.clone()
-    torch.testing.assert_close(
-        state_reference[1], accepted_checkpoint, rtol=0, atol=0
-    )
+    torch.testing.assert_close(state_reference[1], accepted_checkpoint, rtol=0, atol=0)
     expected = _reference(binding, state_reference)
 
     actual = gdn.run_kda(binding)
@@ -485,9 +644,7 @@ def test_kda_torch_compile_fullgraph_keeps_outer_op_opaque() -> None:
     compiled = torch.compile(launch, fullgraph=True)
     binding.mixed_qkv.copy_(torch.randn_like(binding.mixed_qkv).mul_(0.2))
     binding.raw_g.copy_(torch.randn_like(binding.raw_g).mul_(0.2))
-    binding.recurrent_state.copy_(
-        torch.randn_like(binding.recurrent_state).mul_(0.1)
-    )
+    binding.recurrent_state.copy_(torch.randn_like(binding.recurrent_state).mul_(0.1))
     state_reference = binding.recurrent_state.clone()
     expected = _reference(binding, state_reference)
 
@@ -537,9 +694,7 @@ def test_kda_padded_state_slot_past_int32_element_boundary() -> None:
     raw_beta = _randn((1, heads), device=device)
     z = _randn((1, heads, 128), device=device)
     A_log = _randn((heads,), device=device, dtype=torch.float32, scale=0.1)
-    dt_bias = _randn(
-        (heads, 128), device=device, dtype=torch.float32, scale=0.1
-    )
+    dt_bias = _randn((heads, 128), device=device, dtype=torch.float32, scale=0.1)
     norm_weight = (
         1.0 + _randn((128,), device=device, dtype=torch.float32, scale=0.05)
     ).contiguous()

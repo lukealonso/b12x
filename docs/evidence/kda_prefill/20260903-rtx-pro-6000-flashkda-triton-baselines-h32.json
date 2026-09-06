@@ -1,0 +1,177 @@
+{
+ "device": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+ "sms": 188,
+ "cases": {
+  "h32-t1024-n1": {
+   "heads": 32,
+   "lengths": [
+    1024
+   ],
+   "flashkda": {
+    "cold_us": 79.14399914443493,
+    "warm_us": 69.21599805355072,
+    "cold_min_us": 77.31200009584427,
+    "replays_per_sample": 2,
+    "gather_scatter_us": 23.221333511173725,
+    "captured": true,
+    "workspace_bytes": 28753920
+   },
+   "triton": {
+    "cold_us": 129.37600165605545,
+    "warm_us": 117.35999956727028,
+    "cold_min_us": 126.97599828243256,
+    "replays_per_sample": 2,
+    "captured": true
+   },
+   "chain_tiles": 64
+  },
+  "h32-t2048-n1": {
+   "heads": 32,
+   "lengths": [
+    2048
+   ],
+   "flashkda": {
+    "cold_us": 139.26400244235992,
+    "warm_us": 136.80000603199005,
+    "cold_min_us": 137.15200126171112,
+    "replays_per_sample": 1,
+    "gather_scatter_us": 22.690666684259973,
+    "captured": true,
+    "workspace_bytes": 57065472
+   },
+   "triton": {
+    "cold_us": 241.66400730609894,
+    "warm_us": 243.80800127983093,
+    "cold_min_us": 237.56800591945648,
+    "replays_per_sample": 1,
+    "captured": true
+   },
+   "chain_tiles": 128
+  },
+  "h32-t4096-n1": {
+   "heads": 32,
+   "lengths": [
+    4096
+   ],
+   "flashkda": {
+    "cold_us": 284.67199206352234,
+    "warm_us": 294.49599981307983,
+    "cold_min_us": 283.6480140686035,
+    "replays_per_sample": 1,
+    "gather_scatter_us": 22.677333249400057,
+    "captured": true,
+    "workspace_bytes": 113688576
+   },
+   "triton": {
+    "cold_us": 621.5200126171112,
+    "warm_us": 629.3439865112305,
+    "cold_min_us": 618.4960007667542,
+    "replays_per_sample": 1,
+    "captured": true
+   },
+   "chain_tiles": 256
+  },
+  "h32-t4096-n4": {
+   "heads": 32,
+   "lengths": [
+    1024,
+    1024,
+    1024,
+    1024
+   ],
+   "flashkda": {
+    "cold_us": 223.23200106620789,
+    "warm_us": 233.0559939146042,
+    "cold_min_us": 221.15199267864227,
+    "replays_per_sample": 1,
+    "gather_scatter_us": 24.240000173449516,
+    "captured": true,
+    "workspace_bytes": 115015680
+   },
+   "triton": {
+    "cold_us": 632.8319907188416,
+    "warm_us": 640.608012676239,
+    "cold_min_us": 627.7120113372803,
+    "replays_per_sample": 1,
+    "captured": true
+   },
+   "chain_tiles": 64
+  },
+  "h32-t512x8": {
+   "heads": 32,
+   "lengths": [
+    512,
+    512,
+    512,
+    512,
+    512,
+    512,
+    512,
+    512
+   ],
+   "flashkda": {
+    "cold_us": 237.56800591945648,
+    "warm_us": 245.34399807453156,
+    "cold_min_us": 235.52000522613525,
+    "replays_per_sample": 1,
+    "gather_scatter_us": 24.32639990001917,
+    "captured": true,
+    "workspace_bytes": 116785152
+   },
+   "triton": {
+    "cold_us": 650.7200002670288,
+    "warm_us": 657.5040221214294,
+    "cold_min_us": 647.167980670929,
+    "replays_per_sample": 1,
+    "captured": true
+   },
+   "chain_tiles": 32
+  },
+  "h32-t8192-n1": {
+   "heads": 32,
+   "lengths": [
+    8192
+   ],
+   "flashkda": {
+    "cold_us": 593.9520001411438,
+    "warm_us": 604.2399704456329,
+    "cold_min_us": 589.8560285568237,
+    "replays_per_sample": 1,
+    "gather_scatter_us": 23.136000148952007,
+    "captured": true,
+    "workspace_bytes": 226934784
+   },
+   "triton": {
+    "cold_us": 1433.407962322235,
+    "warm_us": 1440.351963043213,
+    "cold_min_us": 1427.456021308899,
+    "replays_per_sample": 1,
+    "captured": true
+   },
+   "chain_tiles": 512
+  },
+  "h32-t32768-n1": {
+   "heads": 32,
+   "lengths": [
+    32768
+   ],
+   "flashkda": {
+    "cold_us": 2414.911985397339,
+    "warm_us": 2427.4559020996094,
+    "cold_min_us": 2407.423973083496,
+    "replays_per_sample": 1,
+    "gather_scatter_us": 22.466666686038174,
+    "captured": true,
+    "workspace_bytes": 906412032
+   },
+   "triton": {
+    "cold_us": 6158.655881881714,
+    "warm_us": 6218.30415725708,
+    "cold_min_us": 6138.879776000977,
+    "replays_per_sample": 1,
+    "captured": true
+   },
+   "chain_tiles": 2048
+  }
+ }
+}

@@ -34,6 +34,8 @@ META = OpMeta(
         "Plan",
         "Binding",
         "ExpertMap",
+        "EpMoeConfig",
+        "EpMoeQuery",
         "plan",
         "bind",
         "run",
@@ -56,6 +58,8 @@ if TYPE_CHECKING:  # static analysis only; runtime resolution is lazy
     from .api import (  # noqa: F401
         Binding,
         Caps,
+        EpMoeConfig,
+        EpMoeQuery,
         ExpertMap,
         Plan,
         bind,

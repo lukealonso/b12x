@@ -6,6 +6,7 @@ from ..._lib.gating import default_is_supported
 from .._shared.block_fp8 import (
     BlockFP8LinearBinding as Binding,
 )
+from ._policy import BlockFp8LinearConfig, BlockFp8LinearQuery
 from .._shared.block_fp8 import (
     BlockFP8LinearScratchCaps as Caps,
 )
@@ -52,6 +53,8 @@ __all__ = [
     "Plan",
     "Binding",
     "Weight",
+    "BlockFp8LinearConfig",
+    "BlockFp8LinearQuery",
     "plan",
     "bind",
     "run",

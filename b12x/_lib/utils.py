@@ -171,6 +171,8 @@ _num_sm_cache: dict[int, int] = {}
 
 def get_num_sm(device: torch.device) -> int:
     """Return the device SM count without exposing lru_cache to Dynamo."""
+    if device.type != "cuda":
+        return 1
     index = device.index
     if index is None:
         index = torch.cuda.current_device()
@@ -312,12 +314,9 @@ class _Pointer(Pointer):
         raise NotImplementedError("align is not supported in runtime")
 
     def verify(self, expected_py_type):
-        if expected_py_type is Pointer or (
+        return expected_py_type is Pointer or (
             isinstance(expected_py_type, ir.Value) and expected_py_type.ty is Pointer
-        ):
-            return True
-
-        return False
+        )
 
     @property
     def __cache_key__(self) -> tuple[object, ...]:

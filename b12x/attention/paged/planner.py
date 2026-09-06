@@ -23,6 +23,10 @@ from typing import Literal
 
 import torch
 
+from b12x.policy import NO_POLICY_OVERRIDE, PolicyContext, get_auto_policy
+
+from ._policy import GQA_POLICY, GqaConfig, GqaQuery
+
 _FP8_KV_DTYPE = torch.float8_e4m3fn
 _PAGED_EXTEND_FP8_CHUNK_TABLE_PAGES = (
     (1, 1),
@@ -965,6 +969,7 @@ class PagedDecodeGraphCapacity:
     max_effective_kv_pages: int
     worst_page_count: int
     chunk_pages_lut: tuple[int, ...]
+    policy_resolution: object | None = None
 
 
 @dataclass(frozen=True)
@@ -1158,7 +1163,7 @@ def build_decode_chunk_pages_lut(
     return tuple(lut)
 
 
-def plan_decode_graph_capacity(
+def _plan_decode_graph_capacity_heuristic(
     *,
     device: torch.device | str,
     q_dtype: torch.dtype,
@@ -1406,6 +1411,9 @@ def plan_decode_graph_capacity(
         capacity_max_chunks_per_request = _ceil_div(
             analytic_total_work_budget, batch
         )
+        architecture_max_chunks = max(
+            architecture_max_chunks, capacity_max_chunks_per_request
+        )
     else:
         capacity_max_work_items = (
             batch * query_tiles_per_request * max_chunks_per_request
@@ -1425,6 +1433,87 @@ def plan_decode_graph_capacity(
         max_effective_kv_pages=int(max_effective_kv_pages),
         worst_page_count=int(worst_page_count),
         chunk_pages_lut=tuple(int(v) for v in chunk_pages_lut),
+    )
+
+
+def plan_decode_graph_capacity(
+    *,
+    device: torch.device | str,
+    q_dtype: torch.dtype,
+    kv_dtype: torch.dtype,
+    num_q_heads: int,
+    num_kv_heads: int,
+    head_dim_qk: int,
+    head_dim_vo: int,
+    page_size: int,
+    batch: int,
+    max_cache_page_count: int,
+    window_left: int = -1,
+    graph_ctas_per_sm: int | None = None,
+    max_work_items: int | None = None,
+    max_partial_rows: int | None = None,
+    force_split_kv: bool | None = None,
+    kv_cache_layout: str = "separate",
+    policy: PolicyContext | None = None,
+    config: GqaConfig | None = None,
+) -> PagedDecodeGraphCapacity:
+    """Resolve preplanned or heuristic decode-graph capacity policy."""
+
+    resolved_device = torch.device(device)
+    if resolved_device.type == "cuda" and resolved_device.index is None:
+        resolved_device = torch.device("cuda", torch.cuda.current_device())
+    policy = policy or get_auto_policy(resolved_device)
+    if not isinstance(policy, PolicyContext):
+        raise TypeError("policy must be a PolicyContext")
+    policy.require_device(resolved_device)
+    page_size = int(page_size)
+    max_cache_page_count = int(max_cache_page_count)
+    query = GqaQuery(
+        device=resolved_device,
+        mode="decode",
+        q_dtype=str(q_dtype).removeprefix("torch."),
+        kv_dtype=str(kv_dtype).removeprefix("torch."),
+        q_heads=int(num_q_heads),
+        kv_heads=int(num_kv_heads),
+        head_dim_qk=int(head_dim_qk),
+        head_dim_vo=int(head_dim_vo),
+        page_size=page_size,
+        kv_cache_layout=kv_cache_layout,
+        batch_size=int(batch),
+        query_len=1,
+        cache_tokens=max_cache_page_count * page_size,
+        window_left=int(window_left),
+        requested_graph_ctas_per_sm=(
+            None if graph_ctas_per_sm is None else int(graph_ctas_per_sm)
+        ),
+        requested_max_work_items=(
+            None if max_work_items is None else int(max_work_items)
+        ),
+        requested_max_partial_rows=(
+            None if max_partial_rows is None else int(max_partial_rows)
+        ),
+        force_split_kv=force_split_kv,
+    )
+    resolution = policy.resolve(
+        GQA_POLICY,
+        query,
+        override=NO_POLICY_OVERRIDE if config is None else config,
+    )
+    selected = resolution.config
+    return PagedDecodeGraphCapacity(
+        graph_ctas_per_sm=selected.graph_ctas_per_sm,
+        cta_tile_q=selected.cta_tile_q,
+        query_tiles_per_request=selected.query_tiles_per_request,
+        architecture_max_chunks_per_request=(
+            selected.architecture_max_chunks_per_request
+        ),
+        max_chunks_per_request=selected.max_chunks_per_request,
+        max_work_items=selected.max_work_items,
+        max_partial_rows=selected.max_partial_rows,
+        max_effective_kv_pages=selected.max_effective_kv_pages,
+        worst_page_count=selected.worst_page_count,
+        chunk_pages_lut=selected.chunk_pages_lut(),
+        policy_resolution=resolution,
     )
 
 

@@ -75,6 +75,7 @@ _GLM_NEXT_GMEM_STRIDE = 528  # Same latent+scales row, with no RoPE suffix.
 # BF16 RoPE. The NoPE+scale+pad region is staged as a 288B row; decode math
 # dequants the E2M1 data and E4M3 group-16 scales in registers.
 _NVFP4_GMEM_STRIDE = 432
+_GLM_NEXT_NVFP4_GMEM_STRIDE = 304
 _NVFP4_NOPE_SCALE_BYTES = 288
 _NVFP4_ROPE_BYTES = 128
 _NVFP4_ROPE_SRC = 304
@@ -173,14 +174,16 @@ def io_issue_gather(
             # BF16-rope smem row. decode_math interprets scale at +0 and E4M3 at +16.
             _ROPE = Int32(_NVFP4_FP8_ROPE_TAIL_BYTES)
             _ROPE_SRC = Int64(_NVFP4_FP8_ROPE_TAIL_SRC)
-        else:
+        elif cutlass.const_expr(rope_smem_stride):
             _IOS = Int64(_NVFP4_GMEM_STRIDE)
             _ROPE = Int32(_NVFP4_ROPE_BYTES)
             _ROPE_SRC = Int64(_NVFP4_ROPE_SRC)
+        else:
+            _IOS = Int64(_GLM_NEXT_NVFP4_GMEM_STRIDE)
+            _ROPE = Int32(0)
+            _ROPE_SRC = Int64(_GLM_NEXT_NVFP4_GMEM_STRIDE)
     else:
-        _IOS = Int64(
-            _GLM_GMEM_STRIDE if rope_smem_stride else _GLM_NEXT_GMEM_STRIDE
-        )
+        _IOS = Int64(_GLM_GMEM_STRIDE if rope_smem_stride else _GLM_NEXT_GMEM_STRIDE)
         _NOPE = Int32(_GLM_NOPE_SCALE_BYTES)  # 528 nope+inline-fp32 -> kv_fp8
         _ROPE = Int32(_GLM_ROPE_BYTES if rope_smem_stride else 0)
         _ROPE_SRC = Int64(_GLM_NOPE_SCALE_BYTES)  # rope follows nope+scales
@@ -344,9 +347,7 @@ def io_issue_gather(
                 s_byte = entry * _FOOT
                 st_shared_u32(kv_sc_dst_addr + s_byte, f0)
                 st_shared_u32(kv_sc_dst_addr + s_byte + Int32(4), f1)
-            elif cutlass.const_expr(
-                scale_format == 2 and fp8_rope and per_token_latent_scale
-            ):
+            elif cutlass.const_expr(scale_format == 2 and per_token_latent_scale):
                 # NVFP4 two-level record: the per-token fp32 latent scale sits
                 # at [292, 296).  292 is not 8B-aligned, so load the 8-aligned
                 # pair at [288, 296) (rope scale, latent scale) and keep the
@@ -389,3 +390,180 @@ def io_issue_gather(
                     full_mbar_ptr, Int32(bulk_tx_bytes)
                 )
         _issue_payload()
+
+
+@cute.jit
+def io_issue_packed_payload(
+    kv_cache_u8: cute.Tensor,
+    kv_fp8_dst_addr: Int32,
+    full_mbar_ptr,
+    idx0: Int32,
+    idx1: Int32,
+    page_block_size: Int32,
+    stride_kv_block: Int64,
+    io_lane: Int32,
+    *,
+    kv_smem_stride: cutlass.Constexpr,
+    record_bytes: cutlass.Constexpr,
+    bulk_tx_bytes: cutlass.Constexpr,
+):
+    """Register the chunk's transaction bytes and issue its two record copies.
+
+    Entry ``io_lane`` copies candidate ``idx0`` and entry ``io_lane + 32``
+    copies ``idx1``; a negative index copies row 0 so the byte count is
+    always met. Callable before the chunk's validity is known: the copies
+    only fill the shared stage, and the phase cannot complete before the
+    producer's later arrival.
+    """
+    full_mbar_u32 = shared_ptr_to_u32(full_mbar_ptr)
+    if io_lane == Int32(0):
+        cute.arch.mbarrier_expect_tx(full_mbar_ptr, Int32(bulk_tx_bytes))
+    clamped0 = idx0
+    if clamped0 < Int32(0):
+        clamped0 = Int32(0)
+    clamped1 = idx1
+    if clamped1 < Int32(0):
+        clamped1 = Int32(0)
+    blk0 = clamped0 // page_block_size
+    loc0 = clamped0 - blk0 * page_block_size
+    blk1 = clamped1 // page_block_size
+    loc1 = clamped1 - blk1 * page_block_size
+    data0 = Int64(blk0) * stride_kv_block + Int64(loc0) * Int64(record_bytes)
+    data1 = Int64(blk1) * stride_kv_block + Int64(loc1) * Int64(record_bytes)
+    cp_async_bulk_g2s_mbar(
+        kv_fp8_dst_addr + io_lane * Int32(kv_smem_stride),
+        get_ptr_as_int64(kv_cache_u8, data0),
+        Int32(record_bytes),
+        full_mbar_u32,
+    )
+    cp_async_bulk_g2s_mbar(
+        kv_fp8_dst_addr + (io_lane + Int32(32)) * Int32(kv_smem_stride),
+        get_ptr_as_int64(kv_cache_u8, data1),
+        Int32(record_bytes),
+        full_mbar_u32,
+    )
+
+
+@cute.jit
+def io_issue_gather_packed(
+    kv_cache_u8: cute.Tensor,  # flat 1-D u8 view of THIS section's paged cache
+    topk_indices: cute.Tensor,  # 1-D int32 index row for this token and section
+    kv_fp8_dst_addr: Int32,  # u32 smem addr of the packed KV stage for this buffer
+    kv_sc_dst_addr: Int32,  # u32 smem addr of the DSV4 footer stage (unused for GLM)
+    token_idx_view: cute.Tensor,  # smem int32 validity buffer (BI,) for this buffer
+    full_mbar_ptr,  # cute.Pointer (u64) of mbar_full[buf]
+    g_start: Int32,  # absolute candidate offset of entry 0 within the section
+    g_end: Int32,  # min(g_start + BI, section_len)
+    page_block_size: Int32,  # tokens per paged block in this section
+    stride_kv_block: Int64,  # per-block byte stride in this section
+    io_lane: Int32,  # lane within the single IO warp [0, 32)
+    pre_valid: Int32,  # 1: pre_idx0/pre_idx1 hold the raw indices; 2: payload issued too
+    pre_idx0: Int32,
+    pre_idx1: Int32,
+    *,
+    kv_smem_stride: cutlass.Constexpr,  # 656 GLM / 592 DSV4 packed smem row
+    record_bytes: cutlass.Constexpr,  # 656 GLM / 576 DSV4 contiguous data record
+    bulk_tx_bytes: cutlass.Constexpr,  # BI * record_bytes
+    index_capacity: cutlass.Constexpr,  # entries in topk_indices
+    dsv4_footer: cutlass.Constexpr,  # gather the 8-byte UE8M0 footer per token
+    scale_bytes_per_token: cutlass.Constexpr = 8,
+):
+    """Producer body for one chunk of contiguous-record decode paths.
+
+    Serves the eight-head GLM and DSV4 arms and the generic GLM_NEXT arm; all
+    stage one contiguous record per candidate. One IO warp gathers BI=64
+    records, two per lane. The order is
+    chosen for latency: the raw indices are consumed first (either preloaded
+    by the caller before the kernel's length-dependent prologue or loaded
+    here), the bulk copies are issued immediately, and only then are the
+    DSV4 footer scalar loads and the validity-index stores performed, so the
+    footer round trip overlaps the payload transfer instead of preceding it.
+    The transaction count is registered before the copies with a bare
+    expect-tx; the single arrival that releases the phase follows the CTA
+    fence that publishes the footer and index stores.
+
+    Every entry copies exactly ``record_bytes`` (an invalid entry copies row 0)
+    so the transaction count always reaches ``bulk_tx_bytes``; validity is
+    carried by ``token_idx_view`` alone.
+    """
+    entry0 = io_lane
+    entry1 = io_lane + Int32(32)
+    cand0 = g_start + entry0
+    cand1 = g_start + entry1
+    idx0 = Int32(-1)
+    idx1 = Int32(-1)
+    if pre_valid != Int32(0):
+        idx0 = pre_idx0
+        idx1 = pre_idx1
+    else:
+        if cand0 < Int32(index_capacity):
+            idx0 = Int32(topk_indices[cand0])
+        if cand1 < Int32(index_capacity):
+            idx1 = Int32(topk_indices[cand1])
+    if cand0 >= g_end:
+        idx0 = Int32(-1)
+    if cand1 >= g_end:
+        idx1 = Int32(-1)
+
+    if pre_valid != Int32(2):
+        io_issue_packed_payload(
+            kv_cache_u8,
+            kv_fp8_dst_addr,
+            full_mbar_ptr,
+            idx0,
+            idx1,
+            page_block_size,
+            stride_kv_block,
+            io_lane,
+            kv_smem_stride=kv_smem_stride,
+            record_bytes=record_bytes,
+            bulk_tx_bytes=bulk_tx_bytes,
+        )
+
+    clamped0 = idx0
+    if clamped0 < Int32(0):
+        clamped0 = Int32(0)
+    clamped1 = idx1
+    if clamped1 < Int32(0):
+        clamped1 = Int32(0)
+    blk0 = clamped0 // page_block_size
+    loc0 = clamped0 - blk0 * page_block_size
+    blk1 = clamped1 // page_block_size
+    loc1 = clamped1 - blk1 * page_block_size
+
+    if cutlass.const_expr(dsv4_footer):
+        f00 = Uint32(0)
+        f01 = Uint32(0)
+        f10 = Uint32(0)
+        f11 = Uint32(0)
+        footer_base = Int64(page_block_size) * Int64(record_bytes)
+        if idx0 >= Int32(0):
+            f00, f01 = ld_global_nc_v2_u32(
+                get_ptr_as_int64(
+                    kv_cache_u8,
+                    Int64(blk0) * stride_kv_block
+                    + footer_base
+                    + Int64(loc0) * Int64(scale_bytes_per_token),
+                )
+            )
+        if idx1 >= Int32(0):
+            f10, f11 = ld_global_nc_v2_u32(
+                get_ptr_as_int64(
+                    kv_cache_u8,
+                    Int64(blk1) * stride_kv_block
+                    + footer_base
+                    + Int64(loc1) * Int64(scale_bytes_per_token),
+                )
+            )
+        s0 = entry0 * Int32(scale_bytes_per_token)
+        s1 = entry1 * Int32(scale_bytes_per_token)
+        st_shared_u32(kv_sc_dst_addr + s0, f00)
+        st_shared_u32(kv_sc_dst_addr + s0 + Int32(4), f01)
+        st_shared_u32(kv_sc_dst_addr + s1, f10)
+        st_shared_u32(kv_sc_dst_addr + s1 + Int32(4), f11)
+
+    token_idx_view[entry0] = idx0
+    token_idx_view[entry1] = idx1
+    cute.arch.fence_acq_rel_cta()
+    if io_lane == Int32(0):
+        cute.arch.mbarrier_arrive(full_mbar_ptr)

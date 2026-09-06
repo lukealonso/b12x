@@ -13,6 +13,7 @@ from ._contracts import (
     run_mixed,
     run_prefill,
 )
+from ._policy import PleConfig, PleQuery
 
 
 def is_supported(device=None) -> bool:
@@ -24,6 +25,8 @@ __all__ = [
     "Caps",
     "Plan",
     "Binding",
+    "PleConfig",
+    "PleQuery",
     "plan",
     "bind",
     "run_decode",

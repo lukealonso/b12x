@@ -42,7 +42,7 @@ def test_qwen38_flash_next_profiles_cover_decode_spec_and_prefill() -> None:
     ]
 
 
-def test_profile_and_phase_filters_intersect_in_corpus_order() -> None:
+def test_profile_and_phase_filters_preserve_declared_order() -> None:
     selected = _select_profiles(
         ("prefill-t512", "decode-t1", "prefill-t128"),
         ("decode", "prefill"),
@@ -93,7 +93,7 @@ def test_cli_filters_profiles_without_requiring_cuda() -> None:
     assert _profile_seed(17, args.selected_profiles[0]) == 17 + 4 * 10_007
 
 
-def test_default_cli_selects_full_corpus_and_both_timing_modes() -> None:
+def test_default_cli_selects_all_profiles_and_both_timing_modes() -> None:
     args = _parse_args([])
     assert args.selected_profiles == PROFILES
     assert args.warmup > 0
@@ -123,13 +123,11 @@ def test_cute_projection_contract_accepts_every_positive_live_count() -> None:
             tokens=tokens,
             streams=4,
             hidden_size=2560,
-            compute_capability=(12, 0),
         )
     assert projection_capacity_rows(
         max_tokens=4096,
         streams=4,
         hidden_size=2560,
-        compute_capability=(12, 0),
     ) == (4096, 16384)
 
 
@@ -151,7 +149,6 @@ def test_qwen_projection_pads_each_planner_capacity(
         max_tokens=capacity,
         streams=4,
         hidden_size=2560,
-        compute_capability=(12, 0),
     ) == expected_rows
 
 
@@ -162,7 +159,7 @@ def test_qwen_projection_pads_each_planner_capacity(
         (4, 2048),
     ],
 )
-def test_unqualified_projection_geometries_are_rejected(
+def test_non_qwen_projection_geometries_are_rejected(
     streams: int,
     hidden_size: int,
 ) -> None:
@@ -171,22 +168,19 @@ def test_unqualified_projection_geometries_are_rejected(
             max_tokens=17,
             streams=streams,
             hidden_size=hidden_size,
-            compute_capability=(12, 0),
         )
 
 
-def test_qwen_projection_does_not_gate_compute_capability() -> None:
+def test_qwen_projection_accepts_positive_capacity() -> None:
     assert supports_prefill(
         tokens=17,
         streams=4,
         hidden_size=2560,
-        compute_capability=(12, 1),
     )
     assert projection_capacity_rows(
         max_tokens=32,
         streams=4,
         hidden_size=2560,
-        compute_capability=(12, 1),
     ) == (32, 128)
 
 

@@ -1,4 +1,4 @@
-"""Portable Triton stages for QSA decode selection and state mutation."""
+"""Auxiliary Triton stages for the QSA selection and state transaction."""
 
 from __future__ import annotations
 
@@ -18,11 +18,11 @@ def _round_fp32_to_bf16(value):
     return rounded_bits.to(tl.float32, bitcast=True)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["rows"])
 def _validate_packed_boundaries_kernel(
     query_start_loc,
     request_errors,
-    ROWS: tl.constexpr,
+    rows,
     MAX_BATCH: tl.constexpr,
     BLOCK_BATCH: tl.constexpr,
 ):
@@ -31,12 +31,12 @@ def _validate_packed_boundaries_kernel(
     starts = tl.load(
         query_start_loc + requests,
         mask=request_mask,
-        other=ROWS,
+        other=rows,
     ).to(tl.int32)
     ends = tl.load(
         query_start_loc + requests + 1,
         mask=request_mask,
-        other=ROWS,
+        other=rows,
     ).to(tl.int32)
     deltas = ends - starts
     active = request_mask & (deltas > 0)
@@ -47,7 +47,7 @@ def _validate_packed_boundaries_kernel(
     invalid = (
         (initial != 0)
         | (terminal < 0)
-        | (terminal > ROWS)
+        | (terminal > rows)
         | (tl.sum((request_mask & (deltas < 0)).to(tl.int32), axis=0) != 0)
         | (tl.sum((request_mask & ~dense_prefix).to(tl.int32), axis=0) != 0)
     )
@@ -56,24 +56,18 @@ def _validate_packed_boundaries_kernel(
 
 @triton.jit
 def _validate_packed_requests_kernel(
-    request_ids,
-    query_positions,
-    rope_positions,
     sequence_lengths,
     query_start_loc,
     num_accepted_tokens,
+    is_prefilling,
     raw_state_slot_ids,
     raw_interval_start_positions,
     request_errors,
-    rope_position_row_stride,
-    rope_position_axis_stride,
     raw_state_slot_stride,
     raw_interval_start_stride,
     MAX_BATCH: tl.constexpr,
     MAX_SEQ_LEN: tl.constexpr,
     MAX_SPECULATIVE: tl.constexpr,
-    ROPE_POSITION_ROWS: tl.constexpr,
-    POSITION_AXES: tl.constexpr,
     MAX_RAW_STATE_SLOTS: tl.constexpr,
     BLOCK_BATCH: tl.constexpr,
 ):
@@ -84,11 +78,18 @@ def _validate_packed_requests_kernel(
     query_length = end - start
     active = (global_error == 0) & (query_length > 0)
     error = global_error
-    error = error | tl.where(active & (query_length > MAX_SPECULATIVE + 1), 2, 0)
 
     accepted = tl.load(num_accepted_tokens + request, mask=active, other=0).to(tl.int32)
+    prefill = tl.load(is_prefilling + request, mask=active, other=0).to(tl.int1)
     error = error | tl.where(
-        active & ((accepted < 1) | (accepted > MAX_SPECULATIVE + 1)), 4, 0
+        active
+        & (
+            (accepted < 1)
+            | (accepted > MAX_SPECULATIVE + 1)
+            | (prefill & (accepted != 1))
+        ),
+        4,
+        0,
     )
     sequence_length = tl.load(sequence_lengths + request, mask=active, other=0).to(
         tl.int64
@@ -159,56 +160,22 @@ def _validate_packed_requests_kernel(
     )
     error = error | tl.where(active & (duplicate_slot | invalid_slot_map), 32, 0)
 
-    axes = tl.arange(0, 4)
-    axis_mask = axes < POSITION_AXES
-    for offset in tl.static_range(0, MAX_SPECULATIVE + 1):
-        row_live = active & (offset < query_length)
-        row = start + offset
-        observed_request = tl.load(request_ids + row, mask=row_live, other=-2).to(
-            tl.int64
-        )
-        observed_position = tl.load(query_positions + row, mask=row_live, other=-2).to(
-            tl.int64
-        )
-        error = error | tl.where(
-            row_live
-            & (
-                (observed_request != request)
-                | (observed_position != first_position + offset)
-            ),
-            32,
-            0,
-        )
-        observed_rope = tl.load(
-            rope_positions
-            + row * rope_position_row_stride
-            + axes * rope_position_axis_stride,
-            mask=row_live & axis_mask,
-            other=-1,
-        ).to(tl.int64)
-        invalid_rope = tl.sum(
-            (
-                row_live
-                & axis_mask
-                & ((observed_rope < 0) | (observed_rope >= ROPE_POSITION_ROWS))
-            ).to(tl.int32),
-            axis=0,
-        )
-        error = error | tl.where(invalid_rope != 0, 64, 0)
     tl.store(request_errors + request, error)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["rows", "rope_position_rows"])
 def _materialize_packed_row_errors_kernel(
     request_ids,
     query_positions,
     rope_positions,
+    sequence_lengths,
     query_start_loc,
     request_errors,
     state_errors,
     rope_position_row_stride,
     rope_position_axis_stride,
-    ROWS: tl.constexpr,
+    rows,
+    rope_position_rows,
     MAX_BATCH: tl.constexpr,
     POSITION_AXES: tl.constexpr,
 ):
@@ -222,9 +189,14 @@ def _materialize_packed_row_errors_kernel(
     end = tl.load(query_start_loc + request + 1, mask=valid_request, other=0).to(
         tl.int32
     )
+    sequence_length = tl.load(
+        sequence_lengths + request, mask=valid_request, other=0
+    ).to(tl.int64)
+    expected_position = sequence_length - (end - row)
     error = tl.load(request_errors + MAX_BATCH).to(tl.int32)
     error = error | tl.where(live & ~valid_request, 32, 0)
     error = error | tl.where(valid_request & ((row < start) | (row >= end)), 32, 0)
+    error = error | tl.where(valid_request & (position != expected_position), 32, 0)
     error = error | tl.load(request_errors + request, mask=valid_request, other=0).to(
         tl.int32
     )
@@ -241,6 +213,22 @@ def _materialize_packed_row_errors_kernel(
     invalid_padding_rope = tl.sum(
         ((~live) & axis_mask & (padding_rope != -1)).to(tl.int32), axis=0
     )
+    live_rope = tl.load(
+        rope_positions
+        + row * rope_position_row_stride
+        + axes * rope_position_axis_stride,
+        mask=live & axis_mask,
+        other=-1,
+    ).to(tl.int64)
+    invalid_live_rope = tl.sum(
+        (
+            live
+            & axis_mask
+            & ((live_rope < 0) | (live_rope >= rope_position_rows))
+        ).to(tl.int32),
+        axis=0,
+    )
+    error = error | tl.where(invalid_live_rope != 0, 64, 0)
     error = error | tl.where((~live) & ((request != -1) | (position != -1)), 128, 0)
     error = error | tl.where(invalid_padding_rope != 0, 128, 0)
     tl.store(state_errors + row, error)
@@ -264,7 +252,6 @@ def _validate_page_tables_kernel(
     MAIN_PAGE_SIZE: tl.constexpr,
     COMPRESSED_PAGE_SIZE: tl.constexpr,
     COMPRESS_RATIO: tl.constexpr,
-    ROWS: tl.constexpr,
     MAX_BATCH: tl.constexpr,
     MAX_RAW_STATE_SLOTS: tl.constexpr,
     SHARED_COMPRESSED_RAW_POOL: tl.constexpr,
@@ -833,12 +820,14 @@ def _compress_completed_groups_kernel(
 
 
 @triton.jit
-def _update_raw_ring_kernel(
+def _commit_raw_ring_kernel(
     raw_index_key,
     query_positions,
     rope_positions,
     request_ids,
     query_start_loc,
+    sequence_lengths,
+    is_prefilling,
     raw_state_slot_ids,
     raw_k_ring,
     raw_logical_positions,
@@ -860,10 +849,17 @@ def _update_raw_ring_kernel(
     MAX_RAW_STATE_SLOTS: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
-    row = tl.program_id(0)
-    status = tl.load(state_errors + row)
-    request = tl.load(request_ids + row).to(tl.int64)
-    real_request = (status == 0) & (request >= 0)
+    request = tl.program_id(0)
+    suffix_offset = tl.program_id(1)
+    request_start = tl.load(query_start_loc + request).to(tl.int64)
+    request_end = tl.load(query_start_loc + request + 1).to(tl.int64)
+    query_length = request_end - request_start
+    suffix_length = tl.minimum(query_length, RING_CAPACITY)
+    row = request_end - suffix_length + suffix_offset
+    active = suffix_offset < suffix_length
+    status = tl.load(state_errors + request_start, mask=active, other=1)
+    observed_request = tl.load(request_ids + row, mask=active, other=-1).to(tl.int64)
+    real_request = active & (status == 0) & (observed_request == request)
     state_slot = tl.load(
         raw_state_slot_ids + request * raw_state_slot_stride,
         mask=real_request,
@@ -899,14 +895,16 @@ def _update_raw_ring_kernel(
             state_slot * raw_rope_slot_stride + ring_slot * raw_rope_ring_stride
         ).to(tl.int64)
         tl.store(raw_rope_positions + rope_base + axes, rope, mask=axis_mask)
-        request_start = tl.load(query_start_loc + request).to(tl.int64)
-        if row == request_start:
+        if suffix_offset == 0:
             interval_start_offset = (state_slot * raw_interval_start_stride).to(
                 tl.int64
             )
+            prefill = tl.load(is_prefilling + request).to(tl.int1)
+            sequence_length = tl.load(sequence_lengths + request).to(tl.int64)
+            anchor = tl.where(prefill, sequence_length - 1, position)
             tl.store(
                 raw_interval_start_positions + interval_start_offset,
-                position,
+                anchor,
             )
     elif real_request:
         tl.atomic_or(state_errors + row, 32)
@@ -1332,7 +1330,7 @@ def _mrope_sections(caps) -> tuple[int, int]:
     return int(caps.mrope_sections[0]), int(caps.mrope_sections[1])
 
 
-def launch_validate_decode_rows(
+def launch_validate_rows(
     *,
     request_ids: torch.Tensor,
     query_positions: torch.Tensor,
@@ -1340,6 +1338,7 @@ def launch_validate_decode_rows(
     sequence_lengths: torch.Tensor,
     query_start_loc: torch.Tensor,
     num_accepted_tokens: torch.Tensor,
+    is_prefilling: torch.Tensor,
     raw_state_slot_ids: torch.Tensor,
     raw_interval_start_positions: torch.Tensor,
     request_errors: torch.Tensor,
@@ -1352,30 +1351,24 @@ def launch_validate_decode_rows(
     _validate_packed_boundaries_kernel[(1,)](
         query_start_loc,
         request_errors,
-        ROWS=rows,
+        rows,
         MAX_BATCH=int(caps.max_batch),
         BLOCK_BATCH=block_batch,
         num_warps=1,
     )
     _validate_packed_requests_kernel[(int(caps.max_batch),)](
-        request_ids,
-        query_positions,
-        rope_positions,
         sequence_lengths,
         query_start_loc,
         num_accepted_tokens,
+        is_prefilling,
         raw_state_slot_ids,
         raw_interval_start_positions,
         request_errors,
-        int(rope_positions.stride(0)),
-        int(rope_positions.stride(1)),
         int(raw_state_slot_ids.stride(0)),
         int(raw_interval_start_positions.stride(0)),
         MAX_BATCH=int(caps.max_batch),
         MAX_SEQ_LEN=int(caps.max_seq_len),
         MAX_SPECULATIVE=int(caps.max_speculative_tokens),
-        ROPE_POSITION_ROWS=int(rope_position_rows),
-        POSITION_AXES=int(caps.position_axes),
         MAX_RAW_STATE_SLOTS=int(caps.max_raw_state_slots),
         BLOCK_BATCH=block_batch,
         num_warps=1,
@@ -1384,12 +1377,14 @@ def launch_validate_decode_rows(
         request_ids,
         query_positions,
         rope_positions,
+        sequence_lengths,
         query_start_loc,
         request_errors,
         state_errors,
         int(rope_positions.stride(0)),
         int(rope_positions.stride(1)),
-        ROWS=rows,
+        rows,
+        int(rope_position_rows),
         MAX_BATCH=int(caps.max_batch),
         POSITION_AXES=int(caps.position_axes),
         num_warps=1,
@@ -1431,7 +1426,6 @@ def launch_validate_page_tables(
         MAIN_PAGE_SIZE=int(caps.main_page_size),
         COMPRESSED_PAGE_SIZE=int(caps.compressed_page_size),
         COMPRESS_RATIO=int(caps.compress_ratio),
-        ROWS=rows,
         MAX_BATCH=int(caps.max_batch),
         MAX_RAW_STATE_SLOTS=int(caps.max_raw_state_slots),
         SHARED_COMPRESSED_RAW_POOL=bool(shared_compressed_raw_pool),
@@ -1664,13 +1658,15 @@ def launch_compress_completed_groups(
     )
 
 
-def launch_update_raw_ring(
+def launch_commit_raw_ring(
     *,
     raw_index_key: torch.Tensor,
     query_positions: torch.Tensor,
     rope_positions: torch.Tensor,
     request_ids: torch.Tensor,
     query_start_loc: torch.Tensor,
+    sequence_lengths: torch.Tensor,
+    is_prefilling: torch.Tensor,
     raw_state_slot_ids: torch.Tensor,
     raw_k_ring: torch.Tensor,
     raw_logical_positions: torch.Tensor,
@@ -1679,13 +1675,16 @@ def launch_update_raw_ring(
     state_errors: torch.Tensor,
     caps,
 ) -> None:
-    rows = int(raw_index_key.shape[0])
-    _update_raw_ring_kernel[(rows,)](
+    _commit_raw_ring_kernel[
+        (int(caps.max_batch), int(caps.raw_ring_capacity))
+    ](
         raw_index_key,
         query_positions,
         rope_positions,
         request_ids,
         query_start_loc,
+        sequence_lengths,
+        is_prefilling,
         raw_state_slot_ids,
         raw_k_ring,
         raw_logical_positions,
@@ -1787,8 +1786,8 @@ def launch_topk_groups(
     topk_group_ids: torch.Tensor,
     group_budget: int,
 ) -> None:
-    # This is the existing exact single-row radix kernel, not the cooperative
-    # multi-CTA persistent path that is forbidden on SM120.
+    # This is the exact single-row radix kernel, not the cooperative multi-CTA
+    # persistent path.
     from ..dsa_indexer.tiled_topk import run_row_topk
 
     run_row_topk(
@@ -1939,14 +1938,14 @@ def launch_poison_failed_rows(
 
 
 __all__ = [
-    "launch_validate_decode_rows",
+    "launch_validate_rows",
     "launch_validate_page_tables",
     "launch_validate_shared_pool_ownership",
     "launch_prepare_index_query",
     "launch_validate_completed_groups",
     "launch_propagate_request_errors",
     "launch_compress_completed_groups",
-    "launch_update_raw_ring",
+    "launch_commit_raw_ring",
     "launch_score_representatives",
     "launch_stage_topk_carry",
     "launch_topk_groups",

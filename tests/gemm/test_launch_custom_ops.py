@@ -3,6 +3,46 @@ from __future__ import annotations
 import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
 
+from b12x.norm.mhc._policy import MhcConfig
+
+
+def test_mhc_projection_cache_key_uses_planned_geometry_not_live_rows() -> None:
+    import b12x.norm.mhc._kernels as residual_kernels
+
+    config = MhcConfig(
+        backend="tf32_tma",
+        projection_tile_m=64,
+        projection_tile_n=24,
+        projection_tile_k=64,
+        projection_num_stages=2,
+        projection_num_m_warps=4,
+        projection_num_n_warps=1,
+        projection_k_splits=8,
+    )
+    geometry = (
+        4_096,
+        64,
+        config.projection_tile_m,
+        config.projection_tile_n,
+        config.projection_tile_k,
+        config.projection_num_stages,
+        config.projection_num_m_warps,
+        config.projection_num_n_warps,
+        config.projection_k_splits,
+    )
+
+    assert residual_kernels._prefill_tf32_project_kernel(
+        *geometry
+    ) is residual_kernels._prefill_tf32_project_kernel(*geometry)
+    assert {
+        residual_kernels.mhc_prefill_tf32_project_splits(
+            tokens=tokens,
+            hidden_size=4_096,
+            config=config,
+        )
+        for tokens in (2_304, 2_511, 3_071)
+    } == {8}
+
 
 def test_mhc_decode_split_n_environment_override(monkeypatch) -> None:
     import b12x.norm.mhc._kernels as residual_kernels
@@ -222,6 +262,18 @@ def test_mhc_launch_ops_have_fake_dispatch() -> None:
             False,
             1,
             0,
+        )
+        torch.ops.b12x.mhc_prefill_tf32_project_launch(
+            torch.empty((2, 4, 4096), dtype=torch.bfloat16),
+            torch.empty((24, 16384), dtype=torch.float32),
+            partials,
+            64,
+            24,
+            64,
+            2,
+            4,
+            1,
+            8,
         )
 
 

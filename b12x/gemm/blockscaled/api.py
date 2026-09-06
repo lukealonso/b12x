@@ -12,6 +12,7 @@ from ._linear import (
     prewarm,
 )
 from . import META
+from ._a16 import NVFP4LinearWeight, w4a16, w8a16, workspace_size
 
 
 def is_supported(device=None) -> bool:
@@ -101,6 +102,7 @@ def mm_block_fp8(
 
 __all__ = [
     "Weight",
+    "NVFP4LinearWeight",
     "is_supported",
     "mm",
     "mm_block_fp8",
@@ -108,4 +110,7 @@ __all__ = [
     "mm_nvfp4",
     "pack_weight",
     "prewarm",
+    "w4a16",
+    "w8a16",
+    "workspace_size",
 ]

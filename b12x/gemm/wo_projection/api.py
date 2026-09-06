@@ -6,6 +6,7 @@ from ..._lib.gating import default_is_supported
 from .._shared.wo_mxfp8 import (
     MXFP8Rows,
 )
+from ._policy import WoProjectionConfig, WoProjectionQuery
 from .._shared.wo_mxfp8 import (
     WOProjectionBinding as Binding,
 )
@@ -71,6 +72,8 @@ __all__ = [
     "InvRopeBinding",
     "Weights",
     "MXFP8Rows",
+    "WoProjectionConfig",
+    "WoProjectionQuery",
     "plan",
     "bind",
     "bind_inv_rope",

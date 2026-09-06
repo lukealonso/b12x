@@ -4,27 +4,35 @@ from __future__ import annotations
 
 import functools
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import torch
 from cutlass import Int32
 
-from b12x.attention._shared.contiguous.forward import (
-    ContiguousAttentionForwardKernel,
-)
 from b12x._lib.compiler import (
     KernelCompileSpec,
+)
+from b12x._lib.compiler import (
     compile as b12x_compile,
 )
-from b12x._lib.utils import current_cuda_stream, make_ptr
 from b12x._lib.scratch import (
     ScratchBufferSpec,
     scratch_buffer_spec,
     scratch_tensor,
 )
-
+from b12x._lib.utils import current_cuda_stream, make_ptr
+from b12x.attention._shared.contiguous.forward import (
+    ContiguousAttentionForwardKernel,
+)
+from b12x.attention.varlen._policy import (
+    VARLEN_ATTENTION_POLICY,
+    VarlenAttentionConfig,
+    VarlenAttentionQuery,
+)
+from b12x.policy import NO_POLICY_OVERRIDE, PolicyContext, get_auto_policy
 
 _ARENA_ALIGN_BYTES = 1024
 
@@ -168,18 +176,6 @@ def _varlen_attention_logical_dims(
         qhead_per_kvhead,
         logical_q_rows_static,
         logical_total_q_rows,
-    )
-
-
-def _select_tile_shape(head_dim: int, *, causal: bool) -> tuple[int, int]:
-    if head_dim <= 64:
-        return (128, 128)
-    if head_dim <= 128:
-        return (128, 64)
-    if head_dim == 256:
-        return (64, 32 if causal else 48)
-    raise ValueError(
-        f"unsupported head_dim={head_dim} for the current b12x attention path"
     )
 
 
@@ -428,6 +424,11 @@ class AttentionPlan:
     key: AttentionPlanKey
     compiled: object = field(repr=False, compare=False)
     cutlass_dtype: type[cutlass.Numeric] = field(repr=False, compare=False)
+    policy_resolution: object | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
 
     def __getattr__(self, name: str):
         return getattr(self.key, name)
@@ -444,6 +445,11 @@ class VarlenAttentionPlan:
     key: VarlenAttentionPlanKey
     compiled: object = field(repr=False, compare=False)
     cutlass_dtype: type[cutlass.Numeric] = field(repr=False, compare=False)
+    policy_resolution: object | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
 
     def __getattr__(self, name: str):
         return getattr(self.key, name)
@@ -2091,6 +2097,7 @@ def create_attention_plan(
     window_size: int | tuple[int, int] | None = None,
     attention_sink_bias: torch.Tensor | None = None,
     tile_shape: tuple[int, int] | None = None,
+    policy: PolicyContext | None = None,
 ) -> AttentionPlan:
     """Create one exact contiguous attention launch plan."""
     q_shape, k_shape, v_shape, device, dtype = _validate_forward_inputs(q, k, v)
@@ -2099,21 +2106,54 @@ def create_attention_plan(
         q_shape=q_shape,
         device=device,
     )
-    _, _, _, head_dim = _seq_dims(q_shape)
-    tile_m, tile_n = tile_shape or _select_tile_shape(head_dim, causal=causal)
+    batch_dims, seqlen_q, q_heads, head_dim = _seq_dims(q_shape)
+    _, seqlen_k, kv_heads, _ = _seq_dims(k_shape)
+    policy = policy or get_auto_policy(device)
+    if not isinstance(policy, PolicyContext):
+        raise TypeError("policy must be a PolicyContext")
+    policy.require_device(device)
+    override = NO_POLICY_OVERRIDE
+    if tile_shape is not None:
+        override = VarlenAttentionConfig(
+            tile_m=int(tile_shape[0]),
+            tile_n=int(tile_shape[1]),
+        )
+    resolution = policy.resolve(
+        VARLEN_ATTENTION_POLICY,
+        VarlenAttentionQuery(
+            variant="batched",
+            dtype=str(dtype).removeprefix("torch."),
+            causal=causal,
+            batch_size=batch_dims[0] if batch_dims else 1,
+            q_heads=q_heads,
+            kv_heads=kv_heads,
+            q_head_dim=head_dim,
+            v_head_dim=v_shape[-1],
+            query_rows=seqlen_q * (batch_dims[0] if batch_dims else 1),
+            kv_rows=seqlen_k * (batch_dims[0] if batch_dims else 1),
+            max_seqlen_q=seqlen_q,
+            max_seqlen_k=seqlen_k,
+        ),
+        override=override,
+    )
+    tile_m = resolution.config.tile_m
+    tile_n = resolution.config.tile_n
     window_size_left, window_size_right = _normalize_window_size(window_size)
-    return _get_attention_plan(
-        q_shape,
-        k_shape,
-        v_shape,
-        _cuda_device_index(device),
-        dtype,
-        causal,
-        window_size_left,
-        window_size_right,
-        attention_sink_bias is not None,
-        tile_m,
-        tile_n,
+    return replace(
+        _get_attention_plan(
+            q_shape,
+            k_shape,
+            v_shape,
+            _cuda_device_index(device),
+            dtype,
+            causal,
+            window_size_left,
+            window_size_right,
+            attention_sink_bias is not None,
+            tile_m,
+            tile_n,
+        ),
+        policy_resolution=resolution,
     )
 
 
@@ -2130,6 +2170,7 @@ def create_varlen_attention_plan(
     window_size: int | tuple[int, int] | None = None,
     attention_sink_bias: torch.Tensor | None = None,
     tile_shape: tuple[int, int] | None = None,
+    policy: PolicyContext | None = None,
 ) -> VarlenAttentionPlan:
     """Create one exact packed varlen contiguous attention launch plan."""
     if cu_seqlens_k is None:
@@ -2158,25 +2199,58 @@ def create_varlen_attention_plan(
         max_seqlen_k,
         name="max_seqlen_k",
     )
-    _, _, head_dim = q_shape
-    tile_m, tile_n = tile_shape or _select_tile_shape(head_dim, causal=causal)
+    total_q, q_heads, head_dim = q_shape
+    total_k, kv_heads, _ = k_shape
+    policy = policy or get_auto_policy(device)
+    if not isinstance(policy, PolicyContext):
+        raise TypeError("policy must be a PolicyContext")
+    policy.require_device(device)
+    override = NO_POLICY_OVERRIDE
+    if tile_shape is not None:
+        override = VarlenAttentionConfig(
+            tile_m=int(tile_shape[0]),
+            tile_n=int(tile_shape[1]),
+        )
+    resolution = policy.resolve(
+        VARLEN_ATTENTION_POLICY,
+        VarlenAttentionQuery(
+            variant="varlen",
+            dtype=str(dtype).removeprefix("torch."),
+            causal=causal,
+            batch_size=cu_seqlens_q_shape[0] - 1,
+            q_heads=q_heads,
+            kv_heads=kv_heads,
+            q_head_dim=head_dim,
+            v_head_dim=v_shape[-1],
+            query_rows=total_q,
+            kv_rows=total_k,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+        ),
+        override=override,
+    )
+    tile_m = resolution.config.tile_m
+    tile_n = resolution.config.tile_n
     window_size_left, window_size_right = _normalize_window_size(window_size)
-    return _get_varlen_attention_plan(
-        q_shape,
-        k_shape,
-        v_shape,
-        cu_seqlens_q_shape,
-        cu_seqlens_k_shape,
-        _cuda_device_index(device),
-        dtype,
-        causal,
-        window_size_left,
-        window_size_right,
-        attention_sink_bias is not None,
-        max_seqlen_q,
-        max_seqlen_k,
-        tile_m,
-        tile_n,
+    return replace(
+        _get_varlen_attention_plan(
+            q_shape,
+            k_shape,
+            v_shape,
+            cu_seqlens_q_shape,
+            cu_seqlens_k_shape,
+            _cuda_device_index(device),
+            dtype,
+            causal,
+            window_size_left,
+            window_size_right,
+            attention_sink_bias is not None,
+            max_seqlen_q,
+            max_seqlen_k,
+            tile_m,
+            tile_n,
+        ),
+        policy_resolution=resolution,
     )
 
 

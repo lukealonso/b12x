@@ -255,7 +255,6 @@ def _launch_mtp_feedback(
         max_tokens=max_tokens,
         streams=streams,
         hidden_size=hidden_size,
-        device=token_embedding.device,
     )
     if (token_projection_rows, state_projection_rows) != (
         expected_token_rows,

@@ -35,6 +35,8 @@ META = OpMeta(
     entry_points=(
         "Caps",
         "Budget",
+        "DenseMlaConfig",
+        "DenseMlaQuery",
         "Plan",
         "Binding",
         "Scratch",
@@ -72,6 +74,8 @@ if TYPE_CHECKING:
         Binding,
         Budget,
         Caps,
+        DenseMlaConfig,
+        DenseMlaQuery,
         Plan,
         Scratch,
         bind,

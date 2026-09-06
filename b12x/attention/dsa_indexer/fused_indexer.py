@@ -46,15 +46,15 @@ from b12x._lib.scratch import (
 from b12x._lib.utils import current_cuda_stream
 
 # Kept in lock-step with the source kernels we fuse.
+from b12x.attention.dsa_indexer._policy import (
+    FUSED_MERGE_AUTO,
+    FUSED_MERGE_CHOICES,
+    FUSED_MERGE_COOPERATIVE,
+    FUSED_MERGE_SERIAL,
+)
 from b12x.attention.dsa_indexer.persistent_topk import (
     _RADIX,
     _RADIX_THRESHOLD,
-    _STATE_ARRIVAL_COUNTER,
-    _STATE_OUTPUT_COUNTER,
-    _STATE_WORDS as _COOP_STATE_WORDS,
-    _global_state_ptr,
-    _group_barrier,
-    _state_offset,
 )
 from b12x.attention.dsa_indexer.tiled_topk import (
     _SCAN_UNROLL,
@@ -81,7 +81,6 @@ from b12x.attention.dsa_indexer.kernel import (
     _WARP_THREADS,
     _compute_mxfp8_tile_partials,
     _compute_mxfp8_tile_partials_qldm,
-    _stage_q_permuted,
     _load_index_k_page_scalar,
     _num_q_head_tiles,
     _permuted_offset_128b,
@@ -91,11 +90,17 @@ from b12x.attention.dsa_indexer.kernel import (
 )
 from b12x._lib.intrinsics import (
     atomic_add_global_i32,
+    atomic_add_global_u64,
     fmax_f32,
     get_ptr_as_int64,
+    ld_global_acquire_i32,
+    ld_global_cg_v4_u32,
     ld_global_nc_f32,
     ld_global_nc_u32,
     ld_global_v4_u32,
+    red_add_global_i32,
+    red_add_global_release_i32,
+    spin_wait_global_ge_i32,
     ldmatrix_m8n8x4_b16,
     ld_shared_v4_u32,
     mxfp8_mma_m16n8k32_f32_e4m3,
@@ -316,20 +321,387 @@ def _resolve_fused_launch_config(
 _STATE_WORDS_PER_GROUP = 4  # arrival_counter, output_counter, relay_phase, pad
 
 # Cross-CTA merge auto-switch (ctas_per_group>1): a group whose live row K length
-# seq_len <= this uses the serial last-CTA reduction (no grid barriers); larger
-# rows use the cooperative grid-barrier radix. Measured crossover ~32-64k (sm120,
-# rows=1, topk=512). Both arms are exact, so this only trades perf, not results.
+# seq_len <= merge_threshold uses the serial last-CTA reduction (no grid
+# barriers); larger rows use the cooperative grid-barrier radix. Both arms are
+# exact, so the threshold only trades perf. Planned launches resolve the
+# threshold through _resolve_default_merge_threshold; this value is the
+# constructor default for direct kernel constructions.
 _LAST_CTA_MERGE_MAX = 49152
 # Sentinel "never coop" threshold: larger than any live seq_len, so the per-group
-# auto-switch always takes the serial last-CTA arm (used when ctas_per_group*topk is
-# too small for coop's grid barriers to ever pay off -- see run_fused_paged_indexer).
+# auto-switch always takes the serial last-CTA arm (single-CTA groups, and
+# groups that cannot be co-resident).
 _FORCE_LAST_CTA = 1 << 30
+# K stages of the paged score pipeline (one 64-token page each).
+_K_STAGES = 3
 
-# The fused cooperative merge uses persistent_topk's 772-word state layout.
-# Histograms occupy [0, 768); the fused path uses the two otherwise-generic
-# scalar slots as its candidate-total and end-of-launch cleanup counters.
-_FUSED_STATE_TOTAL = 3 * _RADIX
-_FUSED_STATE_CLEANUP = _FUSED_STATE_TOTAL + 1
+# Per-group cross-CTA merge state (int32 words): the cooperative radix
+# selects the pivot over three digits of the order-preserving 32-bit key
+# (12, 12, and 8 bits), each round accumulating the group's digit histogram
+# into its own buffer, followed by the scalars both merge arms share. The
+# arrival counter backs the grid barrier, the output counter reserves winner
+# slots (and the pack-slab offset on the last-CTA arm), the tie counter
+# reserves slots at the pivot, and the total/cleanup words carry the group's
+# candidate count and its end-of-launch departure count.
+# A 12-bit round publishes both a 256-bin coarse histogram (top 8 bits of
+# the digit) and a 4096-bin fine histogram, so the pivot scan reads the
+# coarse buffer and then only the 16 fine bins under the coarse pivot.
+_FUSED_WIDE_RADIX = 4096
+_FUSED_COARSE0 = 0
+_FUSED_FINE0 = _FUSED_COARSE0 + _RADIX
+_FUSED_COARSE1 = _FUSED_FINE0 + _FUSED_WIDE_RADIX
+_FUSED_FINE1 = _FUSED_COARSE1 + _RADIX
+_FUSED_COARSE2 = _FUSED_FINE1 + _FUSED_WIDE_RADIX
+_FUSED_STATE_ARRIVAL = _FUSED_COARSE2 + _RADIX
+_FUSED_STATE_TOTAL = _FUSED_STATE_ARRIVAL + 1
+# Output (winner) and tie counters are adjacent and 8-byte aligned so one
+# 64-bit fetch-add reserves both slot ranges.
+_FUSED_STATE_OUTPUT = _FUSED_STATE_ARRIVAL + 2
+_FUSED_STATE_TIES = _FUSED_STATE_ARRIVAL + 3
+_FUSED_STATE_CLEANUP = _FUSED_STATE_ARRIVAL + 4
+_COOP_STATE_WORDS = _FUSED_STATE_ARRIVAL + 8
+assert (_FUSED_STATE_OUTPUT % 2 == 0) and (_COOP_STATE_WORDS % 2 == 0)
+assert _FUSED_WIDE_RADIX == 4 * _RADIX_THREADS
+
+
+@cute.jit
+def _fused_state_offset(group_id: Int32, word: Int32) -> Int32:
+    return group_id * Int32(_COOP_STATE_WORDS) + word
+
+
+@cute.jit
+def _fused_state_ptr(state: cute.Tensor, group_id: Int32, word: Int32):
+    return get_ptr_as_int64(state, _fused_state_offset(group_id, word))
+
+
+@cute.jit
+def _fused_group_barrier(
+    state: cute.Tensor, group_id: Int32, phase: Int32, ctas_per_group: Int32, tx: Int32
+) -> Int32:
+    """Grid barrier over the group's CTAs on the arrival counter; returns the next phase."""
+    arrival_ptr = _fused_state_ptr(state, group_id, Int32(_FUSED_STATE_ARRIVAL))
+    if tx == Int32(0):
+        red_add_global_release_i32(arrival_ptr, Int32(1))
+        spin_wait_global_ge_i32(arrival_ptr, (phase + Int32(1)) * ctas_per_group)
+    cute.arch.sync_threads()
+    return phase + Int32(1)
+
+
+@cute.jit
+def _page_id_or_invalid(
+    real_page_table: cute.Tensor, q_idx: Int32, col: Int32, page_end: Int32
+) -> Int32:
+    """Page id of page-table column ``col`` of row ``q_idx``, or -1 past the slice."""
+    pid = Int32(-1)
+    if col < page_end:
+        if col < Int32(real_page_table.shape[1]):
+            pid = Int32(real_page_table[q_idx, col])
+    return pid
+
+
+@cute.jit
+def _k_stage_addr(stage: Int32, stage0: Int32, stage1: Int32, stage2: Int32) -> Int32:
+    """Shared-memory base of K ring stage ``stage`` (0, 1, or 2)."""
+    addr = stage0
+    if stage == Int32(1):
+        addr = stage1
+    if stage == Int32(2):
+        addr = stage2
+    return addr
+
+
+@cute.jit
+def _coop_publish_wide(
+    merge_state: cute.Tensor,
+    group_id: Int32,
+    hist_off: cutlass.Constexpr[int],
+    hist_addr: Int32,
+    tx: Int32,
+):
+    """Add this CTA's 4096-bin local histogram (thread ``t`` owns bins
+    ``4t .. 4t+3``) into the group's global buffer and clear it."""
+    c0, c1, c2, c3 = ld_shared_v4_u32(hist_addr + tx * Int32(16))
+    base = _fused_state_ptr(merge_state, group_id, Int32(hist_off) + tx * Int32(4))
+    if c0 != Uint32(0):
+        red_add_global_i32(base, Int32(c0))
+    if c1 != Uint32(0):
+        red_add_global_i32(base + Int64(4), Int32(c1))
+    if c2 != Uint32(0):
+        red_add_global_i32(base + Int64(8), Int32(c2))
+    if c3 != Uint32(0):
+        red_add_global_i32(base + Int64(12), Int32(c3))
+    st_shared_v4_u32(
+        hist_addr + tx * Int32(16), Uint32(0), Uint32(0), Uint32(0), Uint32(0)
+    )
+
+
+@cute.jit
+def _coop_wide_round(
+    merge_state: cute.Tensor,
+    group_id: Int32,
+    coarse_off: cutlass.Constexpr[int],
+    fine_off: cutlass.Constexpr[int],
+    s_c0_values: cute.Tensor,
+    carry_count: Int32,
+    key_mask: Uint32,
+    key_prefix: Uint32,
+    digit_shift: cutlass.Constexpr[int],
+    wide_hist_addr: Int32,
+    coarse_hist_addr: Int32,
+    s_hist0: cute.Tensor,
+    remaining_k: Int32,
+    barrier_phase: Int32,
+    ctas_pg: Int32,
+    tx: Int32,
+    lane: Int32,
+    warp_idx: Int32,
+    s_coop_scalars: cute.Tensor,
+    read_total: cutlass.Constexpr[bool],
+) -> Int32:
+    """One 12-bit cooperative radix round; returns the next barrier phase.
+
+    Every candidate whose key matches ``key_prefix`` under ``key_mask``
+    contributes the 12-bit digit at ``digit_shift`` to the CTA's fine
+    (4096-bin, in the K ring) and coarse (256-bin, in ``s_hist0``) local
+    histograms, both of which must be zero on entry and are left zero. The
+    local histograms are published to the group buffers at ``fine_off`` and
+    ``coarse_off``, the grid barrier is crossed, and warp 0 resolves the
+    pivot into ``s_coop_scalars`` (readable after the trailing CTA barrier).
+    """
+    i = Int32(tx)
+    while i < carry_count:
+        key = _convert_to_uint32(Float32(s_c0_values[i]))
+        if (key & key_mask) == key_prefix:
+            digit = Int32((key >> Uint32(digit_shift)) & Uint32(0xFFF))
+            _smem_red_add(wide_hist_addr, digit, Int32(1))
+            _smem_red_add(coarse_hist_addr, digit >> Int32(4), Int32(1))
+        i += Int32(_RADIX_THREADS)
+    cute.arch.sync_threads()
+    _coop_publish_wide(merge_state, group_id, fine_off, wide_hist_addr, tx)
+    if tx < Int32(_RADIX):
+        c = Int32(s_hist0[tx])
+        if c > Int32(0):
+            red_add_global_i32(
+                _fused_state_ptr(merge_state, group_id, Int32(coarse_off) + tx), c
+            )
+        s_hist0[tx] = Int32(0)
+    phase = _fused_group_barrier(merge_state, group_id, barrier_phase, ctas_pg, tx)
+    if warp_idx == Int32(0):
+        _coop_scan_round12(
+            merge_state,
+            group_id,
+            coarse_off,
+            fine_off,
+            remaining_k,
+            lane,
+            s_coop_scalars,
+            read_total,
+        )
+    cute.arch.sync_threads()
+    return phase
+
+
+@cute.jit
+def _coop_narrow_round(
+    merge_state: cute.Tensor,
+    group_id: Int32,
+    coarse_off: cutlass.Constexpr[int],
+    s_c0_values: cute.Tensor,
+    carry_count: Int32,
+    key_mask: Uint32,
+    key_prefix: Uint32,
+    coarse_hist_addr: Int32,
+    s_hist0: cute.Tensor,
+    remaining_k: Int32,
+    barrier_phase: Int32,
+    ctas_pg: Int32,
+    tx: Int32,
+    lane: Int32,
+    warp_idx: Int32,
+    s_coop_scalars: cute.Tensor,
+) -> Int32:
+    """The final 8-bit cooperative radix round over the low key byte.
+
+    Same contract as :func:`_coop_wide_round` with a 256-bin histogram only.
+    """
+    if tx < Int32(_RADIX):
+        s_hist0[tx] = Int32(0)
+    cute.arch.sync_threads()
+    i = Int32(tx)
+    while i < carry_count:
+        key = _convert_to_uint32(Float32(s_c0_values[i]))
+        if (key & key_mask) == key_prefix:
+            _smem_red_add(coarse_hist_addr, Int32(key & Uint32(0xFF)), Int32(1))
+        i += Int32(_RADIX_THREADS)
+    cute.arch.sync_threads()
+    if tx < Int32(_RADIX):
+        c = Int32(s_hist0[tx])
+        if c > Int32(0):
+            red_add_global_i32(
+                _fused_state_ptr(merge_state, group_id, Int32(coarse_off) + tx), c
+            )
+        s_hist0[tx] = Int32(0)
+    phase = _fused_group_barrier(merge_state, group_id, barrier_phase, ctas_pg, tx)
+    if warp_idx == Int32(0):
+        _coop_scan_round(
+            merge_state, group_id, coarse_off, remaining_k, lane, s_coop_scalars, False
+        )
+    cute.arch.sync_threads()
+    return phase
+
+
+@cute.jit
+def _coop_scan_round12(
+    merge_state: cute.Tensor,
+    group_id: Int32,
+    coarse_off: cutlass.Constexpr[int],
+    fine_off: cutlass.Constexpr[int],
+    remaining_k: Int32,
+    lane: Int32,
+    s_coop_scalars: cute.Tensor,
+    read_total: cutlass.Constexpr[bool],
+):
+    """Warp 0: resolve a 12-bit pivot digit from the coarse and fine histograms.
+
+    The 256-bin coarse histogram (lane ``l`` owns bins ``8l .. 8l+7``) is
+    suffix-scanned for the coarse pivot ``c`` and the count above it; lanes
+    0-3 then read the 16 fine bins under ``c`` and refine. Both are read
+    through L2 so other CTAs' reductions are visible. ``s_coop_scalars``
+    receives the 12-bit pivot bin, the count strictly above it, and the
+    bin's own count; with ``read_total`` it also receives the group's
+    candidate total.
+    """
+    base = _fused_state_ptr(
+        merge_state, group_id, Int32(coarse_off) + lane * Int32(8)
+    )
+    h0, h1, h2, h3 = ld_global_cg_v4_u32(base)
+    h4, h5, h6, h7 = ld_global_cg_v4_u32(base + Int64(16))
+    s7 = Int32(h7)
+    s6 = s7 + Int32(h6)
+    s5 = s6 + Int32(h5)
+    s4 = s5 + Int32(h4)
+    s3 = s4 + Int32(h3)
+    s2 = s3 + Int32(h2)
+    s1 = s2 + Int32(h1)
+    s0 = s1 + Int32(h0)
+    above = s0
+    for d in (1, 2, 4, 8, 16):
+        other = cute.arch.shuffle_sync_down(above, offset=d)
+        if lane + Int32(d) < Int32(_WARP_THREADS):
+            above = above + other
+    above = above - s0
+    suffix = [s0 + above, s1 + above, s2 + above, s3 + above,
+              s4 + above, s5 + above, s6 + above, s7 + above, above]
+    coarse_bin = Int32(-1)
+    coarse_gt = Int32(-1)
+    for j in cutlass.range_constexpr(8):
+        if (suffix[j] >= remaining_k) & (suffix[j + 1] < remaining_k):
+            coarse_bin = lane * Int32(8) + Int32(j)
+            coarse_gt = suffix[j + 1]
+    for d in (16, 8, 4, 2, 1):
+        coarse_bin = _max_i32(
+            coarse_bin, cute.arch.shuffle_sync_bfly(coarse_bin, offset=d)
+        )
+        coarse_gt = _max_i32(
+            coarse_gt, cute.arch.shuffle_sync_bfly(coarse_gt, offset=d)
+        )
+    f0 = Uint32(0)
+    f1 = Uint32(0)
+    f2 = Uint32(0)
+    f3 = Uint32(0)
+    if lane < Int32(4):
+        f0, f1, f2, f3 = ld_global_cg_v4_u32(
+            _fused_state_ptr(
+                merge_state,
+                group_id,
+                Int32(fine_off) + coarse_bin * Int32(16) + lane * Int32(4),
+            )
+        )
+    t3 = Int32(f3)
+    t2 = t3 + Int32(f2)
+    t1 = t2 + Int32(f1)
+    t0 = t1 + Int32(f0)
+    fine_above = t0
+    for d in (1, 2):
+        other = cute.arch.shuffle_sync_down(fine_above, offset=d)
+        if lane + Int32(d) < Int32(4):
+            fine_above = fine_above + other
+    fine_above = fine_above - t0 + coarse_gt
+    fsuffix = [t0 + fine_above, t1 + fine_above, t2 + fine_above, t3 + fine_above, fine_above]
+    if lane < Int32(4):
+        for j in cutlass.range_constexpr(4):
+            if (fsuffix[j] >= remaining_k) & (fsuffix[j + 1] < remaining_k):
+                s_coop_scalars[0] = Uint32(coarse_bin * Int32(16) + lane * Int32(4) + Int32(j))
+                s_coop_scalars[1] = Uint32(fsuffix[j + 1])
+                s_coop_scalars[2] = Uint32(fsuffix[j] - fsuffix[j + 1])
+    if cutlass.const_expr(read_total):
+        if lane == Int32(0):
+            s_coop_scalars[3] = Uint32(
+                ld_global_acquire_i32(
+                    _fused_state_ptr(merge_state, group_id, Int32(_FUSED_STATE_TOTAL))
+                )
+            )
+
+
+@cute.jit
+def _max_i32(a: Int32, b: Int32) -> Int32:
+    r = a
+    if b > a:
+        r = b
+    return r
+
+
+@cute.jit
+def _coop_scan_round(
+    merge_state: cute.Tensor,
+    group_id: Int32,
+    hist_off: cutlass.Constexpr[int],
+    remaining_k: Int32,
+    lane: Int32,
+    s_coop_scalars: cute.Tensor,
+    read_total: cutlass.Constexpr[bool],
+):
+    """Warp 0: suffix-scan a 256-bin group histogram and publish the pivot.
+
+    Lane ``l`` owns bins ``8l .. 8l+7`` of the histogram at word offset
+    ``hist_off``, read through L2 so other CTAs' reductions are visible.
+    ``s_coop_scalars`` receives the pivot bin (the highest bin whose suffix
+    count reaches ``remaining_k``), the count strictly above it, and the
+    bin's own count; with ``read_total`` it also receives the group's
+    candidate total.
+    """
+    base = _fused_state_ptr(
+        merge_state, group_id, Int32(hist_off) + lane * Int32(8)
+    )
+    h0, h1, h2, h3 = ld_global_cg_v4_u32(base)
+    h4, h5, h6, h7 = ld_global_cg_v4_u32(base + Int64(16))
+    s7 = Int32(h7)
+    s6 = s7 + Int32(h6)
+    s5 = s6 + Int32(h5)
+    s4 = s5 + Int32(h4)
+    s3 = s4 + Int32(h3)
+    s2 = s3 + Int32(h2)
+    s1 = s2 + Int32(h1)
+    s0 = s1 + Int32(h0)
+    above = s0
+    for d in (1, 2, 4, 8, 16):
+        other = cute.arch.shuffle_sync_down(above, offset=d)
+        if lane + Int32(d) < Int32(_WARP_THREADS):
+            above = above + other
+    above = above - s0
+    suffix = [s0 + above, s1 + above, s2 + above, s3 + above,
+              s4 + above, s5 + above, s6 + above, s7 + above, above]
+    for j in cutlass.range_constexpr(8):
+        if (suffix[j] >= remaining_k) & (suffix[j + 1] < remaining_k):
+            s_coop_scalars[0] = Uint32(lane * Int32(8) + Int32(j))
+            s_coop_scalars[1] = Uint32(suffix[j + 1])
+            s_coop_scalars[2] = Uint32(suffix[j] - suffix[j + 1])
+    if cutlass.const_expr(read_total):
+        if lane == Int32(0):
+            s_coop_scalars[3] = Uint32(
+                ld_global_acquire_i32(
+                    _fused_state_ptr(merge_state, group_id, Int32(_FUSED_STATE_TOTAL))
+                )
+            )
 
 
 @cute.jit
@@ -596,29 +968,49 @@ def _resolve_default_merge_threshold(
     num_heads: int,
     topk: int,
 ) -> int:
-    # Cross-CTA merge auto-switch, candidate-count model (sm120, graph; refit after
-    # the last-CTA select was unrolled/de-branched to match tiled_topk). The
-    # per-group merge sees min(seq_len, ctas_per_group*topk) candidates -- each CTA
-    # trims its local top-k to topk, so ctas_per_group*topk caps the count. Coop's
-    # grid-barrier radix only amortizes its fixed barrier cost (which GROWS with
-    # ctas_per_group) above a crossover candidate count C; below it the now-fast
-    # serial last-CTA select wins. Measured crossover (rows 1/2 -> ctas_pg 188/94,
-    # topk 512/1024/2048): C ~= 22000 + 117*ctas_per_group - 13*(topk-512). When the
-    # cap ctas_per_group*topk <= C (small ctas_pg, i.e. rows>=4) coop can never reach
-    # the crossover, so force last-CTA. The kernel branches seq_len > merge_threshold;
-    # since cap > C in the coop-reachable case, seq_len > C <=> min(seq,cap) > C.
-    ctas_per_group = max(1, int(ctas_per_group))
-    topk = int(topk)
-    crossover = max(4096, 22000 + 117 * ctas_per_group - 13 * (topk - 512))
-    # The original fit was dominated by the 64-head kernel. After vectorized
-    # query staging, GLM's 32-head/top-k-2048 path still favors the serial
-    # last-CTA reducer through 16k for B2-B5; cooperative merge only wins
-    # beyond that point. This floor is runtime-seqlen dispatch inside a
-    # capture-static kernel variant, and both arms self-reset for replay.
-    if int(num_heads) == 32 and topk == 2048:
-        crossover = max(crossover, 16384)
-    cap = ctas_per_group * topk
-    return crossover if cap > crossover else _FORCE_LAST_CTA
+    """Live-length threshold above which a multi-CTA group merges cooperatively.
+
+    The cooperative arm publishes each radix round's histogram with one grid
+    barrier and places its output without another; measured under graph
+    replay on sm120 (top-k 512 with 64 heads and top-k 2048 with 32 heads,
+    1 to 8 rows, 4k to 64k live tokens) it won or tied the serial last-CTA
+    arm at every point, so every co-resident group merges cooperatively at
+    any live length. Single-CTA groups have no cross-CTA merge.
+    """
+    del num_heads, topk
+    if int(ctas_per_group) <= 1:
+        return _FORCE_LAST_CTA
+    return 0
+
+
+def resolve_fused_merge_threshold(
+    fused_merge: str,
+    *,
+    ctas_per_group: int,
+    num_heads: int,
+    topk: int,
+) -> int:
+    """Live-length threshold implementing the policy's ``fused_merge`` choice.
+
+    A group whose live row length exceeds the threshold merges cooperatively;
+    otherwise it takes the serial last-CTA arm. Single-CTA groups have no
+    cross-CTA merge. ``auto`` applies the planner default
+    (:func:`_resolve_default_merge_threshold`).
+    """
+    if fused_merge not in FUSED_MERGE_CHOICES:
+        raise ValueError(
+            f"unsupported fused_merge {fused_merge!r}; expected one of "
+            f"{FUSED_MERGE_CHOICES}"
+        )
+    if int(ctas_per_group) <= 1 or fused_merge == FUSED_MERGE_SERIAL:
+        return _FORCE_LAST_CTA
+    if fused_merge == FUSED_MERGE_COOPERATIVE:
+        return 0
+    return _resolve_default_merge_threshold(
+        ctas_per_group=int(ctas_per_group),
+        num_heads=int(num_heads),
+        topk=int(topk),
+    )
 
 
 def fused_indexer_decode_warmup_rows(
@@ -627,6 +1019,7 @@ def fused_indexer_decode_warmup_rows(
     num_heads: int,
     max_pages: int,
     device: torch.device,
+    fused_merge: str = FUSED_MERGE_AUTO,
 ) -> tuple[int, ...]:
     """Return one safe launch row count per compiled decode policy.
 
@@ -634,6 +1027,7 @@ def fused_indexer_decode_warmup_rows(
     threshold by row count. Each returned row count selects a distinct policy
     while preserving the planner's one-machine-wave launch bound. Callers can
     launch these shapes before graph capture to populate every runtime variant.
+    ``fused_merge`` must match the policy choice the serving plan applies.
     """
     props = torch.cuda.get_device_properties(device)
     compute_capability = (
@@ -664,7 +1058,8 @@ def fused_indexer_decode_warmup_rows(
             max_pages=int(max_pages),
             device=device,
         )
-        merge_threshold = _resolve_default_merge_threshold(
+        merge_threshold = resolve_fused_merge_threshold(
+            fused_merge,
             ctas_per_group=ctas_per_group,
             num_heads=int(num_heads),
             topk=int(topk),
@@ -1100,13 +1495,27 @@ def _fused_radix_select(
 
 
 class DSAFusedIndexerKernel:
-    """paged fused score+top-k, v1: single-CTA-per-row, scalar K-load, 1024 threads.
+    """Fused DSA indexer: score a query row's K slice and select its top-k.
 
-    Score phase: warps 0-3 (tx < _PAGED_THREADS_PER_CTA) reuse the paged scorer's
-    page-load + mxfp8 MMA (m=heads) into the SMEM logit staging; barriers are
-    unconditional so all 1024 threads stay in lock-step. Fold phase: all 1024
-    threads run the tiled_topk radix over {staging ∪ carry0} → carry1, then copy
-    carry1 → carry0 (running top-k). After all pages, carry0 is the row's top-k.
+    One 1024-thread CTA per (row, slice). ``ctas_per_group`` CTAs split a
+    row's pages; each scores its slice and the group merges across CTAs.
+
+    Score phase (paged): 64-token pages stream through a 3-stage cp.async
+    ring one page ahead of the MMA; the score warps run the mxfp8 MMA
+    against the ldmatrix-permuted Q staged in shared memory and a page's
+    reduce and carry append are deferred behind the next page's barrier.
+    The 4-head-tile paged contract at 3 rows or more instead scores 8
+    tokens per warp straight from L2 (``direct_k_score``). Scored tokens
+    append to an over-sized carry accumulator that a radix select trims
+    back to ``topk`` when it would overflow, so the trim runs once per
+    batch of pages rather than per page.
+
+    Merge phase (``ctas_per_group > 1``): a group whose live length exceeds
+    ``merge_threshold`` selects the final top-k cooperatively with three
+    grid-barrier radix rounds (12, 12, and 8 key bits) over the CTAs'
+    carries; otherwise every CTA packs its carry into a global slab and the
+    last CTA to arrive radix-selects the row. Both arms self-reset their
+    group state for the next launch or graph replay.
     """
 
     def __init__(
@@ -1203,7 +1612,7 @@ class DSAFusedIndexerKernel:
         # capacity ctas_per_group * topk; the last-arriving CTA radix-selects the
         # final top-k over the packed reals (no host merge launch).
         self.merge_in_kernel = self.ctas_per_group > 1
-        # Cooperative grid-barrier merge (_group_barrier) spins until every one of
+        # Cooperative grid-barrier merge (_fused_group_barrier) spins until every one of
         # the group's ctas_per_group CTAs has arrived, so they must all be co-resident
         # at once. This kernel launches one CTA per SM (1024 threads + min_blocks_per_mp
         # =1), so a group larger than the SM count can never be fully resident and the
@@ -1381,6 +1790,46 @@ class DSAFusedIndexerKernel:
         ni1 = shared_ptr_to_u32(storage.ni1.data_ptr())
         lr = shared_ptr_to_u32(storage.last_rem.data_ptr())
 
+        # Q vectors and head weights do not depend on the row length, so their
+        # loads are issued before the seq_len -> page-table -> page-fetch
+        # chain and complete while it resolves; they are stored to shared
+        # memory once the first pages are in flight. Thread ``t`` owns Q
+        # vector ``t`` (16 bytes of one head) in the ldmatrix-permuted
+        # per-head-tile layout and weight ``t``.
+        q_v0 = Uint32(0)
+        q_v1 = Uint32(0)
+        q_v2 = Uint32(0)
+        q_v3 = Uint32(0)
+        q_dst_addr = Int32(0)
+        q_owner = Int32(0)
+        if cutlass.const_expr(self.vectorized_q_load):
+            if tx < Int32(self.padded_q_heads * (_INDEX_HEAD_DIM // 16)):
+                q_owner = Int32(1)
+                q_head = tx // Int32(_INDEX_HEAD_DIM // 16)
+                q_vec = tx - q_head * Int32(_INDEX_HEAD_DIM // 16)
+                if q_head < num_heads:
+                    q_v0, q_v1, q_v2, q_v3 = ld_global_v4_u32(
+                        get_ptr_as_int64(
+                            q_bytes,
+                            Int64(q_idx) * Int64(self.q_row_stride_bytes)
+                            + Int64(q_head) * Int64(_INDEX_HEAD_DIM)
+                            + Int64(q_vec) * Int64(16),
+                        )
+                    )
+                q_tile = q_head // Int32(_PAGED_Q_HEAD_TILE)
+                q_dst_addr = _smem_addr_from_b128_offset(
+                    q_smem_base_addr + q_tile * Int32(_PAGED_Q_HEAD_TILE * _INDEX_HEAD_DIM),
+                    _permuted_offset_128b(
+                        q_head - q_tile * Int32(_PAGED_Q_HEAD_TILE),
+                        q_vec,
+                        Int32(_INDEX_HEAD_DIM // 16),
+                    ),
+                )
+        w_val = Float32(0.0)
+        if tx < Int32(self.padded_q_heads):
+            if tx < num_heads:
+                w_val = Float32(weights[q_idx, tx])
+
         # PAGED: valid k = [0, seqlen) via page table. CONTIGUOUS_MLA: contiguous k =
         # [k_start, k_end) with abs_start = k_start (no page table).
         abs_start = Int32(0)
@@ -1401,23 +1850,44 @@ class DSAFusedIndexerKernel:
         if page_start > total_pages:
             page_start = total_pages
 
-        # Stage q + weights with all 1024 threads (paid once per CTA; the
-        # 128-thread version was 64 sequential byte rounds, costly at short K
-        # where per-CTA work is small and CTAs are many).
-        # Q staged straight into the ldmatrix-permuted per-head-tile layout so
-        # the score core consumes raw fragments on BOTH operands (no byte
-        # packs, no 16b->8b fragment swizzles).
-        if cutlass.const_expr(self.vectorized_q_load):
-            _stage_q_permuted(
-                q_bytes,
-                q_idx,
-                num_heads,
-                q_smem_base_addr,
-                tx,
-                Int64(self.q_row_stride_bytes),
-                padded_q_heads=self.padded_q_heads,
-                stage_threads=_RADIX_THREADS,
+        # Page ids of the slice are read two pages ahead of their use (pid_cur
+        # and pid_p1 hold pages p and p+1 at the top of iteration p) so the
+        # page-table load never sits between a landed page and the next fetch
+        # issue. The first page is issued before Q staging so its fetch
+        # overlaps the Q and weight staging.
+        scales_base_addr = shared_ptr_to_u32(storage.scales.data_ptr())
+        pid_cur = Int32(-1)
+        pid_p1 = Int32(-1)
+        pid_p2 = Int32(-1)
+        if cutlass.const_expr(
+            self.kv_layout == KV_LAYOUT_PAGED and not self.direct_k_score
+        ):
+            pid_cur = _page_id_or_invalid(real_page_table, q_idx, page_start, page_end)
+            pid_p1 = _page_id_or_invalid(
+                real_page_table, q_idx, page_start + Int32(1), page_end
             )
+            if pid_cur >= Int32(0):
+                _stream_issue_k_page_cp_async(
+                    k_quant_bytes,
+                    k_scales,
+                    pid_cur,
+                    k_page_perm_base_addr,
+                    scales_base_addr,
+                    Int32(0),
+                    tx,
+                    k_quant_page_stride=int(self.k_quant_page_stride),
+                    k_scales_row_stride=int(self.k_scales_row_stride),
+                    issue_threads=_RADIX_THREADS,
+                )
+            cute.arch.cp_async_commit_group()
+
+        # Stage q + weights. Q lands straight in the ldmatrix-permuted
+        # per-head-tile layout so the score core consumes raw fragments on
+        # BOTH operands (no byte packs, no 16b->8b fragment swizzles); heads
+        # past num_heads stage zeros.
+        if cutlass.const_expr(self.vectorized_q_load):
+            if q_owner != Int32(0):
+                st_shared_v4_u32(q_dst_addr, q_v0, q_v1, q_v2, q_v3)
         else:
             # Preserve arbitrary tensor head/row strides.  Each thread moves
             # individual bytes directly into the same XOR-permuted granules as
@@ -1449,14 +1919,8 @@ class DSAFusedIndexerKernel:
                     q_byte = q_bytes[q_idx, head_idx, col_idx]
                 st_shared_u8(dst_addr, q_byte)
                 q_linear += Int32(_RADIX_THREADS)
-        w_linear = tx
-        while w_linear < Int32(self.padded_q_heads):
-            s_w[w_linear] = (
-                Float32(weights[q_idx, w_linear])
-                if w_linear < num_heads
-                else Float32(0.0)
-            )
-            w_linear += Int32(_RADIX_THREADS)
+        if tx < Int32(self.padded_q_heads):
+            s_w[tx] = w_val
         cute.arch.sync_threads()
 
         head_tile_slot = warp_idx % Int32(self.num_q_head_tiles)
@@ -1597,17 +2061,16 @@ class DSAFusedIndexerKernel:
                 carry_count = topk_static
         else:
             carry_count = Int32(0)
-            # Paged-branch cp.async ping-pong: K alternates between k_page_perm
-            # (stage 0) and k_page (stage 1 -- unused as linear staging on the
-            # paged path); scales alternate scales/scales2. One page of lookahead.
-            scales_base_addr = shared_ptr_to_u32(storage.scales.data_ptr())
-            scales_ring_last = scales_base_addr + Int32(3 * _PAGE_SIZE * 4)
-            pipe_stage = Int32(0)
-            # Deferred-reduce pipeline (page_splits==1 paged flow): page p's reduce
-            # and carry append run at iteration p+1 BEHIND the pipeline barrier, so
-            # one barrier per page orders both the K stage and the partials handoff
-            # (the per-page reduce barrier disappears). Scales need a 3-deep ring
-            # because page p-1's scales are still live when p+1's are issued.
+            # Paged K pipeline: page 0 of the slice was issued before Q
+            # staging; iteration p issues page p+1 into the K stage page p-2
+            # used (the 3-stage ring holds p-1, p, and p+1), then waits for
+            # page p. Deferred-reduce flow (page_splits == 1): page p's
+            # reduce and carry append run at iteration p+1 behind the
+            # pipeline barrier, so one barrier per page orders both the K
+            # stage and the partials handoff, and page p-1's scales stay live
+            # for it (4-slot scales ring).
+            k_stage = Int32(0)
+            sc_slot = Int32(0)
             cur_scale_addr = scales_base_addr
             prev_do = Int32(0)
             prev_valid = Int32(0)
@@ -1615,25 +2078,6 @@ class DSAFusedIndexerKernel:
             prev_scale_addr = scales_base_addr
             prev_pl2 = Int32(0)
             cur_pl2 = Int32(0)
-            if cutlass.const_expr(self.kv_layout == KV_LAYOUT_PAGED):
-                if page_start < page_end:
-                    pid0 = Int32(-1)
-                    if page_start < Int32(real_page_table.shape[1]):
-                        pid0 = Int32(real_page_table[q_idx, page_start])
-                    if pid0 >= Int32(0):
-                        _stream_issue_k_page_cp_async(
-                            k_quant_bytes,
-                            k_scales,
-                            pid0,
-                            k_page_perm_base_addr,
-                            scales_base_addr,
-                            Int32(0),
-                            tx,
-                            k_quant_page_stride=int(self.k_quant_page_stride),
-                            k_scales_row_stride=int(self.k_scales_row_stride),
-                            issue_threads=_RADIX_THREADS,
-                        )
-                cute.arch.cp_async_commit_group()
             page_col = page_start
             while page_col < page_end:
                 page_base = page_col * Int32(_PAGE_SIZE)
@@ -1644,47 +2088,43 @@ class DSAFusedIndexerKernel:
                 do_page = Int32(0)
                 page_id = Int32(0)
                 if cutlass.const_expr(self.kv_layout == KV_LAYOUT_PAGED):
-                    page_id = Int32(-1)
-                    if page_col < Int32(real_page_table.shape[1]):
-                        page_id = Int32(real_page_table[q_idx, page_col])
+                    page_id = pid_cur
                     if (page_id >= Int32(0)) & (valid_slots > Int32(0)):
                         do_page = Int32(1)
+                    # Read the id of page p+2 now; it is issued at iteration p+1.
+                    pid_p2 = _page_id_or_invalid(
+                        real_page_table, q_idx, page_col + Int32(2), page_end
+                    )
                 else:
                     if valid_slots > Int32(0):
                         do_page = Int32(1)
 
-                cur_k_base = k_page_perm_base_addr
+                cur_k_base = _k_stage_addr(
+                    k_stage, k_page_perm_base_addr, k_page_base_addr, k_page3_base_addr
+                )
                 cur_scale_base = scales_base_addr
-                nsc_ring = cur_scale_addr + Int32(_PAGE_SIZE * 4)
-                if nsc_ring > scales_ring_last:
-                    nsc_ring = scales_base_addr
                 if cutlass.const_expr(self.kv_layout == KV_LAYOUT_PAGED):
-                    # Issue the NEXT page into the K ring stage of page p-2. In the
-                    # warp-specialized flow the producer first waits that stage's
-                    # EMPTY barrier (all score warps released it), so no CTA
-                    # barrier is needed; in the fallback flow the CTA barrier
-                    # provides the same ordering.
-                    nxt = page_col + Int32(1)
                     nxt_valid = Int32(0)
-                    pid_n = Int32(-1)
-                    if nxt < page_end:
-                        if nxt < Int32(real_page_table.shape[1]):
-                            pid_n = Int32(real_page_table[q_idx, nxt])
-                        if (pid_n >= Int32(0)) & (nxt * Int32(_PAGE_SIZE) < seq_len):
-                            nxt_valid = Int32(1)
-                    # stage((p+1) % 3): perm -> k_page -> k_page3 -> perm
-                    nk = k_page_base_addr
-                    if pipe_stage == Int32(1):
-                        nk = k_page3_base_addr
-                    if pipe_stage == Int32(2):
-                        nk = k_page_perm_base_addr
+                    if (page_col + Int32(1) < page_end) & (pid_p1 >= Int32(0)):
+                        nxt_valid = Int32(1)
+                    next_stage = k_stage + Int32(1)
+                    if next_stage == Int32(_K_STAGES):
+                        next_stage = Int32(0)
+                    nsc = sc_slot + Int32(1)
+                    if nsc == Int32(4):
+                        nsc = Int32(0)
                     if nxt_valid != Int32(0):
                         _stream_issue_k_page_cp_async(
                             k_quant_bytes,
                             k_scales,
-                            pid_n,
-                            nk,
-                            nsc_ring,
+                            pid_p1,
+                            _k_stage_addr(
+                                next_stage,
+                                k_page_perm_base_addr,
+                                k_page_base_addr,
+                                k_page3_base_addr,
+                            ),
+                            scales_base_addr + nsc * Int32(_PAGE_SIZE * 4),
                             Int32(0),
                             tx,
                             k_quant_page_stride=int(self.k_quant_page_stride),
@@ -1692,13 +2132,12 @@ class DSAFusedIndexerKernel:
                             issue_threads=_RADIX_THREADS,
                         )
                     cute.arch.cp_async_commit_group()
+                    # Page p has landed once every group but the newest has
+                    # completed; the barrier then orders page p-1's partials
+                    # for the deferred reduce.
                     cute.arch.cp_async_wait_group(1)
                     cute.arch.sync_threads()
                     cur_scale_base = cur_scale_addr
-                    if pipe_stage == Int32(1):
-                        cur_k_base = k_page_base_addr
-                    if pipe_stage == Int32(2):
-                        cur_k_base = k_page3_base_addr
                     if cutlass.const_expr(self.page_splits == 1):
                         # Reduce + append the PREVIOUS page: its partials (all
                         # head tiles) and its scales are ordered by the pipeline
@@ -1908,10 +2347,15 @@ class DSAFusedIndexerKernel:
                         carry_count + Int32(_PAGE_SIZE) > Int32(self.carry_cap)
                     ) | (is_last & (carry_count > topk_static))
                 if cutlass.const_expr(self.kv_layout == KV_LAYOUT_PAGED):
-                    pipe_stage = pipe_stage + Int32(1)
-                    if pipe_stage == Int32(3):
-                        pipe_stage = Int32(0)
-                    cur_scale_addr = nsc_ring
+                    k_stage = k_stage + Int32(1)
+                    if k_stage == Int32(_K_STAGES):
+                        k_stage = Int32(0)
+                    pid_cur = pid_p1
+                    pid_p1 = pid_p2
+                    sc_slot = sc_slot + Int32(1)
+                    if sc_slot == Int32(4):
+                        sc_slot = Int32(0)
+                    cur_scale_addr = scales_base_addr + sc_slot * Int32(_PAGE_SIZE * 4)
                 if need_trim:
                     cute.arch.sync_threads()
                     _fused_radix_select(
@@ -2037,7 +2481,7 @@ class DSAFusedIndexerKernel:
             #   seq_len <= merge_threshold -> serial last-CTA reduction over a
             #     packed slab (no grid barriers; cheaper for few-row/short-K).
             # Both arms index the per-group _COOP_STATE_WORDS state block via
-            # _state_offset, so groups taking different arms never collide.
+            # _fused_state_offset, so groups taking different arms never collide.
             ctas_pg = Int32(self.ctas_per_group)
             barrier_phase = Int32(0)
             cap = Int32(self.pack_cap)
@@ -2057,44 +2501,86 @@ class DSAFusedIndexerKernel:
             off = Int32(0)
             total = Int32(0)
             key = Uint32(0)
-            byte = Int32(0)
             mask = Uint32(0)
-            count_ge = Int32(0)
-            count_gt = Int32(0)
-            scan_val = Int32(0)
-            stride_s = Int32(0)
-            local_gt = Int32(0)
-            gt_base = Int32(0)
-            lp = Int32(0)
-            pos = Int32(0)
             prefix = Uint32(0)
-            remaining_k = Int32(0)
             shift = Uint32(0)
-            ordered_pivot = Uint32(0)
-            bucket_u32 = Uint32(0)
+            pivot_bin = Int32(0)
+            count_gt = Int32(0)
+            digit = Int32(0)
+            bin_count = Int32(0)
+            winners = Int32(0)
+            remaining_k = Int32(0)
+            done = Int32(0)
+            local_gt = Int32(0)
+            local_eq = Int32(0)
+            gt_base = Int32(0)
+            eq_base = Int32(0)
+            pos = Int32(0)
             c = Int32(0)
             coop_possible = Int32(1 if self.coop_merge_possible else 0)
             if (seq_len > Int32(self.merge_threshold)) & (coop_possible != Int32(0)):
-                # group total candidate count (for the degenerate total <= topk path)
+                # ---- cooperative grid-barrier radix merge ----
+                # Round 0 histograms the top 12 key bits of every candidate,
+                # round 1 the next 12 bits of the candidates matching the
+                # round-0 pivot, and round 2 the low byte of those matching
+                # the round-1 pivot. Each round accumulates the group's
+                # histogram into its own global buffer, so one grid barrier
+                # per round publishes it, and every CTA then reads the buffer
+                # back and derives the same pivot digit. The round-0 barrier
+                # also publishes the group's candidate total. Winners above
+                # the final pivot prefix and the tie fill at the prefix are
+                # placed through two group counters whose bases follow from
+                # the histogram, so no barrier separates them, and the
+                # refinement stops once the pivot bin holds exactly the
+                # remaining slots. The last CTA to leave zeroes the state
+                # block. The 4096-bin local histogram lives in the K ring,
+                # which is idle once scoring is done.
                 if tx == Int32(0):
-                    atomic_add_global_i32(
-                        _global_state_ptr(
-                            merge_state, group_id, Int32(_FUSED_STATE_TOTAL)
-                        ),
+                    red_add_global_i32(
+                        _fused_state_ptr(merge_state, group_id, Int32(_FUSED_STATE_TOTAL)),
                         carry_count,
                     )
-                barrier_phase = _group_barrier(
-                    merge_state, group_id, barrier_phase, ctas_pg, tx
+                cute.arch.cp_async_wait_group(0)
+                wide_hist_addr = k_page_base_addr
+                st_shared_v4_u32(
+                    wide_hist_addr + tx * Int32(16),
+                    Uint32(0),
+                    Uint32(0),
+                    Uint32(0),
+                    Uint32(0),
                 )
-                total = Int32(
-                    merge_state[_state_offset(group_id, Int32(_FUSED_STATE_TOTAL))]
+                if tx < Int32(_RADIX):
+                    s_hist0[tx] = Int32(0)
+                cute.arch.sync_threads()
+                barrier_phase = _coop_wide_round(
+                    merge_state,
+                    group_id,
+                    _FUSED_COARSE0,
+                    _FUSED_FINE0,
+                    s_c0_values,
+                    carry_count,
+                    Uint32(0),
+                    Uint32(0),
+                    20,
+                    wide_hist_addr,
+                    coop_hist_addr,
+                    s_hist0,
+                    topk_static,
+                    barrier_phase,
+                    ctas_pg,
+                    tx,
+                    lane,
+                    warp_idx,
+                    s_coop_scalars,
+                    True,
                 )
+                total = Int32(s_coop_scalars[3])
                 if total <= topk_static:
-                    # every candidate survives: pack contiguously (atomic base) + pad -1
+                    # Every candidate survives: pack at an atomic base; CTA 0 pads.
                     if tx == Int32(0):
                         s_coop_counters[1] = atomic_add_global_i32(
-                            _global_state_ptr(
-                                merge_state, group_id, Int32(_STATE_OUTPUT_COUNTER)
+                            _fused_state_ptr(
+                                merge_state, group_id, Int32(_FUSED_STATE_OUTPUT)
                             ),
                             carry_count,
                         )
@@ -2105,188 +2591,156 @@ class DSAFusedIndexerKernel:
                         out_values[group_id, base + i] = Float32(s_c0_values[i])
                         out_indices[group_id, base + i] = Int32(s_c0_gindex[i])
                         i += Int32(_RADIX_THREADS)
-                    barrier_phase = _group_barrier(
-                        merge_state, group_id, barrier_phase, ctas_pg, tx
-                    )
-                    # pad [total, topk) with -1 (cta0 only, to avoid duplicate writes)
-                    i = Int32(tx)
-                    while i < topk_static:
-                        if (i >= total) & (cta_in_group == Int32(0)):
+                    if cta_in_group == Int32(0):
+                        i = total + Int32(tx)
+                        while i < topk_static:
                             out_values[group_id, i] = Float32(float("-inf"))
                             out_indices[group_id, i] = Int32(-1)
-                        i += Int32(_RADIX_THREADS)
+                            i += Int32(_RADIX_THREADS)
                 else:
-                    if tx == Int32(0):
-                        s_coop_scalars[0] = Uint32(0)  # prefix
-                        s_coop_scalars[1] = Uint32(topk_static)  # remaining_k
-                    cute.arch.sync_threads()
-                    for round_idx in cutlass.range_constexpr(4):
-                        shift = Uint32(24 - round_idx * 8)
-                        prefix = Uint32(s_coop_scalars[0])
-                        remaining_k = Int32(s_coop_scalars[1])
-                        # cta0 zeros the per-group global histogram for this round
-                        if cta_in_group == Int32(0):
-                            i = Int32(tx)
-                            while i < Int32(_RADIX):
-                                merge_state[_state_offset(group_id, i)] = Int32(0)
-                                i += Int32(_RADIX_THREADS)
-                        i = Int32(tx)
-                        while i < Int32(_RADIX):
-                            s_hist0[i] = Int32(0)  # local histogram (reuses hist0)
-                            i += Int32(_RADIX_THREADS)
-                        cute.arch.sync_threads()
-                        barrier_phase = _group_barrier(
-                            merge_state, group_id, barrier_phase, ctas_pg, tx
+                    pivot_bin = Int32(s_coop_scalars[0])
+                    count_gt = Int32(s_coop_scalars[1])
+                    bin_count = Int32(s_coop_scalars[2])
+                    prefix = Uint32(pivot_bin) << Uint32(20)
+                    mask = Uint32(0xFFF00000)
+                    winners = count_gt
+                    remaining_k = topk_static - count_gt
+                    done = Int32(0)
+                    if bin_count == remaining_k:
+                        done = Int32(1)
+                    if done == Int32(0):
+                        barrier_phase = _coop_wide_round(
+                            merge_state,
+                            group_id,
+                            _FUSED_COARSE1,
+                            _FUSED_FINE1,
+                            s_c0_values,
+                            carry_count,
+                            mask,
+                            prefix,
+                            8,
+                            wide_hist_addr,
+                            coop_hist_addr,
+                            s_hist0,
+                            remaining_k,
+                            barrier_phase,
+                            ctas_pg,
+                            tx,
+                            lane,
+                            warp_idx,
+                            s_coop_scalars,
+                            False,
                         )
-                        # histogram this CTA's carry entries matching the running prefix
-                        i = Int32(tx)
-                        while i < carry_count:
-                            key = _convert_to_uint32(Float32(s_c0_values[i]))
-                            if cutlass.const_expr(round_idx == 0):
-                                byte = Int32((key >> shift) & Uint32(0xFF))
-                                _smem_red_add(coop_hist_addr, byte, Int32(1))
-                            else:
-                                mask = Uint32(0xFFFFFFFF) << Uint32(32 - round_idx * 8)
-                                if (key & mask) == prefix:
-                                    byte = Int32((key >> shift) & Uint32(0xFF))
-                                    _smem_red_add(coop_hist_addr, byte, Int32(1))
-                            i += Int32(_RADIX_THREADS)
-                        cute.arch.sync_threads()
-                        # local histogram -> per-group global histogram (atomics)
-                        i = Int32(tx)
-                        while i < Int32(_RADIX):
-                            c = Int32(s_hist0[i])
-                            if c > Int32(0):
-                                atomic_add_global_i32(
-                                    _global_state_ptr(merge_state, group_id, i), c
-                                )
-                            i += Int32(_RADIX_THREADS)
-                        barrier_phase = _group_barrier(
-                            merge_state, group_id, barrier_phase, ctas_pg, tx
+                        pivot_bin = Int32(s_coop_scalars[0])
+                        count_gt = Int32(s_coop_scalars[1])
+                        bin_count = Int32(s_coop_scalars[2])
+                        prefix = prefix | (Uint32(pivot_bin) << Uint32(8))
+                        mask = Uint32(0xFFFFFF00)
+                        winners = winners + count_gt
+                        remaining_k = remaining_k - count_gt
+                        if bin_count == remaining_k:
+                            done = Int32(1)
+                    if done == Int32(0):
+                        barrier_phase = _coop_narrow_round(
+                            merge_state,
+                            group_id,
+                            _FUSED_COARSE2,
+                            s_c0_values,
+                            carry_count,
+                            mask,
+                            prefix,
+                            coop_hist_addr,
+                            s_hist0,
+                            remaining_k,
+                            barrier_phase,
+                            ctas_pg,
+                            tx,
+                            lane,
+                            warp_idx,
+                            s_coop_scalars,
                         )
-                        # read global histogram -> suffix sum (count_ge per bin)
-                        i = Int32(tx)
-                        while i < Int32(_RADIX):
-                            s_coop_suffix[i] = Int32(
-                                merge_state[_state_offset(group_id, i)]
-                            )
-                            i += Int32(_RADIX_THREADS)
-                        cute.arch.sync_threads()
-                        for stage in cutlass.range_constexpr(8):
-                            stride_s = Int32(1 << stage)
-                            scan_val = Int32(0)
-                            if tx < Int32(_RADIX):
-                                scan_val = Int32(s_coop_suffix[tx])
-                                if tx < Int32(_RADIX) - stride_s:
-                                    scan_val = scan_val + Int32(
-                                        s_coop_suffix[tx + stride_s]
-                                    )
-                            cute.arch.sync_threads()
-                            if tx < Int32(_RADIX):
-                                s_coop_suffix[tx] = scan_val
-                            cute.arch.sync_threads()
-                        # pivot bin: count_ge >= remaining_k and count_gt < remaining_k
-                        if tx == Int32(0):
-                            s_coop_scalars[2] = Uint32(0)
-                            s_coop_scalars[3] = Uint32(remaining_k)
-                        cute.arch.sync_threads()
-                        if tx < Int32(_RADIX):
-                            count_ge = Int32(s_coop_suffix[tx])
-                            count_gt = Int32(0)
-                            if tx + Int32(1) < Int32(_RADIX):
-                                count_gt = Int32(s_coop_suffix[tx + Int32(1)])
-                            if (count_ge >= remaining_k) & (count_gt < remaining_k):
-                                s_coop_scalars[2] = Uint32(tx)
-                                s_coop_scalars[3] = Uint32(remaining_k - count_gt)
-                        cute.arch.sync_threads()
-                        if tx == Int32(0):
-                            bucket_u32 = Uint32(s_coop_scalars[2])
-                            s_coop_scalars[0] = prefix | (bucket_u32 << shift)
-                            s_coop_scalars[1] = Uint32(s_coop_scalars[3])
-                        cute.arch.sync_threads()
-                        barrier_phase = _group_barrier(
-                            merge_state, group_id, barrier_phase, ctas_pg, tx
-                        )
-                    ordered_pivot = Uint32(s_coop_scalars[0])
-                    # > pivot: definite winners, written at a per-CTA atomic base
+                        pivot_bin = Int32(s_coop_scalars[0])
+                        count_gt = Int32(s_coop_scalars[1])
+                        bin_count = Int32(s_coop_scalars[2])
+                        prefix = prefix | Uint32(pivot_bin)
+                        mask = Uint32(0xFFFFFFFF)
+                        winners = winners + count_gt
+                        remaining_k = remaining_k - count_gt
+                    # Count this CTA's winners and pivot ties, then reserve
+                    # their group slots: winners fill [0, winners), ties fill
+                    # [winners, topk) in arrival order.
                     if tx == Int32(0):
                         s_coop_counters[0] = Int32(0)
+                        s_coop_counters[1] = Int32(0)
                     cute.arch.sync_threads()
                     i = Int32(tx)
                     while i < carry_count:
-                        key = _convert_to_uint32(Float32(s_c0_values[i]))
-                        if key > ordered_pivot:
+                        key = _convert_to_uint32(Float32(s_c0_values[i])) & mask
+                        if key > prefix:
                             _smem_xadd(coop_ctr_addr, Int32(0), Int32(1))
+                        else:
+                            if key == prefix:
+                                _smem_xadd(coop_ctr_addr, Int32(1), Int32(1))
                         i += Int32(_RADIX_THREADS)
                     cute.arch.sync_threads()
-                    local_gt = Int32(s_coop_counters[0])
                     if tx == Int32(0):
-                        gt_base = Int32(0)
-                        if local_gt > Int32(0):
-                            gt_base = atomic_add_global_i32(
-                                _global_state_ptr(
-                                    merge_state, group_id, Int32(_STATE_OUTPUT_COUNTER)
-                                ),
-                                local_gt,
-                            )
+                        local_gt = Int32(s_coop_counters[0])
+                        local_eq = Int32(s_coop_counters[1])
+                        # One 64-bit fetch-add reserves the winner slots (low
+                        # word) and the tie slots (high word).
+                        reserved = atomic_add_global_u64(
+                            _fused_state_ptr(
+                                merge_state, group_id, Int32(_FUSED_STATE_OUTPUT)
+                            ),
+                            Int64(local_gt) + (Int64(local_eq) << Int64(32)),
+                        )
+                        s_coop_scalars[0] = Uint32(
+                            (reserved & Int64(0xFFFFFFFF)).to(Int32)
+                        )
+                        s_coop_scalars[1] = Uint32(
+                            winners + (reserved >> Int64(32)).to(Int32)
+                        )
                         s_coop_counters[0] = Int32(0)
-                        s_coop_counters[1] = gt_base
+                        s_coop_counters[1] = Int32(0)
                     cute.arch.sync_threads()
+                    gt_base = Int32(s_coop_scalars[0])
+                    eq_base = Int32(s_coop_scalars[1])
                     i = Int32(tx)
                     while i < carry_count:
-                        key = _convert_to_uint32(Float32(s_c0_values[i]))
-                        if key > ordered_pivot:
-                            lp = _smem_xadd(coop_ctr_addr, Int32(0), Int32(1))
-                            pos = Int32(s_coop_counters[1]) + lp
+                        key = _convert_to_uint32(Float32(s_c0_values[i])) & mask
+                        if key > prefix:
+                            pos = gt_base + _smem_xadd(coop_ctr_addr, Int32(0), Int32(1))
                             out_values[group_id, pos] = Float32(s_c0_values[i])
                             out_indices[group_id, pos] = Int32(s_c0_gindex[i])
+                        else:
+                            if key == prefix:
+                                pos = eq_base + _smem_xadd(
+                                    coop_ctr_addr, Int32(1), Int32(1)
+                                )
+                                if pos < topk_static:
+                                    out_values[group_id, pos] = Float32(s_c0_values[i])
+                                    out_indices[group_id, pos] = Int32(s_c0_gindex[i])
                         i += Int32(_RADIX_THREADS)
-                    barrier_phase = _group_barrier(
-                        merge_state, group_id, barrier_phase, ctas_pg, tx
-                    )
-                    # == pivot: fill the remaining slots up to topk (ties at the boundary)
-                    i = Int32(tx)
-                    while i < carry_count:
-                        key = _convert_to_uint32(Float32(s_c0_values[i]))
-                        if key == ordered_pivot:
-                            pos = atomic_add_global_i32(
-                                _global_state_ptr(
-                                    merge_state, group_id, Int32(_STATE_OUTPUT_COUNTER)
-                                ),
-                                Int32(1),
-                            )
-                            if pos < topk_static:
-                                out_values[group_id, pos] = Float32(s_c0_values[i])
-                                out_indices[group_id, pos] = Int32(s_c0_gindex[i])
-                        i += Int32(_RADIX_THREADS)
-
-                # Self-reset the cooperative state without a second grid
-                # barrier.  Each CTA publishes departure only after its final
-                # output/state use; the last departing CTA can therefore reset
-                # every cross-launch scalar safely.  This also permits graph
-                # replays to switch between cooperative and serial merge as the
-                # live seqlen changes, without a captured memset on every replay.
+                # Departure: once its output is placed, every CTA publishes
+                # that it is done with the group state, and the last one
+                # zeroes the whole block (round histograms and counters) so
+                # the next launch or graph replay starts clean. The fence
+                # orders this CTA's reservation and histogram traffic before
+                # its departure becomes visible, so the zeroing can never
+                # overtake a pending reservation.
                 cute.arch.sync_threads()
                 if tx == Int32(0):
-                    cleanup_ptr = _global_state_ptr(
-                        merge_state, group_id, Int32(_FUSED_STATE_CLEANUP)
+                    threadfence()
+                    s_relay[0] = atomic_add_global_i32(
+                        _fused_state_ptr(merge_state, group_id, Int32(_FUSED_STATE_CLEANUP)),
+                        Int32(1),
                     )
-                    s_relay[0] = atomic_add_global_i32(cleanup_ptr, Int32(1))
                 cute.arch.sync_threads()
                 if Int32(s_relay[0]) == (ctas_pg - Int32(1)):
-                    if tx == Int32(0):
-                        merge_state[
-                            _state_offset(group_id, Int32(_STATE_OUTPUT_COUNTER))
-                        ] = Int32(0)
-                        merge_state[
-                            _state_offset(group_id, Int32(_STATE_ARRIVAL_COUNTER))
-                        ] = Int32(0)
-                        merge_state[
-                            _state_offset(group_id, Int32(_FUSED_STATE_TOTAL))
-                        ] = Int32(0)
-                        merge_state[
-                            _state_offset(group_id, Int32(_FUSED_STATE_CLEANUP))
-                        ] = Int32(0)
+                    i = Int32(tx)
+                    while i < Int32(_COOP_STATE_WORDS):
+                        merge_state[_fused_state_offset(group_id, i)] = Int32(0)
+                        i += Int32(_RADIX_THREADS)
             else:
                 # ---- in-kernel cross-CTA merge (relay) ----
                 # Each CTA atomically packs its carry_count REAL candidates into the
@@ -2294,11 +2748,11 @@ class DSAFusedIndexerKernel:
                 # top-k over the packed reals and writes the row (no host merge launch).
                 # 1. reserve a contiguous slab slot for this CTA's real candidates.
                 #    woff/arrival live in this group's coop-state block (via
-                #    _STATE_OUTPUT_COUNTER / _STATE_ARRIVAL_COUNTER), so a group on
+                #    _FUSED_STATE_OUTPUT / _FUSED_STATE_ARRIVAL), so a group on
                 #    this arm never collides with a sibling group on the coop arm.
                 if tx == Int32(0):
-                    woff_ptr = _global_state_ptr(
-                        merge_state, group_id, Int32(_STATE_OUTPUT_COUNTER)
+                    woff_ptr = _fused_state_ptr(
+                        merge_state, group_id, Int32(_FUSED_STATE_OUTPUT)
                     )
                     s_relay[0] = atomic_add_global_i32(woff_ptr, carry_count)
                 cute.arch.sync_threads()
@@ -2313,8 +2767,8 @@ class DSAFusedIndexerKernel:
                 # 3. release the writes, then bump arrival; old==ctas-1 => I am last
                 if tx == Int32(0):
                     threadfence()
-                    arr_ptr = _global_state_ptr(
-                        merge_state, group_id, Int32(_STATE_ARRIVAL_COUNTER)
+                    arr_ptr = _fused_state_ptr(
+                        merge_state, group_id, Int32(_FUSED_STATE_ARRIVAL)
                     )
                     s_relay[1] = atomic_add_global_i32(arr_ptr, Int32(1))
                 cute.arch.sync_threads()
@@ -2322,7 +2776,7 @@ class DSAFusedIndexerKernel:
                     threadfence()  # acquire: observe every producer's packed writes
                     total = Int32(
                         merge_state[
-                            _state_offset(group_id, Int32(_STATE_OUTPUT_COUNTER))
+                            _fused_state_offset(group_id, Int32(_FUSED_STATE_OUTPUT))
                         ]
                     )
                     if total > topk_static:
@@ -2367,10 +2821,10 @@ class DSAFusedIndexerKernel:
                     cute.arch.sync_threads()
                     if tx == Int32(0):
                         merge_state[
-                            _state_offset(group_id, Int32(_STATE_OUTPUT_COUNTER))
+                            _fused_state_offset(group_id, Int32(_FUSED_STATE_OUTPUT))
                         ] = Int32(0)
                         merge_state[
-                            _state_offset(group_id, Int32(_STATE_ARRIVAL_COUNTER))
+                            _fused_state_offset(group_id, Int32(_FUSED_STATE_ARRIVAL))
                         ] = Int32(0)
 
 
@@ -2434,29 +2888,25 @@ def _launch_fused(kernel, cute_args, key_tensors, policy):
     (the existing indexer kernels rely on it). Row-bearing key tensors use dynamic
     row dimensions; policy distinguishes the constexpr variant.
     """
-    # Variants that do not take the direct-K path trace byte-identical code to
-    # the v2 kernel, so they keep their v2 cache keys: the heavy legacy
-    # variants (e.g. heads=16/topk=2048/ctas=96) have pathologically long cold
-    # compiles and their warm cubins are load-bearing.
-    # A group that oversubscribes the SMs (ctas_per_group > num_sms) drops the coop
-    # grid-barrier arm for the serial last-CTA arm (see coop_co_resident) -- a distinct
-    # traced kernel, so it needs its own cache key. This also invalidates any stale
-    # pre-fix cubin for those variants, which baked in the deadlocking coop arm.
-    # v5/v3 (bumped from v4/v2): the candidate-buffer overflow fix changed the
-    # radix-select body, so every variant needs a fresh key to drop stale cubins.
+    # The variant string names the traced kernel body: the direct-K score
+    # path and the cross-CTA merge arm (cooperative grid barrier, or the
+    # serial last-CTA arm for a group that oversubscribes the SMs, see
+    # coop_co_resident) are distinct traces. Its version suffix is bumped
+    # whenever the traced body changes, so a cached cubin is never reused
+    # for a different kernel.
     if kernel.direct_k_score:
         # direct-K needs ctas_per_group <= 16, co-resident on every real SM12x part,
         # so this keeps its historical key. The suffix keeps the key honest (no trace
         # collision) if a <16-SM device ever oversubscribes a direct-K build.
         variant = (
-            "fused_indexer_v5_directk64"
+            "fused_indexer_v10_directk64"
             if kernel.coop_co_resident
-            else "fused_indexer_v5_directk64_oversub_serial"
+            else "fused_indexer_v10_directk64_oversub_serial"
         )
     elif kernel.coop_co_resident:
-        variant = "fused_indexer_v3_coop"
+        variant = "fused_indexer_v8_coop"
     else:
-        variant = "fused_indexer_v3_oversub_serial"
+        variant = "fused_indexer_v8_oversub_serial"
     cache_key = tuple(_fused_indexer_tensor_key(name, t) for name, t in key_tensors) + (
         (variant,) + tuple(policy),
     )

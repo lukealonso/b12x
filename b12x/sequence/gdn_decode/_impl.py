@@ -9,6 +9,7 @@ from typing import Literal
 
 import torch
 
+from b12x.policy import PolicyContext, get_auto_policy
 from b12x._lib.scratch import (
     ScratchBufferSpec,
     scratch_buffer_spec,
@@ -20,10 +21,11 @@ from b12x._lib.scratch_layout import (
     dtype_nbytes,
     materialize_scratch_view,
 )
+from ._policy import GDN_POLICY, GdnQuery
 
 
 GateActivation = Literal["silu", "sigmoid"]
-_SUPPORTED_RATIOS = frozenset((1, 2, 3, 4, 8))
+KdaMetadataValidation = Literal["transactional", "trusted"]
 
 
 def _canonical_device(device: torch.device | str) -> torch.device:
@@ -62,6 +64,7 @@ class Caps:
     gate_activation: GateActivation = "silu"
     qk_l2norm: bool = True
     null_state_index: int | None = None
+    kda_metadata_validation: KdaMetadataValidation = "transactional"
 
     def __post_init__(self) -> None:
         device = _canonical_device(self.device)
@@ -92,12 +95,6 @@ class Caps:
             )
         if self.value_heads % self.key_heads:
             raise ValueError("value_heads must be divisible by key_heads")
-        ratio = self.value_heads // self.key_heads
-        if ratio not in _SUPPORTED_RATIOS:
-            raise ValueError(
-                f"value_heads/key_heads ratio must be one of "
-                f"{sorted(_SUPPORTED_RATIOS)}, got {ratio}"
-            )
         if self.model_dtype != torch.bfloat16:
             raise TypeError(
                 f"model_dtype must be torch.bfloat16, got {self.model_dtype}"
@@ -111,6 +108,11 @@ class Caps:
             raise ValueError(
                 "gate_activation must be 'silu' or 'sigmoid', got "
                 f"{self.gate_activation!r}"
+            )
+        if self.kda_metadata_validation not in ("transactional", "trusted"):
+            raise ValueError(
+                "kda_metadata_validation must be 'transactional' or 'trusted', got "
+                f"{self.kda_metadata_validation!r}"
             )
         null_state_index = self.null_state_index
         if null_state_index is not None:
@@ -152,6 +154,7 @@ class Plan:
     recurrent_num_warps: int = 1
     norm_block: int = 128
     norm_num_warps: int = 4
+    policy_resolution: object | None = None
 
     def scratch_specs(self) -> tuple[ScratchBufferSpec, ...]:
         return self._scratch_specs
@@ -201,7 +204,7 @@ class Binding:
 
 @dataclass(frozen=True)
 class KdaBinding:
-    """Caller-owned inputs for lower-bounded KDA decode.
+    """Complete caller-owned invocation for lower-bounded KDA decode.
 
     ``raw_g`` is the unactivated per-key-coordinate forget gate and
     ``raw_beta`` is the unactivated scalar update gate for each head.
@@ -227,11 +230,11 @@ class KdaBinding:
     output: torch.Tensor
 
 
-def plan(caps: Caps) -> Plan:
-    """Plan GDN decode for a fixed serving capacity and state layout."""
-
-    if not isinstance(caps, Caps):
-        raise TypeError(f"caps must be Caps, got {type(caps)!r}")
+def _materialize_plan(
+    caps: Caps,
+    *,
+    policy_resolution: object | None,
+) -> Plan:
     error_code_offset_bytes = align_up(0, SCRATCH_ALIGN_BYTES)
     cursor = error_code_offset_bytes + dtype_nbytes(torch.int32)
     duplicate_table_offset_bytes = align_up(cursor, SCRATCH_ALIGN_BYTES)
@@ -248,7 +251,33 @@ def plan(caps: Caps) -> Plan:
         duplicate_table_offset_bytes=duplicate_table_offset_bytes,
         error_code_offset_bytes=error_code_offset_bytes,
         _scratch_specs=(spec,),
+        policy_resolution=policy_resolution,
     )
+
+
+def plan(caps: Caps, *, policy: PolicyContext | None = None) -> Plan:
+    """Plan GDN decode for a fixed serving capacity and state layout."""
+
+    if not isinstance(caps, Caps):
+        raise TypeError(f"caps must be Caps, got {type(caps)!r}")
+    policy = policy or get_auto_policy(caps.device)
+    if not isinstance(policy, PolicyContext):
+        raise TypeError("policy must be a PolicyContext")
+    policy.require_device(caps.device)
+    resolution = policy.resolve(
+        GDN_POLICY,
+        GdnQuery(
+            gate_activation=caps.gate_activation,
+            qk_l2norm=caps.qk_l2norm,
+            state_dtype=str(caps.state_dtype).removeprefix("torch."),
+            key_heads=caps.key_heads,
+            value_heads=caps.value_heads,
+            max_seqs=caps.max_seqs,
+            max_tokens=caps.max_tokens,
+            state_index_columns=caps.state_index_columns,
+        ),
+    )
+    return _materialize_plan(caps, policy_resolution=resolution)
 
 
 def _require_tensor(
@@ -299,6 +328,40 @@ def _require_paged_recurrent_state(
         raise ValueError(
             "recurrent_state slots must not overlap; expected outer stride at "
             f"least {slot_elements}, got {tensor.stride(0)}"
+        )
+
+
+def _require_row_contiguous(
+    name: str,
+    tensor: torch.Tensor,
+    *,
+    shape: tuple[int, ...],
+    device: torch.device,
+    dtypes: tuple[torch.dtype, ...],
+) -> None:
+    _require_tensor(
+        name,
+        tensor,
+        shape=shape,
+        device=device,
+        dtypes=dtypes,
+        contiguous=False,
+    )
+    expected_inner_strides = []
+    stride = 1
+    for size in reversed(shape[1:]):
+        expected_inner_strides.append(stride)
+        stride *= size
+    expected_inner = tuple(reversed(expected_inner_strides))
+    if tuple(tensor.stride()[1:]) != expected_inner:
+        raise ValueError(
+            f"{name} must be contiguous within each token row; expected inner "
+            f"strides {expected_inner}, got {tuple(tensor.stride()[1:])}"
+        )
+    if tensor.stride(0) < stride:
+        raise ValueError(
+            f"{name} token rows must not overlap; expected outer stride at "
+            f"least {stride}, got {tensor.stride(0)}"
         )
 
 
@@ -530,10 +593,10 @@ def bind_kda(
 ) -> KdaBinding:
     """Bind lower-bounded KDA tensors to a GDN decode plan.
 
-    KDA uses one Q/K/V head per recurrent state head. ``raw_g`` has shape
-    ``[max_tokens, heads, key_head_dim]`` and ``raw_beta`` has shape
-    ``[max_tokens, heads]``. The recurrent-state and packed-request contracts
-    are identical to :func:`bind`.
+    KDA uses one Q/K/V head per recurrent state head. Projection, metadata,
+    and output tensors may use any positive leading capacity within the plan.
+    All live tensors for one invocation must be bound together before
+    :func:`run_kda`; binding neither copies nor stages their contents.
     """
     if not isinstance(plan, Plan):
         raise TypeError(f"plan must be Plan, got {type(plan)!r}")
@@ -564,31 +627,68 @@ def bind_kda(
     )
     model = (caps.model_dtype,)
     parameter = (torch.bfloat16, torch.float32)
-    _require_tensor(
+    if mixed_qkv.ndim != 2:
+        raise ValueError(
+            f"mixed_qkv must have two dimensions, got shape {tuple(mixed_qkv.shape)}"
+        )
+    token_capacity = _positive("mixed_qkv token capacity", mixed_qkv.shape[0])
+    if token_capacity > caps.max_tokens:
+        raise ValueError(
+            f"mixed_qkv token capacity {token_capacity} exceeds planned "
+            f"capacity {caps.max_tokens}"
+        )
+    if state_indices.ndim != 2:
+        raise ValueError(
+            "state_indices must have two dimensions, got "
+            f"shape {tuple(state_indices.shape)}"
+        )
+    sequence_capacity = _positive(
+        "state_indices sequence capacity", state_indices.shape[0]
+    )
+    state_index_columns = _positive(
+        "state_indices column capacity", state_indices.shape[1]
+    )
+    if sequence_capacity > caps.max_seqs:
+        raise ValueError(
+            f"state_indices sequence capacity {sequence_capacity} exceeds "
+            f"planned capacity {caps.max_seqs}"
+        )
+    if state_index_columns > caps.state_index_columns:
+        raise ValueError(
+            f"state_indices column capacity {state_index_columns} exceeds "
+            f"planned capacity {caps.state_index_columns}"
+        )
+    if token_capacity > sequence_capacity * state_index_columns:
+        raise ValueError(
+            "token capacity must fit the bound packed metadata geometry, got "
+            f"{token_capacity} > {sequence_capacity} * {state_index_columns}"
+        )
+    _require_row_contiguous(
         "mixed_qkv",
         mixed_qkv,
-        shape=(caps.max_tokens, caps.packed_qkv_width),
+        shape=(token_capacity, caps.packed_qkv_width),
         device=caps.device,
         dtypes=model,
     )
-    _require_tensor(
+    _require_row_contiguous(
         "raw_g",
         raw_g,
-        shape=(caps.max_tokens, caps.value_heads, caps.key_head_dim),
+        shape=(token_capacity, caps.value_heads, caps.key_head_dim),
         device=caps.device,
         dtypes=model,
     )
     _require_tensor(
         "raw_beta",
         raw_beta,
-        shape=(caps.max_tokens, caps.value_heads),
+        shape=(token_capacity, caps.value_heads),
         device=caps.device,
         dtypes=model,
+        contiguous=False,
     )
-    _require_tensor(
+    _require_row_contiguous(
         "z",
         z,
-        shape=(caps.max_tokens, caps.value_heads, caps.value_head_dim),
+        shape=(token_capacity, caps.value_heads, caps.value_head_dim),
         device=caps.device,
         dtypes=model,
     )
@@ -627,23 +727,24 @@ def bind_kda(
     _require_tensor(
         "query_start_loc",
         query_start_loc,
-        shape=(caps.max_seqs + 1,),
+        shape=(sequence_capacity + 1,),
         device=caps.device,
         dtypes=(torch.int32,),
     )
     _require_tensor(
         "num_accepted_tokens",
         num_accepted_tokens,
-        shape=(caps.max_seqs,),
+        shape=(sequence_capacity,),
         device=caps.device,
         dtypes=(torch.int32,),
     )
     _require_tensor(
         "state_indices",
         state_indices,
-        shape=(caps.max_seqs, caps.state_index_columns),
+        shape=(sequence_capacity, state_index_columns),
         device=caps.device,
         dtypes=(torch.int32, torch.int64),
+        contiguous=False,
     )
     for name, tensor in (("num_seqs", num_seqs), ("num_tokens", num_tokens)):
         _require_tensor(
@@ -653,10 +754,10 @@ def bind_kda(
             device=caps.device,
             dtypes=(torch.int32,),
         )
-    _require_tensor(
+    _require_row_contiguous(
         "output",
         output,
-        shape=(caps.max_tokens, caps.value_heads, caps.value_head_dim),
+        shape=(token_capacity, caps.value_heads, caps.value_head_dim),
         device=caps.device,
         dtypes=model,
     )
@@ -782,6 +883,7 @@ def run(
         duplicate_table_size=binding.plan.duplicate_table_size,
         recurrent_num_warps=binding.plan.recurrent_num_warps,
         norm_num_warps=binding.plan.norm_num_warps,
+        validate_metadata=True,
     )
     return binding.output
 
@@ -799,8 +901,7 @@ def run_kda(
     lower_bound_value = float(lower_bound)
     if not math.isfinite(lower_bound_value) or lower_bound_value >= 0.0:
         raise ValueError(
-            "lower_bound must be finite and negative, got "
-            f"{lower_bound_value}"
+            f"lower_bound must be finite and negative, got {lower_bound_value}"
         )
     eps_value = float(eps)
     if not math.isfinite(eps_value) or eps_value <= 0.0:
@@ -847,18 +948,19 @@ def run_kda(
         duplicate_table_size=binding.plan.duplicate_table_size,
         recurrent_num_warps=binding.plan.recurrent_num_warps,
         norm_num_warps=binding.plan.norm_num_warps,
+        validate_metadata=caps.kda_metadata_validation == "transactional",
     )
     return binding.output
 
 
 __all__ = [
-    "Caps",
-    "Plan",
     "Binding",
+    "Caps",
     "KdaBinding",
-    "plan",
+    "Plan",
     "bind",
     "bind_kda",
+    "plan",
     "run",
     "run_kda",
 ]

@@ -1118,17 +1118,17 @@ def test_qwen_grouped_state_slot_offset_past_int32_boundary() -> None:
     torch.cuda.empty_cache()
 
 
-def test_caps_reject_unsupported_ratio_columns_and_packing_capacity() -> None:
+def test_caps_accept_divisible_head_ratios_and_reject_invalid_capacity() -> None:
     device = require_sm120()
-    with pytest.raises(ValueError, match="ratio"):
-        gdn.Caps(
-            device=device,
-            max_tokens=1,
-            max_seqs=1,
-            max_state_slots=1,
-            key_heads=1,
-            value_heads=5,
-        )
+    caps = gdn.Caps(
+        device=device,
+        max_tokens=1,
+        max_seqs=1,
+        max_state_slots=1,
+        key_heads=1,
+        value_heads=5,
+    )
+    assert caps.value_heads_per_key_head == 5
     with pytest.raises(ValueError, match="at most 8"):
         gdn.Caps(
             device=device,

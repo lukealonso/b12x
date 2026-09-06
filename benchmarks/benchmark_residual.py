@@ -426,6 +426,23 @@ def main() -> None:
             split_k=args.split_k,
         )
     )
+    planned_config = fused_plan.config
+    prefill_tf32_selected = (
+        args.fuse_rmsnorm and planned_config.backend == "tf32_tma"
+    )
+    prefill_tf32_tma_m = planned_config.projection_tile_m
+    prefill_tf32_tma_n = planned_config.projection_tile_n
+    prefill_tf32_tma_k = planned_config.projection_tile_k
+    prefill_tf32_tma_stages = planned_config.projection_num_stages
+    prefill_tf32_tma_m_warps = planned_config.projection_num_m_warps
+    prefill_tf32_tma_n_warps = planned_config.projection_num_n_warps
+    prefill_tf32_tma_k_splits = planned_config.projection_k_splits
+    prefill_tf32_tma_chunk_geometry = (
+        prefill_tf32_tma_m == 192 and prefill_tf32_tma_k_splits == 8
+    )
+    prefill_tf32_tma_long_geometry = (
+        prefill_tf32_tma_m == 128 and prefill_tf32_tma_k_splits == 4
+    )
     fused_scratch = tuple(
         torch.empty(shape, dtype=dtype, device=device)
         for shape, dtype in fused_plan.shapes_and_dtypes()
@@ -594,11 +611,12 @@ def main() -> None:
         f"fused_rmsnorm={args.fuse_rmsnorm} "
         f"prefill_tf32_mma={prefill_tf32_enabled} "
         f"prefill_tf32_selected={prefill_tf32_selected} "
+        f"prefill_backend={planned_config.backend} "
         f"prefill_tf32_tma=m{prefill_tf32_tma_m}n{prefill_tf32_tma_n}"
         f"k{prefill_tf32_tma_k}s{prefill_tf32_tma_stages}"
         f"wm{prefill_tf32_tma_m_warps}wn{prefill_tf32_tma_n_warps} "
-        f"prefill_tf32_chunk_geometry={prefill_tf32_tma_chunk_geometry} "
-        f"prefill_tf32_long_geometry={prefill_tf32_tma_long_geometry} "
+        f"prefill_tf32_m192_geometry={prefill_tf32_tma_chunk_geometry} "
+        f"prefill_tf32_m128_geometry={prefill_tf32_tma_long_geometry} "
         f"prefill_tf32_k_splits={prefill_tf32_tma_k_splits} "
         f"prefill_gram_threads={prefill_gram_threads} "
         f"prefill_finalize_threads={prefill_finalize_threads} "

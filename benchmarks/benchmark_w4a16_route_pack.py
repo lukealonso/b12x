@@ -39,6 +39,7 @@ class RoutePackCase:
     num_experts: int
     local_experts: int
     block_size: int
+    use_expert_map: bool = True
 
 
 CASES = {
@@ -57,6 +58,42 @@ CASES = {
         num_experts=256,
         local_experts=192,
         block_size=8,
+    ),
+    "qwen38-flash-next-m4": RoutePackCase(
+        name="qwen38-flash-next-tp1-m4",
+        tokens=4,
+        topk=10,
+        num_experts=512,
+        local_experts=512,
+        block_size=16,
+        use_expert_map=False,
+    ),
+    "qwen38-flash-next-m5": RoutePackCase(
+        name="qwen38-flash-next-tp1-m5",
+        tokens=5,
+        topk=10,
+        num_experts=512,
+        local_experts=512,
+        block_size=16,
+        use_expert_map=False,
+    ),
+    "qwen38-flash-next-m6": RoutePackCase(
+        name="qwen38-flash-next-tp1-m6",
+        tokens=6,
+        topk=10,
+        num_experts=512,
+        local_experts=512,
+        block_size=16,
+        use_expert_map=False,
+    ),
+    "qwen38-flash-next-m7": RoutePackCase(
+        name="qwen38-flash-next-tp1-m7",
+        tokens=7,
+        topk=10,
+        num_experts=512,
+        local_experts=512,
+        block_size=16,
+        use_expert_map=False,
     ),
 }
 
@@ -156,12 +193,15 @@ def _workspace(
 def _validate(
     case: RoutePackCase,
     routes: torch.Tensor,
-    expert_map: torch.Tensor,
+    expert_map: torch.Tensor | None,
     workspace: dict[str, torch.Tensor],
 ) -> None:
     raw_ids = routes.cpu().reshape(-1).to(torch.int64)
-    host_map = expert_map.cpu().to(torch.int64)
-    mapped_ids = host_map[raw_ids]
+    mapped_ids = (
+        raw_ids
+        if expert_map is None
+        else expert_map.cpu().to(torch.int64)[raw_ids]
+    )
     valid = mapped_ids >= 0
     counts = torch.bincount(
         mapped_ids[valid],
@@ -250,7 +290,7 @@ def _run_case(
     seed: int,
 ) -> dict[str, object]:
     routes = _make_routes(case, device, seed)
-    expert_map = _make_expert_map(case, device)
+    expert_map = _make_expert_map(case, device) if case.use_expert_map else None
     workspace = _workspace(case, device)
 
     def run() -> object:

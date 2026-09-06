@@ -6,6 +6,8 @@ import math
 
 import torch
 
+from .._shared.kda_math import kda_beta, kda_log_decay, l2_normalize
+
 
 def _scalar(value: torch.Tensor | int) -> int:
     if isinstance(value, torch.Tensor):
@@ -254,9 +256,11 @@ def decode_kda(
     ).float()
     v = mixed_qkv[:, 2 * q_width :].view(-1, heads, value_head_dim).float()
     if qk_l2norm:
-        q = q * torch.rsqrt(q.square().sum(dim=-1, keepdim=True) + 1e-6)
-        k = k * torch.rsqrt(k.square().sum(dim=-1, keepdim=True) + 1e-6)
+        q = l2_normalize(q)
+        k = l2_normalize(k)
     q *= scale_value
+    log_decay_all = kda_log_decay(raw_g, dt_bias, A_log, lower_bound_value)
+    beta_all = kda_beta(raw_beta)
 
     for request, (start, end, accepted) in enumerate(request_spans):
         if end == start:
@@ -266,13 +270,10 @@ def decode_kda(
             continue
         for head in range(heads):
             state = recurrent_state[source_slot, head].float()
-            rate = torch.exp(A_log[head].float())
             for relative_token, token in enumerate(range(start, end)):
-                log_decay = lower_bound_value * torch.sigmoid(
-                    rate * (raw_g[token, head].float() + dt_bias[head].float())
-                )
+                log_decay = log_decay_all[token, head]
                 state = state * torch.exp(log_decay).unsqueeze(0)
-                beta = torch.sigmoid(raw_beta[token, head].float())
+                beta = beta_all[token, head]
                 delta = v[token, head] - state.mv(k[token, head])
                 state = state + (delta * beta).unsqueeze(1) * k[
                     token, head

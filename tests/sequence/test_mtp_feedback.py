@@ -544,15 +544,12 @@ def test_standalone_cute_norm_reuses_binaries_across_live_token_counts_when_froz
 
 def test_standalone_cute_norm_uses_source_device_when_non_current() -> None:
     if torch.cuda.device_count() < 2:
-        pytest.skip("two visible SM120 GPUs are required")
+        pytest.skip("two visible CUDA GPUs are required")
     original_device = torch.cuda.current_device()
     target_index = next(
         index for index in range(torch.cuda.device_count()) if index != original_device
     )
     target = torch.device("cuda", target_index)
-    if torch.cuda.get_device_capability(target) not in ((12, 0), (12, 1)):
-        pytest.skip("the non-current visible GPU must be SM120 or SM121")
-
     tokens, streams, hidden_size = 2, 4, 2560
     token_source = _randn((tokens, hidden_size), device=target, scale=0.4)
     state_source = _randn(

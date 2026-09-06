@@ -56,6 +56,24 @@ from tests._reference.w4a16_reference import moe_reference_w4a16
 
 LEGACY_BATCH_SIZES = [1, 2, 4, 8]
 NANO35_MTP_BATCH_SIZES = [1, 4, 9]
+# Qwen3.8 Flash Next serves single-request decode at M=1 and verifies three
+# MTP draft tokens with the sampled token at M=4. Keep the full micro/dynamic
+# boundary and the 128-token serving cap in the profile so planner regressions
+# are visible around those production points.
+QWEN38_FLASH_NEXT_BATCH_SIZES = [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    16,
+    32,
+    64,
+    128,
+]
 # Observed in the live single-request sglang probe:
 # - prefill m=23 for the prompt itself
 # - larger prefill chunk m=80 during the same request path
@@ -71,6 +89,7 @@ BATCH_SIZE_PROFILES = {
     "eager-prefill": EAGER_PREFILL_BATCH_SIZES,
     "micro": LEGACY_BATCH_SIZES,
     "nano35-mtp": NANO35_MTP_BATCH_SIZES,
+    "qwen38-flash-next": QWEN38_FLASH_NEXT_BATCH_SIZES,
     "sglang-single-request": RECORDED_SGLANG_SINGLE_REQUEST_BATCH_SIZES,
     "chunked-prefill": CHUNKED_PREFILL_BATCH_SIZES,
 }
@@ -285,6 +304,33 @@ class ModelProfile:
 
 
 MODEL_PROFILES = {
+    "qwen38-flash-next": ModelProfile(
+        label="Qwen3.8 Flash Next",
+        checkpoint_family="qwen",
+        default_layer_idx=0,
+        tp_size=1,
+        hf_repo_id=None,
+        default_model_path=pathlib.Path(
+            "/data/models/qwen3.8-flash-next-mixed/"
+            "qwen3.8-flash-next-180b-nvfp4-ple-mxfp8-attn-shared_vv1"
+        ),
+        default_quant_mode="nvfp4",
+    ),
+    "qwen38-flash-next-shape": ModelProfile(
+        label="Qwen3.8 Flash Next (shape)",
+        checkpoint_family="qwen38_flash_next_shape",
+        default_layer_idx=0,
+        tp_size=1,
+        hf_repo_id=None,
+        default_quant_mode="nvfp4",
+        default_validate="none",
+        shape=ShapeSpec(
+            hidden_size=2560,
+            intermediate_size=640,
+            num_experts=512,
+            top_k=10,
+        ),
+    ),
     "qwen397b": ModelProfile(
         label="Qwen3.5-397B",
         checkpoint_family="qwen",
@@ -421,6 +467,31 @@ MODEL_PROFILES = {
         default_model_path=pathlib.Path("/data/models/GLM-5.2-trainer-minimal"),
         default_quant_mode="w4a8_nvfp4",
         default_validate="none",
+    ),
+    "glm53-flash": ModelProfile(
+        label="GLM-5.3 Flash",
+        checkpoint_family="glm53_flash",
+        default_layer_idx=3,
+        tp_size=1,
+        hf_repo_id=None,
+        default_model_path=pathlib.Path("/data/models/GLM-5.3-Flash-4p67"),
+        default_quant_mode="nvfp4",
+        default_validate="oracle",
+    ),
+    "glm53-flash-shape": ModelProfile(
+        label="GLM-5.3 Flash (shape)",
+        checkpoint_family="glm53_flash_shape",
+        default_layer_idx=3,
+        tp_size=1,
+        hf_repo_id=None,
+        default_quant_mode="w4a16",
+        default_validate="none",
+        shape=ShapeSpec(
+            hidden_size=4096,
+            intermediate_size=2048,
+            num_experts=288,
+            top_k=8,
+        ),
     ),
     "minimax-m27": ModelProfile(
         label="MiniMax-M2.7",
@@ -600,7 +671,7 @@ def build_model_spec(model_path: pathlib.Path, profile: ModelProfile, *, tp_size
             tp_size=tp,
             tp_rank=tp_rank,
         )
-    if profile.checkpoint_family == "glm":
+    if profile.checkpoint_family in {"glm", "glm53_flash"}:
         return ModelSpec(
             hidden_size=cfg["hidden_size"],
             intermediate_size=cfg["moe_intermediate_size"],
@@ -802,8 +873,10 @@ def load_expert_weights(
         "nano35_w4a16_shape",
         "dsv4f_shape",
         "dsv4f_nvfp4_shape",
+        "glm53_flash_shape",
         "laguna_s21_shape",
         "minimax_m3_shape",
+        "qwen38_flash_next_shape",
     }:
         shape_source_format = (
             "fp4_e8m0_k32" if checkpoint_family == "dsv4f_shape" else "modelopt_nvfp4"
@@ -820,8 +893,17 @@ def load_expert_weights(
     cfg = _load_config(model_path)
     loader = IndexedSafetensorLoader(model_path)
 
-    if checkpoint_family in {"qwen", "glm", "minimax_m2", "minimax_m3"}:
-        if checkpoint_family in {"glm", "minimax_m2"} and activation != "silu":
+    if checkpoint_family in {
+        "qwen",
+        "glm",
+        "glm53_flash",
+        "minimax_m2",
+        "minimax_m3",
+    }:
+        if (
+            checkpoint_family in {"glm", "glm53_flash", "minimax_m2"}
+            and activation != "silu"
+        ):
             raise ValueError(f"{checkpoint_family} FP4 benchmark only supports silu experts")
         if checkpoint_family == "minimax_m3" and activation != SWIGLUOAI_UNINTERLEAVE:
             raise ValueError("minimax_m3 FP4 benchmark expects swigluoai_uninterleave experts")
@@ -839,10 +921,17 @@ def load_expert_weights(
             gate_proj = "w1"
             up_proj = "w3"
             down_proj = "w2"
-        else:
+        elif checkpoint_family == "glm":
             cfg_num_experts = cfg["n_routed_experts"]
             cfg_intermediate_size = cfg["moe_intermediate_size"]
             prefix = f"model.layers.{layer_idx}.mlp.experts"
+            gate_proj = "gate_proj"
+            up_proj = "up_proj"
+            down_proj = "down_proj"
+        else:
+            cfg_num_experts = cfg["n_routed_experts"]
+            cfg_intermediate_size = cfg["moe_intermediate_size"]
+            prefix = f"model.language_model.layers.{layer_idx}.mlp.experts"
             gate_proj = "gate_proj"
             up_proj = "up_proj"
             down_proj = "down_proj"
@@ -874,7 +963,9 @@ def load_expert_weights(
             gate_w[eid] = loader.get_tensor(f"{ep}.{gate_proj}.weight").narrow(0, tp_off, I_tp).to(device)
             gate_sf[eid] = loader.get_tensor(f"{ep}.{gate_proj}.weight_scale").narrow(0, tp_off, I_tp).to(device)
             gate_gs[eid] = loader.get_tensor(f"{ep}.{gate_proj}.weight_scale_2").to(device)
-            gate_is[eid] = loader.get_tensor(f"{ep}.{gate_proj}.input_scale").to(device)
+            gate_is[eid] = loader.get_tensor(
+                f"{ep}.{gate_proj}.input_scale"
+            ).to(device)
 
             up_w[eid] = loader.get_tensor(f"{ep}.{up_proj}.weight").narrow(0, tp_off, I_tp).to(device)
             up_sf[eid] = loader.get_tensor(f"{ep}.{up_proj}.weight_scale").narrow(0, tp_off, I_tp).to(device)
@@ -882,7 +973,9 @@ def load_expert_weights(
             down_w[eid] = loader.get_tensor(f"{ep}.{down_proj}.weight").narrow(1, tp_off_packed, I_tp // 2).to(device)
             down_sf[eid] = loader.get_tensor(f"{ep}.{down_proj}.weight_scale").narrow(1, tp_sf_off, tp_sf_cols).to(device)
             down_gs[eid] = loader.get_tensor(f"{ep}.{down_proj}.weight_scale_2").to(device)
-            down_is[eid] = loader.get_tensor(f"{ep}.{down_proj}.input_scale").to(device)
+            down_is[eid] = loader.get_tensor(
+                f"{ep}.{down_proj}.input_scale"
+            ).to(device)
         print(" done.")
 
         if checkpoint_family == "minimax_m3":
@@ -2378,6 +2471,7 @@ def check_oracle_metrics(
     *,
     activation: str = "silu",
     oracle_mode: str = "nvfp4",
+    min_cosine: float | None = None,
 ) -> list[str]:
     failures = []
     metric_values = {
@@ -2405,8 +2499,11 @@ def check_oracle_metrics(
         failures.append(f"  bs={batch_size} {label}: rmse={metrics.rmse:.5f} > {tol['rmse']}")
     if tol["mean_abs"] is not None and metrics.mean_abs > tol["mean_abs"]:
         failures.append(f"  bs={batch_size} {label}: mean_abs={metrics.mean_abs:.5f} > {tol['mean_abs']}")
-    if metrics.cos < tol["cos_min"]:
-        failures.append(f"  bs={batch_size} {label}: cos={metrics.cos:.6f} < {tol['cos_min']}")
+    cos_min = tol["cos_min"] if min_cosine is None else float(min_cosine)
+    if metrics.cos < cos_min:
+        failures.append(
+            f"  bs={batch_size} {label}: cos={metrics.cos:.6f} < {cos_min}"
+        )
     return failures
 
 
@@ -2945,6 +3042,18 @@ def bench_e2e() -> None:
         ],
         default=None,
     )
+    parser.add_argument(
+        "--min-cosine",
+        type=float,
+        default=None,
+        help="Override only the oracle cosine gate; other tolerances are unchanged.",
+    )
+    parser.add_argument(
+        "--policy-mode",
+        choices=("auto", "heuristic-only", "preplanned-only"),
+        default="auto",
+        help="Select AUTO, heuristic-only, or fail-closed preplanned policy.",
+    )
     parser.add_argument("--include-routing", action="store_true")
     parser.set_defaults(cuda_graph=True)
     parser.add_argument(
@@ -2993,6 +3102,7 @@ def bench_e2e() -> None:
         help="Bytes to touch when evicting L2; 0 uses 2x the reported L2 size.",
     )
     args = parser.parse_args()
+    os.environ["B12X_POLICY_MODE"] = args.policy_mode
     model_profile = MODEL_PROFILES[args.model_profile]
     if args.activation is None:
         args.activation = model_profile.default_activation
@@ -3150,6 +3260,7 @@ def bench_e2e() -> None:
     print(f"Batch-size profile: {args.batch_size_profile} -> {batch_sizes}")
     backend_label = "b12x"
     print(f"Backend: {backend_label}")
+    print(f"B12X policy mode: {args.policy_mode}")
     print(f"Reference: {args.reference}")
     print(f"Scale contract: {args.scale_contract}")
     print(f"Validation: {args.validate}")
@@ -3442,9 +3553,31 @@ def bench_e2e() -> None:
         )
         active_experts = int(torch.unique(topk_ids).numel())
         active_density = batch_size * spec.top_k / max(active_experts, 1)
+        from b12x.moe.fused_moe import _impl as fused_moe_impl
+
+        policy_resolution = fused_moe_impl._resolve_moe_decode_policy(
+            num_tokens=batch_size,
+            num_topk=spec.top_k,
+            num_experts=spec.num_experts,
+            k=spec.hidden_size,
+            n=spec.I_tp,
+            activation=args.activation,
+            quant_mode=args.quant_mode,
+            source_format=weights.source_format,
+        )
         print(
             f"  routing: {active_experts} active experts, "
             f"{active_density:.1f} routed rows/active expert"
+        )
+        print(
+            "  policy: "
+            f"source={policy_resolution.source.value}, "
+            f"backend={policy_resolution.config.backend}, "
+            f"route_planner={policy_resolution.config.route_planner}, "
+            "max_active_clusters="
+            f"{policy_resolution.config.max_active_clusters}, "
+            f"profile={policy_resolution.profile_id}, "
+            f"rule={policy_resolution.rule_name}"
         )
 
         def compute_timed_routing() -> tuple[torch.Tensor, torch.Tensor]:
@@ -3649,6 +3782,7 @@ def bench_e2e() -> None:
                     f"{backend_label} vs oracle", backend_metrics, batch_size,
                     activation=args.activation,
                     oracle_mode=args.oracle_mode,
+                    min_cosine=args.min_cosine,
                 )
             )
             if ref_output is not None and ref_name is not None:
@@ -3659,6 +3793,7 @@ def bench_e2e() -> None:
                         f"{ref_name} vs oracle", ref_metrics, batch_size,
                         activation=args.activation,
                         oracle_mode=args.oracle_mode,
+                        min_cosine=args.min_cosine,
                     )
                 )
 

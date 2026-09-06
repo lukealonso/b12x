@@ -1,0 +1,122 @@
+"""Typed GPU component policies with authoritative embedded profiles."""
+
+import importlib
+
+from .catalog import (
+    PLANNING_COMPONENTS,
+    PlanningComponentRegistration,
+    PlanningPolicyMode,
+    list_planning_components,
+    list_profiled_components,
+)
+from .components import (
+    BF16_VOCAB_PROJECTION,
+    BLOCK_FP8_LINEAR,
+    COMPRESSED_SPARSE_MLA_ATTENTION,
+    DSA_INDEXER,
+    EP_MOE,
+    GDN_ATTENTION,
+    GQA_ATTENTION,
+    HYPERCONNECTION,
+    MHC,
+    MLA_ATTENTION,
+    MOE_DECODE,
+    MTP_FEEDBACK,
+    NVFP4_QUANTIZATION,
+    PLE,
+    PLE_EMBEDDING,
+    PLE_HASH,
+    QSA_ATTENTION,
+    SPARSE_MLA_ATTENTION,
+    VARLEN_ATTENTION,
+    WO_PROJECTION,
+)
+from .context import (
+    NO_POLICY_OVERRIDE,
+    ComponentPolicy,
+    InvalidPreplannedPolicyError,
+    PolicyContext,
+    PreplannedPolicyNotFoundError,
+    get_auto_policy,
+    validate_component_profile_contract,
+)
+from .device import DetectedDevice, detect_device
+from .fixed_backend import BackendConfig, make_fixed_backend_policy
+from .registry import EMBEDDED_REGISTRY, ProfileRegistry
+from .serialization import profile_from_dict
+from .types import (
+    ComponentProfile,
+    DecisionNode,
+    DeviceIdentity,
+    ExactDecisionNode,
+    FrozenMapping,
+    GpuProfile,
+    MatchRange,
+    PolicyMode,
+    PolicyResolution,
+    PolicySource,
+    ProfileHit,
+    ProfileLeaf,
+    ProfileRule,
+    RangeDecisionNode,
+)
+
+_embedded_profiles = importlib.import_module("._profiles", __name__)
+EMBEDDED_REGISTRY.freeze()
+
+
+__all__ = [
+    "BF16_VOCAB_PROJECTION",
+    "BLOCK_FP8_LINEAR",
+    "BackendConfig",
+    "COMPRESSED_SPARSE_MLA_ATTENTION",
+    "ComponentPolicy",
+    "ComponentProfile",
+    "DecisionNode",
+    "DetectedDevice",
+    "DeviceIdentity",
+    "DSA_INDEXER",
+    "EMBEDDED_REGISTRY",
+    "EP_MOE",
+    "ExactDecisionNode",
+    "FrozenMapping",
+    "GDN_ATTENTION",
+    "GQA_ATTENTION",
+    "GpuProfile",
+    "HYPERCONNECTION",
+    "InvalidPreplannedPolicyError",
+    "MLA_ATTENTION",
+    "MHC",
+    "MOE_DECODE",
+    "MTP_FEEDBACK",
+    "MatchRange",
+    "NO_POLICY_OVERRIDE",
+    "NVFP4_QUANTIZATION",
+    "PLE",
+    "PLE_EMBEDDING",
+    "PLE_HASH",
+    "PolicyContext",
+    "PolicyMode",
+    "PolicyResolution",
+    "PolicySource",
+    "PLANNING_COMPONENTS",
+    "PlanningComponentRegistration",
+    "PlanningPolicyMode",
+    "PreplannedPolicyNotFoundError",
+    "ProfileHit",
+    "ProfileLeaf",
+    "ProfileRegistry",
+    "ProfileRule",
+    "RangeDecisionNode",
+    "QSA_ATTENTION",
+    "SPARSE_MLA_ATTENTION",
+    "VARLEN_ATTENTION",
+    "WO_PROJECTION",
+    "detect_device",
+    "get_auto_policy",
+    "list_planning_components",
+    "list_profiled_components",
+    "make_fixed_backend_policy",
+    "profile_from_dict",
+    "validate_component_profile_contract",
+]

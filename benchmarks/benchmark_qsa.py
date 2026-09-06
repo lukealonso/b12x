@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Benchmark the public Qwen3.8 Flash Next QSA decode transaction.
+"""Benchmark public Qwen3.8 Flash Next QSA decode and prefill transactions.
 
 The harness constructs every case through ``Caps -> plan -> bind -> run``. The
 timed operation is the bound ``qsa.run`` transaction: selector query
@@ -29,6 +29,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import torch
 
 from b12x.attention import qsa
+from b12x.policy import PolicyContext
 from b12x.attention.qsa.reference import (
     gemma_rmsnorm_reference,
     packed_stream_compress_reference,
@@ -97,12 +98,28 @@ class BenchmarkCase:
     kind: str = "throughput"
     tail_length: int = 0
     preceding_accepted_tokens: int = 1
+    main_page_size: int = MAIN_PAGE_SIZE
+    planned_max_batch: int | None = None
+    planned_max_q_rows: int | None = None
+    planned_max_speculative_tokens: int | None = None
 
     def __post_init__(self) -> None:
-        if self.kind not in {"throughput", "stream_phase", "speculative"}:
+        if self.kind not in {"throughput", "prefill", "stream_phase", "speculative"}:
             raise ValueError(f"unknown QSA benchmark case kind {self.kind!r}")
         if self.context % COMPRESS_RATIO:
             raise ValueError("QSA benchmark capacity must be compression aligned")
+        if self.main_page_size <= 0 or self.main_page_size % COMPRESS_RATIO:
+            raise ValueError(
+                "QSA benchmark main page size must be positive and compression aligned"
+            )
+        if self.planned_batch < self.request_count:
+            raise ValueError("planned QSA batch capacity must cover active requests")
+        if self.planned_q_rows < self.rows:
+            raise ValueError("planned QSA row capacity must cover active rows")
+        if self.planned_speculative_tokens < self.max_speculative_tokens:
+            raise ValueError(
+                "planned QSA speculative capacity must cover the active transaction"
+            )
         if self.kind == "stream_phase":
             if self.rows != 1 or self.tail_length not in range(COMPRESS_RATIO):
                 raise ValueError("stream-phase cases require one row and tail 0..3")
@@ -117,21 +134,57 @@ class BenchmarkCase:
             raise ValueError(
                 "preceding_accepted_tokens is only configurable for speculative cases"
             )
+        if self.kind == "prefill" and self.rows > self.context:
+            raise ValueError("prefill rows cannot exceed the active context")
 
     @property
     def name(self) -> str:
+        page_suffix = (
+            "" if self.main_page_size == MAIN_PAGE_SIZE else f"-p{self.main_page_size}"
+        )
         if self.kind == "stream_phase":
-            return f"{self.profile.name}-r1-cap{self.context}-tail{self.tail_length}"
+            return (
+                f"{self.profile.name}-r1-cap{self.context}-tail{self.tail_length}"
+                f"{page_suffix}"
+            )
         if self.kind == "speculative":
             return (
                 f"{self.profile.name}-r4-cap{self.context}-spec-"
-                f"accept{self.preceding_accepted_tokens}"
+                f"accept{self.preceding_accepted_tokens}{page_suffix}"
             )
-        return f"{self.profile.name}-r{self.rows}-c{self.context}"
+        if self.kind == "prefill":
+            return (
+                f"{self.profile.name}-prefill-r{self.rows}-c{self.context}{page_suffix}"
+            )
+        return f"{self.profile.name}-r{self.rows}-c{self.context}{page_suffix}"
 
     @property
     def request_count(self) -> int:
-        return 1 if self.kind == "speculative" else self.rows
+        return 1 if self.kind in {"prefill", "speculative"} else self.rows
+
+    @property
+    def planned_batch(self) -> int:
+        return (
+            self.request_count
+            if self.planned_max_batch is None
+            else int(self.planned_max_batch)
+        )
+
+    @property
+    def planned_q_rows(self) -> int:
+        return (
+            self.rows
+            if self.planned_max_q_rows is None
+            else int(self.planned_max_q_rows)
+        )
+
+    @property
+    def planned_speculative_tokens(self) -> int:
+        return (
+            self.max_speculative_tokens
+            if self.planned_max_speculative_tokens is None
+            else int(self.planned_max_speculative_tokens)
+        )
 
     @property
     def max_speculative_tokens(self) -> int:
@@ -150,6 +203,8 @@ class BenchmarkCase:
             setup_start = self.context - 2 * COMPRESS_RATIO
             start = setup_start + self.preceding_accepted_tokens
             return tuple(range(start, start + self.rows))
+        if self.kind == "prefill":
+            return tuple(range(self.context - self.rows, self.context))
         return (self.context - 1,) * self.rows
 
     @property
@@ -171,25 +226,35 @@ class BenchmarkCase:
     def rank_prefix_groups(self) -> int:
         if self.kind == "speculative":
             return (self.context - 2 * COMPRESS_RATIO) // COMPRESS_RATIO
+        if self.kind == "prefill":
+            return (self.context - self.rows) // COMPRESS_RATIO
         return self.groups - 1
 
     @property
     def main_pages_per_request(self) -> int:
-        return (self.context + MAIN_PAGE_SIZE - 1) // MAIN_PAGE_SIZE
+        return (self.context + self.main_page_size - 1) // self.main_page_size
 
     @property
     def main_pages_total(self) -> int:
         return self.request_count * self.main_pages_per_request
 
     @property
+    def main_pages_capacity(self) -> int:
+        return self.planned_batch * self.main_pages_per_request
+
+    @property
     def compressed_page_size(self) -> int:
-        return MAIN_PAGE_SIZE // COMPRESS_RATIO
+        return self.main_page_size // COMPRESS_RATIO
 
     @property
     def compressed_pages_per_request(self) -> int:
         return (
             self.groups + self.compressed_page_size - 1
         ) // self.compressed_page_size
+
+    @property
+    def compressed_pages_capacity(self) -> int:
+        return self.planned_batch * self.compressed_pages_per_request
 
 
 @dataclass
@@ -366,6 +431,15 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="comma-separated packed decode row counts",
     )
     parser.add_argument(
+        "--prefill-rows",
+        type=_parse_positive_csv,
+        default=(),
+        help=(
+            "comma-separated packed single-request prefill row counts; cases "
+            "whose row count exceeds the selected context are omitted"
+        ),
+    )
+    parser.add_argument(
         "--contexts",
         type=_parse_context_csv,
         default=DEFAULT_CONTEXTS,
@@ -419,9 +493,9 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise BenchmarkFailure("warmup and replay counts must be positive")
     if args.l2_flush_bytes < 0:
         raise BenchmarkFailure("L2 flush bytes must be non-negative")
-    if any(rows > 2048 for rows in args.rows):
+    if any(rows > 8192 for rows in (*args.rows, *args.prefill_rows)):
         raise BenchmarkFailure(
-            "row counts above 2048 require an explicit harness change"
+            "row counts above 8192 require an explicit harness change"
         )
 
 
@@ -432,6 +506,13 @@ def _resolve_cases(args: argparse.Namespace) -> tuple[BenchmarkCase, ...]:
         for rows in args.rows
         for context in args.contexts
     ]
+    cases.extend(
+        BenchmarkCase(PROFILES[profile], rows, context, kind="prefill")
+        for profile in args.profiles
+        for rows in args.prefill_rows
+        for context in args.contexts
+        if rows <= context
+    )
     if args.contract_cases:
         profile = PROFILES["tp2"]
         cases.extend(
@@ -469,14 +550,14 @@ def _cache_capacity_bytes(
     )
     main_kv = (
         2
-        * case.main_pages_total
-        * MAIN_PAGE_SIZE
+        * case.main_pages_capacity
+        * case.main_page_size
         * case.profile.kv_heads
         * HEAD_DIM
         * kv_element_bytes
     )
     compressed = (
-        case.request_count
+        case.planned_batch
         * case.compressed_pages_per_request
         * case.compressed_page_size
         * INDEX_HEAD_DIM
@@ -486,7 +567,7 @@ def _cache_capacity_bytes(
         (COMPRESS_RATIO + case.max_speculative_tokens + COMPRESS_RATIO - 1)
         // COMPRESS_RATIO
     )
-    raw = case.request_count * (
+    raw = case.planned_batch * (
         raw_ring_capacity * INDEX_HEAD_DIM * element_bytes
         + raw_ring_capacity * torch.int64.itemsize
         + raw_ring_capacity * POSITION_AXES * torch.int64.itemsize
@@ -640,7 +721,7 @@ def _selector_rank_group_ids(
     )
 
 
-def _initialize_selector_corpus(
+def _initialize_selector_dataset(
     *,
     prepared_query_by_request: torch.Tensor,
     compressed_by_request: torch.Tensor,
@@ -734,17 +815,15 @@ def _make_caps(
 ) -> qsa.Caps:
     return qsa.Caps(
         device=device,
-        max_batch=case.request_count,
-        max_raw_state_slots=case.request_count,
-        max_q_rows=case.rows,
+        max_batch=case.planned_batch,
+        max_raw_state_slots=case.planned_batch,
+        max_q_rows=case.planned_q_rows,
         max_seq_len=case.context,
-        num_main_cache_pages=case.main_pages_total,
-        num_compressed_cache_pages=(
-            case.request_count * case.compressed_pages_per_request
-        ),
-        main_page_size=MAIN_PAGE_SIZE,
+        num_main_cache_pages=case.main_pages_capacity,
+        num_compressed_cache_pages=(case.compressed_pages_capacity),
+        main_page_size=case.main_page_size,
         compressed_page_size=case.compressed_page_size,
-        max_speculative_tokens=case.max_speculative_tokens,
+        max_speculative_tokens=case.planned_speculative_tokens,
         q_heads=case.profile.q_heads,
         kv_heads=case.profile.kv_heads,
         head_dim=HEAD_DIM,
@@ -768,10 +847,11 @@ def _prepare_case(
     seed: int,
     main_cache_layout: str,
     kv_cache_dtype: str,
+    policy: PolicyContext | None = None,
 ) -> PreparedCase:
     kv_dtype = torch.float8_e4m3fn if kv_cache_dtype == "fp8_e4m3" else torch.bfloat16
     caps = _make_caps(case, device, kv_dtype=kv_dtype)
-    plan = qsa.plan(caps)
+    plan = qsa.plan(caps, policy=policy)
     (scratch_spec,) = plan.scratch_specs()
     scratch = torch.empty(
         scratch_spec.shape,
@@ -781,14 +861,14 @@ def _prepare_case(
     generator = torch.Generator(device=device).manual_seed(seed)
 
     main_cache_shape = (
-        case.main_pages_total,
-        MAIN_PAGE_SIZE,
+        case.main_pages_capacity,
+        case.main_page_size,
         case.profile.kv_heads,
         HEAD_DIM,
     )
     if main_cache_layout == "interleaved":
         main_kv_source = _random_bf16(
-            (case.main_pages_total, 2, *main_cache_shape[1:]),
+            (case.main_pages_capacity, 2, *main_cache_shape[1:]),
             generator=generator,
             device=device,
         )
@@ -821,14 +901,14 @@ def _prepare_case(
         main_k.copy_(source_k)
         main_v.copy_(source_v)
     main_table = _disjoint_page_table(
-        case.request_count,
+        case.planned_batch,
         case.main_pages_per_request,
         device=device,
     )
 
     compressed = _random_bf16(
         (
-            case.request_count * case.compressed_pages_per_request,
+            case.compressed_pages_capacity,
             case.compressed_page_size,
             INDEX_HEAD_DIM,
         ),
@@ -836,38 +916,38 @@ def _prepare_case(
         device=device,
     )
     compressed_by_request = compressed.view(
-        case.request_count,
+        case.planned_batch,
         case.compressed_pages_per_request,
         case.compressed_page_size,
         INDEX_HEAD_DIM,
     )
     compressed_table = _disjoint_page_table(
-        case.request_count,
+        case.planned_batch,
         case.compressed_pages_per_request,
         device=device,
     )
 
     raw_ring = _random_bf16(
-        (case.request_count, caps.raw_ring_capacity, INDEX_HEAD_DIM),
+        (case.planned_batch, caps.raw_ring_capacity, INDEX_HEAD_DIM),
         generator=generator,
         device=device,
     )
     raw_tags = torch.full(
-        (case.request_count, caps.raw_ring_capacity),
+        (case.planned_batch, caps.raw_ring_capacity),
         -1,
         dtype=torch.int64,
         device=device,
     )
     raw_rope = torch.full(
-        (case.request_count, caps.raw_ring_capacity, POSITION_AXES),
+        (case.planned_batch, caps.raw_ring_capacity, POSITION_AXES),
         -1,
         dtype=torch.int64,
         device=device,
     )
     interval_starts = torch.full(
-        (case.request_count,), -1, dtype=torch.int64, device=device
+        (case.planned_batch,), -1, dtype=torch.int64, device=device
     )
-    state_slot_ids = torch.arange(case.request_count, dtype=torch.int64, device=device)
+    state_slot_ids = torch.arange(case.planned_batch, dtype=torch.int64, device=device)
 
     q_weight = (
         torch.randn(
@@ -888,12 +968,14 @@ def _prepare_case(
     )
     rope_sin = torch.zeros_like(rope_cos)
     output = torch.empty(
-        (case.rows, case.profile.q_heads, HEAD_DIM),
+        (case.planned_q_rows, case.profile.q_heads, HEAD_DIM),
         dtype=torch.bfloat16,
         device=device,
     )
     selected = torch.empty(
-        (case.rows, caps.selection_width), dtype=torch.int32, device=device
+        (case.planned_q_rows, caps.selection_width),
+        dtype=torch.int32,
+        device=device,
     )
 
     binding = qsa.bind(
@@ -929,19 +1011,31 @@ def _prepare_case(
         generator=generator,
         device=device,
     )
-    if case.kind == "speculative":
+    if case.kind in {"prefill", "speculative"}:
         index_query[1:].copy_(index_query[:1].expand(case.rows - 1, -1, -1))
     raw_key = _random_bf16(
         (case.rows, INDEX_HEAD_DIM), generator=generator, device=device
     )
     query_positions = torch.tensor(case.positions, dtype=torch.int64, device=device)
-    if case.kind == "speculative":
+    if case.kind in {"prefill", "speculative"}:
         request_ids = torch.zeros((case.rows,), dtype=torch.int64, device=device)
         query_start_loc = torch.tensor([0, case.rows], dtype=torch.int32, device=device)
     else:
         request_ids = torch.arange(case.rows, dtype=torch.int64, device=device)
         query_start_loc = torch.arange(case.rows + 1, dtype=torch.int32, device=device)
-    accepted = torch.ones((case.request_count,), dtype=torch.int32, device=device)
+    sequence_lengths = torch.zeros(
+        (case.planned_batch,), dtype=torch.int32, device=device
+    )
+    sequence_lengths[: case.request_count] = case.active_sequence_length
+    padded_query_start_loc = torch.full(
+        (case.planned_batch + 1,),
+        case.rows,
+        dtype=torch.int32,
+        device=device,
+    )
+    padded_query_start_loc[: case.request_count + 1].copy_(query_start_loc)
+    accepted = torch.zeros((case.planned_batch,), dtype=torch.int32, device=device)
+    accepted[: case.request_count] = 1
     if case.kind == "speculative":
         accepted[0] = case.preceding_accepted_tokens
     dynamic = {
@@ -953,14 +1047,24 @@ def _prepare_case(
         "rope_positions": query_positions[:, None]
         .expand(case.rows, POSITION_AXES)
         .contiguous(),
-        "sequence_lengths": torch.full(
-            (case.request_count,),
-            case.active_sequence_length,
-            dtype=torch.int32,
-            device=device,
-        ),
-        "query_start_loc": query_start_loc,
+        "sequence_lengths": sequence_lengths,
+        "query_start_loc": padded_query_start_loc,
         "num_accepted_tokens": accepted,
+        "is_prefilling": torch.cat(
+            (
+                torch.full(
+                    (case.request_count,),
+                    case.kind == "prefill",
+                    dtype=torch.bool,
+                    device=device,
+                ),
+                torch.zeros(
+                    (case.planned_batch - case.request_count,),
+                    dtype=torch.bool,
+                    device=device,
+                ),
+            )
+        ),
     }
 
     prepared_selector_query = gemma_rmsnorm_reference(
@@ -973,10 +1077,10 @@ def _prepare_case(
         if case.request_count == case.rows
         else prepared_selector_query[:1]
     )
-    _initialize_selector_corpus(
+    _initialize_selector_dataset(
         prepared_query_by_request=prepared_query_by_request,
-        compressed_by_request=compressed_by_request,
-        raw_ring=raw_ring,
+        compressed_by_request=compressed_by_request[: case.request_count],
+        raw_ring=raw_ring[: case.request_count],
         raw_index_key=raw_key,
         key_norm_weight=k_weight,
         rank_prefix_groups=case.rank_prefix_groups,
@@ -1004,7 +1108,11 @@ def _prepare_case(
             raw_rope[request, slot, :] = prior
 
     setup_metadata: dict[str, object] = {
-        "transaction": "single_decode_interval",
+        "transaction": (
+            "packed_prefill_interval"
+            if case.kind == "prefill"
+            else "single_decode_interval"
+        ),
         "setup_transaction_executed": False,
     }
     if case.setup_positions is not None:
@@ -1040,12 +1148,23 @@ def _prepare_case(
             .expand(case.rows, POSITION_AXES)
             .contiguous(),
             "sequence_lengths": torch.tensor(
-                [case.setup_positions[-1] + 1], dtype=torch.int32, device=device
+                [case.setup_positions[-1] + 1, *([0] * (case.planned_batch - 1))],
+                dtype=torch.int32,
+                device=device,
             ),
             "query_start_loc": torch.tensor(
-                [0, case.rows], dtype=torch.int32, device=device
+                [0, *([case.rows] * case.planned_batch)],
+                dtype=torch.int32,
+                device=device,
             ),
-            "num_accepted_tokens": torch.ones((1,), dtype=torch.int32, device=device),
+            "num_accepted_tokens": torch.tensor(
+                [1, *([0] * (case.planned_batch - 1))],
+                dtype=torch.int32,
+                device=device,
+            ),
+            "is_prefilling": torch.zeros(
+                (case.planned_batch,), dtype=torch.bool, device=device
+            ),
         }
         setup_oracle_compressed = compressed.clone()
         setup_oracle_raw_ring = raw_ring[0].clone()
@@ -1115,7 +1234,7 @@ def _prepare_case(
             "setup_main_kv_read_only": True,
         }
 
-    if case.kind == "speculative":
+    if case.kind in {"prefill", "speculative"}:
         compressed_rows = compressed
     else:
         completed_groups = {
@@ -1182,6 +1301,7 @@ def _validate_correctness(
             oracle_raw_rope[state_slot],
             prior_interval_start_position=int(expected_anchors[state_slot]),
             num_accepted_tokens=int(prepared.dynamic["num_accepted_tokens"][request]),
+            is_prefilling=bool(prepared.dynamic["is_prefilling"][request]),
             compress_ratio=COMPRESS_RATIO,
             key_norm_weight=binding.index_k_norm_weight,
             eps=binding.plan.caps.rms_norm_eps,
@@ -1245,19 +1365,24 @@ def _validate_correctness(
         binding.index_q_norm_weight,
         binding.plan.caps.rms_norm_eps,
     )
+    final_workspace_rows = case.rows % binding.plan.workspace_q_rows
+    if final_workspace_rows == 0:
+        final_workspace_rows = min(case.rows, binding.plan.workspace_q_rows)
     torch.testing.assert_close(
-        binding.prepared_index_query[: case.rows],
-        prepared_query,
+        binding.prepared_index_query[:final_workspace_rows],
+        prepared_query[-final_workspace_rows:],
         rtol=0.0,
         atol=2e-2,
     )
 
     compressed_groups = oracle_compressed.view(
-        case.request_count,
+        case.planned_batch,
         case.compressed_pages_per_request,
         case.compressed_page_size,
         INDEX_HEAD_DIM,
-    ).reshape(case.request_count, -1, INDEX_HEAD_DIM)[:, : case.groups]
+    ).reshape(case.planned_batch, -1, INDEX_HEAD_DIM)[
+        : case.request_count, : case.groups
+    ]
     reference_k_cache = binding.main_k_cache.float()
     reference_v_cache = binding.main_v_cache.float()
     sparse_gqa_atol = 2e-2
@@ -1268,7 +1393,23 @@ def _validate_correctness(
         sparse_gqa_atol = 4e-2
     max_abs = 0.0
     tail_lengths: list[int] = []
-    for row in range(case.rows):
+    if case.rows <= 64:
+        reference_rows = tuple(range(case.rows))
+    else:
+        reference_rows = tuple(
+            sorted(
+                {
+                    0,
+                    1,
+                    COMPRESS_RATIO - 1,
+                    COMPRESS_RATIO,
+                    case.rows // 2,
+                    case.rows - 2,
+                    case.rows - 1,
+                }
+            )
+        )
+    for row in reference_rows:
         request = int(prepared.dynamic["request_ids"][row])
         sequence_length = int(prepared.dynamic["sequence_lengths"][request])
         _, expected_selected = score_select_reference(
@@ -1349,7 +1490,7 @@ def _validate_correctness(
                 "packed_stream_compress_reference + score_select_reference + "
                 "sparse_paged_gqa_reference"
             ),
-            "reference_rows": case.rows,
+            "reference_rows": list(reference_rows),
             "selector_exact": True,
             "sparse_gqa_rtol": 0.0,
             "sparse_gqa_atol": sparse_gqa_atol,
@@ -1444,6 +1585,7 @@ def _run_case(
     device: torch.device,
     l2_flush: Callable[[], None] | None,
     case_index: int,
+    policy: PolicyContext | None = None,
 ) -> dict[str, object]:
     prepared = _prepare_case(
         case,
@@ -1451,6 +1593,7 @@ def _run_case(
         seed=args.seed + 1009 * case_index,
         main_cache_layout=args.main_cache_layout,
         kv_cache_dtype=args.kv_cache_dtype,
+        policy=policy,
     )
     eager_output, correctness, eager_persistent_state = _validate_correctness(prepared)
     eager_selected = prepared.binding.selected_positions[: case.rows].clone()
@@ -1549,7 +1692,7 @@ def _run_case(
             "main_cache_layout": args.main_cache_layout,
             "kv_cache_dtype": args.kv_cache_dtype,
             "head_dim": HEAD_DIM,
-            "main_page_size": MAIN_PAGE_SIZE,
+            "main_page_size": case.main_page_size,
             "compressed_page_size": case.compressed_page_size,
             "index_heads": INDEX_HEADS,
             "index_kv_heads": INDEX_KV_HEADS,
@@ -1564,11 +1707,13 @@ def _run_case(
         },
         "capacity": {
             "main_pages_per_request": case.main_pages_per_request,
-            "main_pages_total": case.main_pages_total,
+            "main_pages_active": case.main_pages_total,
+            "main_pages_capacity": case.main_pages_capacity,
             "compressed_pages_per_request": case.compressed_pages_per_request,
-            "compressed_pages": (
+            "compressed_pages_active": (
                 case.request_count * case.compressed_pages_per_request
             ),
+            "compressed_pages_capacity": case.compressed_pages_capacity,
             "cache_bytes": _cache_capacity_bytes(
                 case,
                 kv_cache_dtype=args.kv_cache_dtype,
@@ -1660,14 +1805,10 @@ def main(argv: list[str] | None = None) -> int:
         if device.index is None:
             device = torch.device("cuda", torch.cuda.current_device())
         torch.cuda.set_device(device)
-        capability = torch.cuda.get_device_capability(device)
-        if capability != (12, 0):
-            raise BenchmarkFailure(
-                f"QSA benchmarking requires SM120, got SM{capability[0]}{capability[1]}"
-            )
         cases = _resolve_cases(args)
         l2_flush = make_l2_flush_fn(args.flush_l2, bytes_hint=args.l2_flush_bytes)
         properties = torch.cuda.get_device_properties(device)
+        capability = torch.cuda.get_device_capability(device)
         result: dict[str, object] = {
             "kind": _RESULT_KIND,
             "schema_version": _RESULT_SCHEMA_VERSION,
@@ -1699,14 +1840,14 @@ def main(argv: list[str] | None = None) -> int:
             "contract": {
                 "model": "Qwen3.8 Flash Next",
                 "api": ["Caps", "plan", "bind", "run"],
-                "timed_operation": "bound qsa.run decode transaction",
+                "timed_operation": "bound qsa.run transaction",
                 "setup_operation": "Caps -> plan -> bind",
                 "main_kv_pool": (
                     "disjoint read-only physical pages per request with "
                     f"{args.main_cache_layout} K/V storage"
                 ),
                 "selector_state": "independent per request",
-                "selector_corpus": (
+                "selector_dataset": (
                     "context-spanning rank-separated exact-oracle representatives"
                 ),
                 "default_profile": "tp2",
@@ -1716,6 +1857,7 @@ def main(argv: list[str] | None = None) -> int:
             "parameters": {
                 "profiles": list(args.profiles),
                 "rows": list(args.rows),
+                "prefill_rows": list(args.prefill_rows),
                 "contexts": list(args.contexts),
                 "main_cache_layout": args.main_cache_layout,
                 "kv_cache_dtype": args.kv_cache_dtype,

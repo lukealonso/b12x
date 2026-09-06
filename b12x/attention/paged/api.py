@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 from ..._lib.gating import default_is_supported
+from ...policy import PolicyContext, get_auto_policy
 from ._forward import (
     clear_paged_caches as clear_caches,
 )
@@ -28,11 +31,12 @@ from ._scratch import (
     plan_decode_graph_scratch_envelope as decode_graph_scratch_envelope,
 )
 from ._scratch import (
-    plan_paged_attention_scratch as plan,
+    plan_paged_attention_scratch,
 )
 from .planner import (
     PagedDecodeGraphCapacity as DecodeGraphCapacity,
 )
+from ._policy import GqaConfig, GqaQuery
 from .planner import (
     PagedExtendGraphCapacity as ExtendGraphCapacity,
 )
@@ -60,6 +64,20 @@ from .workspace import (
 from . import META
 
 
+def plan(caps: Caps, *, policy: PolicyContext | None = None) -> Plan:
+    """Size fixed scratch under one immutable device policy context."""
+
+    if not isinstance(caps, Caps):
+        raise TypeError("caps must be paged.Caps")
+    policy = policy or caps.policy_context or get_auto_policy(caps.device)
+    if not isinstance(policy, PolicyContext):
+        raise TypeError("policy must be a PolicyContext")
+    policy.require_device(caps.device)
+    return plan_paged_attention_scratch(
+        replace(caps, policy_context=policy),
+    )
+
+
 def bind(plan: Plan, **kwargs) -> Binding:
     """Bind runtime tensors and caller-owned scratch to a plan.
 
@@ -81,6 +99,8 @@ __all__ = [
     "Workspace",
     "Budget",
     "DecodeGraphCapacity",
+    "GqaConfig",
+    "GqaQuery",
     "ExtendGraphCapacity",
     "VerifyGraphCapacity",
     "DecodeGraphScratchEnvelope",

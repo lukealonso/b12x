@@ -6,6 +6,131 @@ import torch
 import b12x.norm.mhc._impl as residual_impl
 from b12x.norm.mhc._impl import B12XMHCBinding, B12XMHCScratchCaps, plan_mhc_scratch
 from b12x.norm.mhc._impl import MHC_DEFAULT_BLOCK_K, MHC_DEFAULT_SPLIT_K
+from b12x.norm.mhc._policy import MHC_POLICY, MhcConfig, MhcQuery
+from b12x.policy import (
+    MHC,
+    DeviceIdentity,
+    PolicyContext,
+    PolicyMode,
+    PolicySource,
+)
+
+
+def _medium_tf32_config(*, stages: int) -> MhcConfig:
+    return MhcConfig(
+        backend="tf32_tma",
+        projection_tile_m=64,
+        projection_tile_n=24,
+        projection_tile_k=64,
+        projection_num_stages=stages,
+        projection_num_m_warps=4,
+        projection_num_n_warps=1,
+        projection_k_splits=8,
+    )
+
+
+def test_mhc_policy_owns_medium_prefill_projection_geometry() -> None:
+    config = _medium_tf32_config(stages=2)
+    policy = PolicyContext.for_identity(
+        None,
+        mode=PolicyMode.HEURISTIC_ONLY,
+    ).with_override(MHC, config)
+    plan = plan_mhc_scratch(
+        B12XMHCScratchCaps(
+            device="cpu",
+            max_tokens=3_072,
+            hidden_size=4_096,
+            split_k=64,
+        ),
+        policy=policy,
+    )
+
+    assert plan.config is config
+    assert plan.config.projection_tile_m == 64
+    assert plan.config.projection_tile_n == 24
+    assert plan.config.projection_tile_k == 64
+    assert plan.config.projection_num_stages == 2
+    assert plan.config.projection_k_splits == 8
+
+
+@pytest.mark.parametrize(
+    ("device", "tile_m", "k_splits"),
+    (
+        (
+            DeviceIdentity(
+                vendor="nvidia",
+                product_name="nvidia gb10",
+                compute_capability=(12, 1),
+                sm_count=48,
+            ),
+            128,
+            4,
+        ),
+        (
+            DeviceIdentity(
+                vendor="nvidia",
+                product_name=(
+                    "nvidia rtx pro 6000 blackwell max-q workstation edition"
+                ),
+                compute_capability=(12, 0),
+                sm_count=188,
+            ),
+            64,
+            8,
+        ),
+    ),
+)
+def test_embedded_mhc_profiles_resolve_measured_medium_prefill_geometry(
+    device: DeviceIdentity,
+    tile_m: int,
+    k_splits: int,
+) -> None:
+    resolution = PolicyContext.for_identity(device).resolve(
+        MHC_POLICY,
+        MhcQuery(
+            dtype="bfloat16",
+            max_tokens=3_072,
+            hidden_size=4_096,
+            split_k=64,
+        ),
+    )
+
+    assert resolution.source is PolicySource.PREPLANNED
+    assert resolution.config.backend == "tf32_tma"
+    assert resolution.config.projection_tile_m == tile_m
+    assert resolution.config.projection_k_splits == k_splits
+
+
+@pytest.mark.parametrize(
+    ("tokens", "tile_m", "stages", "k_splits"),
+    (
+        (2_303, 16, 1, 1),
+        (2_304, 64, 3, 8),
+        (3_072, 64, 2, 8),
+        (3_584, 192, 2, 8),
+        (8_192, 128, 2, 4),
+    ),
+)
+def test_mhc_heuristic_has_explicit_prefill_capacity_regimes(
+    tokens: int,
+    tile_m: int,
+    stages: int,
+    k_splits: int,
+) -> None:
+    query = MhcQuery(
+        dtype="bfloat16",
+        max_tokens=tokens,
+        hidden_size=4_096,
+        split_k=64,
+    )
+
+    config = MHC_POLICY.heuristic(query, None)
+    MHC_POLICY.validate_config(query, config, None)
+
+    assert config.backend == "tf32_tma"
+    assert config.projection_tile_m == tile_m
+    assert config.projection_num_stages == stages
+    assert config.projection_k_splits == k_splits
 
 
 def test_mhc_scratch_plan_exposes_one_component_scratch_spec() -> None:

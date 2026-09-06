@@ -1380,6 +1380,7 @@ def _make_glm_sparse_scratch(device, *, topk, max_chunks, num_heads, s_kv):
     )
 
     caps = B12XSparseMLAScratchCaps(
+        softmax_scale=1.0,
         device=device,
         num_q_heads=num_heads,
         max_q_rows=1,
@@ -1627,6 +1628,7 @@ def test_unified_decode_glm_multitoken_per_token_length(num_tokens) -> None:
 
     n_chunks = (topk + 64 - 1) // 64
     caps = B12XSparseMLAScratchCaps(
+        softmax_scale=1.0,
         device=device,
         num_q_heads=_GLM_NUM_HEADS,
         max_q_rows=num_tokens,
@@ -2383,3 +2385,61 @@ def test_unified_prefill_glm_mixed_per_token_length_with_zero_row(
             f"neg_pad={neg_pad_past_len}) O cos={cos}"
         )
         assert (got[t] - exp_O[t]).abs().max().item() < 3e-2
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("topk", [192, 100])
+def test_unified_prefill_dsv4_sub_container_topk_matches_ref(topk: int) -> None:
+    """A short prefill clamps the runtime top-k below index_topk (192 for a
+    192-token sequence); the entry must widen the rows to the 512 container and
+    match both the reference and a caller-padded 512-wide call."""
+    device = require_b12x_sparse_mla()
+    from b12x.attention._shared.mla.kernel import run_unified_prefill
+
+    num_tokens, num_heads = 16, _DSV4_HEADS
+    num_blocks = 8
+    case = prefill_ref.make_dsv4_prefill_case(
+        num_tokens=num_tokens,
+        num_heads=num_heads,
+        topk=topk,
+        num_blocks=num_blocks,
+        page_block_size=_DSV4_PAGE,
+        with_sink=False,
+        invalidate_half=True,
+        device=device,
+        seed=192,
+    )
+    q = case["q"].contiguous()
+    swa_cache = _repack_dsv4_to_compressed(case["kv_cache"], _DSV4_PAGE, num_blocks)
+    idx = case["topk_indices"].contiguous()
+    lengths = case["topk_lengths"].contiguous()
+
+    O, lse = run_unified_prefill(
+        q=q,
+        kv_cache=swa_cache,
+        topk_indices=idx,
+        topk_length=lengths,
+        sm_scale=case["sm_scale"],
+        page_block_size=_DSV4_PAGE,
+    )
+    padded_idx = torch.nn.functional.pad(idx, (0, 512 - topk), value=-1).contiguous()
+    O_padded, lse_padded = run_unified_prefill(
+        q=q,
+        kv_cache=swa_cache,
+        topk_indices=padded_idx,
+        topk_length=lengths,
+        sm_scale=case["sm_scale"],
+        page_block_size=_DSV4_PAGE,
+    )
+    torch.cuda.synchronize()
+
+    got = O.float()
+    exp = case["expected_O"].float()
+    assert got.shape == (num_tokens, num_heads, _DSV4_HEAD_DIM)
+    assert torch.isfinite(got).all()
+    assert torch.equal(O, O_padded)
+    assert torch.equal(lse, lse_padded)
+    cos = _cosine(got, exp)
+    assert cos > 0.999, f"DSV4 prefill topk={topk} O cos={cos}"
+    assert (got - exp).abs().max().item() < 2e-2
+    assert (lse.float() - case["expected_lse"].float()).abs().max().item() < 5e-2

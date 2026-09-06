@@ -18,7 +18,12 @@ from b12x._lib.compiler import KernelCompileSpec, compile as b12x_compile
 from cutlass.base_dsl.compiler import OptLevel as _DSLOptLevel
 
 _OPT_LEVEL_2 = _DSLOptLevel(2)
-from b12x.moe.fused_moe._impl import _DynamicMoEW4A8Launch, current_cuda_stream
+from b12x.moe.fused_moe._impl import (
+    _DynamicMoEW4A8Launch,
+    _pad_w4a8_grid_columns,
+    _pad_w4a8_grid_rows,
+    current_cuda_stream,
+)
 from b12x.moe._shared.kernels.dynamic import MoEDynamicKernelBackend
 from b12x.moe._shared.kernels.reference import (
     compare_to_reference,
@@ -147,6 +152,8 @@ def _run_w4a8_dynamic(
         w2_res = torch.zeros(E, K, n // 16, dtype=torch.uint8, device=device)
         ref_res_w13 = None
         ref_res_w2 = None
+        ref_w13_mx = w13_mx
+        ref_w2_mx = w2_mx
     else:
         w13_q = [_quantize_weight_nvfp4(w13_full[e]) for e in range(E)]
         w2_q = [_quantize_weight_nvfp4(w2_full[e]) for e in range(E)]
@@ -158,11 +165,40 @@ def _run_w4a8_dynamic(
         w2_mx = w2_mx.contiguous()
         w13_res = w13_res_e4m3.view(torch.uint8).contiguous()
         w2_res = w2_res_e4m3.view(torch.uint8).contiguous()
+        ref_w13_mx = w13_mx
+        ref_w2_mx = w2_mx
         ref_res_w13 = w13_res_e4m3
         ref_res_w2 = w2_res_e4m3
+        w13_mx = _pad_w4a8_grid_rows(
+            w13_mx,
+            logical_n=n,
+            is_gated=is_gated,
+        )
+        w13_res = _pad_w4a8_grid_rows(
+            w13_res,
+            logical_n=n,
+            is_gated=is_gated,
+        )
+        w2_mx = _pad_w4a8_grid_columns(
+            w2_mx,
+            logical_n=n,
+            elements_per_scale=32,
+        )
+        w2_res = _pad_w4a8_grid_columns(
+            w2_res,
+            logical_n=n,
+            elements_per_scale=16,
+        )
 
     w13_packed = torch.stack([q[0] for q in w13_q]).contiguous()
     w2_packed = torch.stack([q[0] for q in w2_q]).contiguous()
+    ref_w13_packed = w13_packed
+    if recipe == "w4a8_nvfp4":
+        w13_packed = _pad_w4a8_grid_rows(
+            w13_packed,
+            logical_n=n,
+            is_gated=is_gated,
+        )
     ones = torch.ones(E, device=device)
 
     reference_ids, reference_weights = _active_route_reference_inputs(
@@ -170,8 +206,8 @@ def _run_w4a8_dynamic(
     )
     reference = moe_reference_w4a8_mx(
         x.float(),
-        w13_packed, w13_mx, ref_res_w13, ones,
-        w2_packed, w2_mx, ref_res_w2, ones,
+        ref_w13_packed, ref_w13_mx, ref_res_w13, ones,
+        w2_packed, ref_w2_mx, ref_res_w2, ones,
         reference_ids, reference_weights, E, K, n,
         activation=activation,
     )
@@ -181,7 +217,11 @@ def _run_w4a8_dynamic(
     # full tiles its routed rows occupy.
     phys_tiles = E + (m * top_k + tile_m - 1) // tile_m
     rows_padded = phys_tiles * tile_m
-    gate_tile_cnt = (w1_n // _TILE_N) // (2 if is_gated else 1)
+    gate_tile_cnt = (
+        (n + _TILE_N - 1) // _TILE_N
+        if is_gated
+        else (w1_n + _TILE_N - 1) // _TILE_N
+    )
     max_tasks = phys_tiles * max(gate_tile_cnt, 1)
     mac = 4
 
@@ -235,8 +275,16 @@ def _run_w4a8_dynamic(
     launch = _DynamicMoEW4A8Launch(kernel, k=K, n=n, w1_n=w1_n, num_topk=top_k)
 
     weight_dtype = cutlass.Float4E2M1FN
+    dynamic_w1_n = (
+        (2 if is_gated else 1) * ((n + _TILE_N - 1) // _TILE_N) * _TILE_N
+        if recipe == "w4a8_nvfp4"
+        else w1_n
+    )
     b_w13_fake = cute.runtime.make_fake_compact_tensor(
-        weight_dtype, (w1_n, K, E), stride_order=(1, 0, 2), assumed_align=16
+        weight_dtype,
+        (dynamic_w1_n, K, E),
+        stride_order=(1, 0, 2),
+        assumed_align=16,
     )
     b_down_fake = cute.runtime.make_fake_compact_tensor(
         weight_dtype, (K, n, E), stride_order=(1, 0, 2), assumed_align=16
@@ -745,6 +793,27 @@ def test_w4a8_dynamic_matches_oracle(recipe: str, activation: str) -> None:
         E=4, m=8, K=256, n=128, top_k=2, seed=11,
     )
     assert out.abs().sum().item() > 0, "kernel produced all zeros"
+    metrics = compare_to_reference(out.float(), ref)
+    assert metrics.cos > 0.999, metrics
+    ref_rms = ref.float().square().mean().sqrt().item()
+    assert metrics.rmse <= max(0.03 * ref_rms, 5e-3), (metrics, ref_rms)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_w4a8_nvfp4_dynamic_n160_tail_matches_oracle() -> None:
+    require_b12x()
+    out, ref = _run_w4a8_dynamic(
+        recipe="w4a8_nvfp4",
+        activation="silu",
+        E=4,
+        m=32,
+        K=256,
+        n=160,
+        top_k=2,
+        seed=160,
+        tile_m=32,
+    )
+
     metrics = compare_to_reference(out.float(), ref)
     assert metrics.cos > 0.999, metrics
     ref_rms = ref.float().square().mean().sqrt().item()
