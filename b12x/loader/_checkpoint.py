@@ -338,7 +338,7 @@ class DirectWeightSession:
         _, entry = item
         if (
             source._version != 0
-            or source.dtype != entry.dtype
+            or source.element_size() != entry.dtype.itemsize
             or source.is_neg()
             or source.is_conj()
             or destination.is_neg()
@@ -374,7 +374,8 @@ class DirectWeightSession:
             expand = (
                 source.dtype == torch.bfloat16 and destination.dtype == torch.float32
             )
-            if destination.dtype == source.dtype or expand:
+            byte_cast = {source.dtype, destination.dtype} <= {torch.int8, torch.uint8}
+            if destination.dtype == source.dtype or expand or byte_cast:
                 elements = 1
                 axis = source.ndim - 1
                 while axis >= 0:

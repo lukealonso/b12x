@@ -16,8 +16,12 @@ Preparation may reuse weight storage in place, but shared weights are read-only
 during inference. New preparation outputs use ordinary CUDA storage. A final
 allocation audit rejects shared non-persistent buffers before serving starts.
 
-Initial serving checks cover Qwen 3.8 Flash Next with TP=1 and GLM 5.3 Flash
-with TP=2 and MTP off. Install the matching vLLM weight-transfer hooks:
+Serving checks cover Qwen 3.8 Flash Next with TP=1, GLM 5.3 Flash with TP=2,
+full GLM 5.3 with TP=4, and DeepSeek V4 Flash with TP=2. The full GLM and
+DeepSeek checks include short and medium prompts, prefix-cache hits, and CUDA
+graph replay with speculation disabled. DeepSeek TP=2 also passes with DSpark's
+seven-token draft, including a response spanning multiple verification iterations.
+Install the matching vLLM weight-transfer hooks:
 
 ```sh
 VLLM_PLUGINS=b12x_loader vllm serve MODEL --load-format b12x
@@ -46,7 +50,9 @@ scale validation, and final weight preparation. A failed batch drains all worker
 before reporting failure. Arbitrary consumers of queued parameter values require
 an explicit completion fence; this is an initial-load integration contract.
 Numerical loading callbacks use `materialize_weight` to read owned inputs before
-operating on them, including GLM's paired selector weights and scales.
+operating on them, including GLM's paired selector weights and scales and full
+GLM's fused FP8 indexer projection. DeepSeek V4's model, MTP, and DSpark post-load
+hooks flush queued reads before deriving packed weights and mHC broadcasts.
 
 Weight destinations use `cudaHostAllocMapped | cudaHostAllocWriteCombined` and
 are explicitly `mlock`ed. Failure to lock final storage fails the allocation.
@@ -57,6 +63,8 @@ not support vLLM sleep mode. It preserves index/prefix filtering, including
 MTP. Byte-preserving contiguous routes read into the CPU alias after synchronizing
 the loading stream. BF16-to-FP32 reads occupy the first half of the final FP32
 allocation, then C99 expands backwards in place, preserving all BF16 bits.
+DeepSeek's signed FP4 payloads and E8M0 scale views preserve their raw bytes,
+including strided TP slices; these routes do not numerically cast FP8 values.
 Other contiguous casts use one reusable 8 MiB input allocation. Arbitrary
 arithmetic on source descriptors and unsupported layouts fail explicitly.
 

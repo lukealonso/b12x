@@ -133,6 +133,33 @@ def test_descriptor_views_read_the_selected_source_into_fused_parameters(tmp_pat
     torch.testing.assert_close(destination[:64].cpu(), torch.full((64, 64), -1.0))
 
 
+@pytest.mark.parametrize("tp_size", [2, 4])
+@pytest.mark.parametrize("dtype", [torch.int8, torch.float8_e8m0fnu])
+def test_mxfp4_tp_shards_preserve_packed_bytes_and_exponents(tmp_path, tp_size, dtype):
+    """Signed FP4 payloads and E8M0 views must not undergo numeric FP8 casts."""
+    bits = torch.arange(256, dtype=torch.uint8).repeat(64).reshape(256, 64)
+    path = tmp_path / "packed.safetensors"
+    save_file({"weight": bits.view(dtype)}, path)
+    with shared_pool(allocation="pinned_wc"), DirectWeightSession() as session:
+        source = dict(session.weights([path]))["weight"]
+        if dtype == torch.float8_e8m0fnu:
+            source = source.view(torch.uint8)
+        width = bits.shape[1] // tp_size
+        targets = []
+        for rank in range(tp_size):
+            shard = source[:, rank * width : (rank + 1) * width]
+            target = torch.empty(shard.shape, dtype=torch.uint8, device="cuda")
+            session(target, shard)
+            targets.append(target)
+        with pytest.raises(
+            NotImplementedError, match="unsupported data transformation"
+        ):
+            session(targets[0], source[:, :width].to(torch.float32))
+        session.flush()
+        assert session.stats()["transform_scratch_bytes"] == 0
+    assert torch.equal(torch.cat([t.cpu() for t in targets], dim=1), bits)
+
+
 def test_truncated_direct_input_fails_without_buffered_retry(tmp_path):
     path = tmp_path / "short"
     path.write_bytes(bytes(4096))
