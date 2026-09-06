@@ -76,19 +76,31 @@ def test_captured_routing_loads_tensor_and_dict_payloads(tmp_path) -> None:
     ids = torch.randint(0, NUM_EXPERTS, (37, TOP_K), dtype=torch.int64)
     tensor_path = tmp_path / "ids.pt"
     torch.save(ids, tensor_path)
-    loaded, weights = _load_topk_ids(tensor_path, torch.device("cpu"))
+    loaded, weights, layer = _load_topk_ids(tensor_path, torch.device("cpu"))
     assert loaded.dtype == torch.int32 and loaded.shape == (37, TOP_K)
     assert torch.equal(loaded.to(torch.int64), ids)
-    assert weights is None
+    assert weights is None and layer is None
 
     routing = torch.softmax(torch.randn(37, TOP_K), dim=-1)
     dict_path = tmp_path / "routing.pt"
-    torch.save({"topk_ids": ids.to(torch.int32), "topk_weights": routing}, dict_path)
-    loaded, weights = _load_topk_ids(dict_path, torch.device("cpu"))
+    torch.save(
+        {
+            "topk_ids": ids.to(torch.int32),
+            "topk_weights": routing,
+            "layer": 12,
+            "num_tokens": 37,
+        },
+        dict_path,
+    )
+    loaded, weights, layer = _load_topk_ids(dict_path, torch.device("cpu"))
     assert torch.equal(loaded.to(torch.int64), ids)
     assert weights is not None and torch.equal(weights, routing)
+    assert layer == 12
 
     bad_path = tmp_path / "bad.pt"
+    torch.save({"topk_ids": ids.to(torch.int32), "num_tokens": 36}, bad_path)
+    with pytest.raises(ValueError, match="num_tokens=36"):
+        _load_topk_ids(bad_path, torch.device("cpu"))
     torch.save(torch.zeros((5, 8), dtype=torch.int32), bad_path)
     with pytest.raises(ValueError, match=r"\[tokens, 16\]"):
         _load_topk_ids(bad_path, torch.device("cpu"))

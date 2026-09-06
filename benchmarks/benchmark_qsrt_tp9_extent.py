@@ -23,6 +23,7 @@ import argparse
 import hashlib
 import json
 from pathlib import Path
+from typing import NamedTuple
 
 import torch
 
@@ -51,11 +52,31 @@ def _zipf_topk_ids(m: int, exponent: float, device: torch.device) -> torch.Tenso
     return ids.to(torch.int32)
 
 
-def _load_topk_ids(path: Path, device: torch.device) -> tuple[torch.Tensor, torch.Tensor | None]:
+class CapturedRouting(NamedTuple):
+    """A routing captured from serving: ``topk_ids`` is ``[tokens, 16]``
+    int32; ``topk_weights`` (optional) the matching fp32 router weights;
+    ``layer`` the MoE layer the capture came from when the file records it."""
+
+    topk_ids: torch.Tensor
+    topk_weights: torch.Tensor | None
+    layer: int | None
+
+
+def _load_topk_ids(path: Path, device: torch.device) -> CapturedRouting:
+    """Load a captured routing saved with ``torch.save``.
+
+    Accepts a bare ``[tokens, 16]`` int tensor or a dict with ``topk_ids``
+    and optional ``topk_weights`` (same shape, fp32), ``layer`` (int) and
+    ``num_tokens`` (int, must equal the row count).
+    """
     payload = torch.load(path, map_location="cpu")
     weights = None
+    layer = None
+    num_tokens = None
     if isinstance(payload, dict):
         weights = payload.get("topk_weights")
+        layer = payload.get("layer")
+        num_tokens = payload.get("num_tokens")
         payload = payload["topk_ids"]
     ids = torch.as_tensor(payload)
     if ids.ndim != 2 or ids.shape[1] != TOP_K:
@@ -66,6 +87,11 @@ def _load_topk_ids(path: Path, device: torch.device) -> tuple[torch.Tensor, torc
         raise ValueError(f"{path}: expert ids must be int32 or int64, got {ids.dtype}")
     if int(ids.min()) < 0 or int(ids.max()) >= NUM_EXPERTS:
         raise ValueError(f"{path}: expert ids must lie in [0, {NUM_EXPERTS})")
+    if num_tokens is not None and int(num_tokens) != int(ids.shape[0]):
+        raise ValueError(
+            f"{path}: num_tokens={int(num_tokens)} does not match the "
+            f"{int(ids.shape[0])} captured rows"
+        )
     ids = ids.to(device=device, dtype=torch.int32).contiguous()
     if weights is not None:
         weights = torch.as_tensor(weights)
@@ -74,7 +100,7 @@ def _load_topk_ids(path: Path, device: torch.device) -> tuple[torch.Tensor, torc
                 f"{path}: topk_weights shape {tuple(weights.shape)} != ids {tuple(ids.shape)}"
             )
         weights = weights.to(device=device, dtype=torch.float32).contiguous()
-    return ids, weights
+    return CapturedRouting(ids, weights, None if layer is None else int(layer))
 
 
 def _routing_histogram(ids: torch.Tensor, chosen_block: int) -> dict:
@@ -199,8 +225,17 @@ def main():
         rank = args.rank
     captured_ids = None
     captured_weights = None
+    captured_layer = None
     if args.topk_ids is not None:
-        captured_ids, captured_weights = _load_topk_ids(args.topk_ids, device)
+        captured_ids, captured_weights, captured_layer = _load_topk_ids(
+            args.topk_ids, device
+        )
+        if captured_layer is not None and captured_layer != args.layer:
+            print(
+                f"captured routing comes from layer {captured_layer}; the "
+                f"weights are layer {args.layer}",
+                flush=True,
+            )
         m_values = (int(captured_ids.shape[0]),)
         if m_values[0] > args.max_tokens:
             print(
@@ -278,6 +313,8 @@ def main():
         if captured_ids is not None:
             ids = captured_ids
             routing_source = f"captured:{args.topk_ids}"
+            if captured_layer is not None:
+                routing_source += f"@layer{captured_layer}"
         elif zipf_exponent is not None:
             ids = _zipf_topk_ids(m, zipf_exponent, device)
             routing_source = f"zipf:{zipf_exponent}"
