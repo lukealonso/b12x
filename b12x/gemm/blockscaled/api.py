@@ -8,6 +8,7 @@ from ..._lib.gating import default_is_supported
 from ._linear import (
     Weight,
     blockscaled_mm as mm,
+    mxfp8_linear_pair as mm_pair,
     pack_weight,
     prewarm,
 )
@@ -106,6 +107,7 @@ __all__ = [
     "is_supported",
     "mm",
     "mm_block_fp8",
+    "mm_pair",
     "mm_mxfp4",
     "mm_nvfp4",
     "pack_weight",

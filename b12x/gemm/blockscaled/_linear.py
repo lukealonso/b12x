@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import functools
+import os
 from collections.abc import Iterable
 from dataclasses import dataclass
+from threading import Lock
 from typing import Any, TypeAlias
 
 import cutlass.cute as cute
@@ -49,6 +51,35 @@ class TensorFP8LinearWeight:
 
 
 Weight: TypeAlias = MXFP8LinearWeight | TensorFP8LinearWeight | NVFP4LinearWeight
+
+
+_PAIR_STREAM_LOCK = Lock()
+_PAIR_STREAMS: dict[tuple[int, int], torch.cuda.Stream] = {}
+
+
+def _paired_projection_stream(device: torch.device) -> torch.cuda.Stream:
+    """Return the B12X-owned projection stream for this process and device.
+
+    CUDA stream handles are process-local resources.  Keeping the stream
+    behind the custom-op boundary prevents Torch AOT artifacts from embedding
+    a handle created by the process that populated the compile cache.
+    """
+    device_index = device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    key = (os.getpid(), int(device_index))
+    with _PAIR_STREAM_LOCK:
+        stream = _PAIR_STREAMS.get(key)
+        if stream is not None:
+            return stream
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "the B12X paired-projection stream must be initialized before "
+                "CUDA graph capture"
+            )
+        stream = torch.cuda.Stream(device=device)
+        _PAIR_STREAMS[key] = stream
+        return stream
 
 
 def _align_up(value: int, alignment: int) -> int:
@@ -592,6 +623,114 @@ def _packed_mxfp8_fake(
 
 
 @torch.library.custom_op(
+    "b12x::blockscaled_packed_mxfp8_pair",
+    mutates_args=(),
+)
+def _packed_mxfp8_pair_op(
+    source_2d: torch.Tensor,
+    primary_weight_values: torch.Tensor,
+    primary_weight_scale_rows: torch.Tensor,
+    primary_weight_scale_mma: torch.Tensor,
+    primary_padded_in_features: int,
+    primary_out_features: int,
+    secondary_weight_values: torch.Tensor,
+    secondary_weight_scale_rows: torch.Tensor,
+    secondary_weight_scale_mma: torch.Tensor,
+    secondary_padded_in_features: int,
+    secondary_out_features: int,
+    expected_m: int,
+    parallel_max_tokens: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Execute independent packed MXFP8 projections with an optional overlap."""
+
+    def project(
+        weight_values: torch.Tensor,
+        weight_scale_rows: torch.Tensor,
+        weight_scale_mma: torch.Tensor,
+        padded_in_features: int,
+        out_features: int,
+    ) -> torch.Tensor:
+        return torch.ops.b12x.blockscaled_packed_mxfp8(
+            source_2d,
+            weight_values,
+            weight_scale_rows,
+            weight_scale_mma,
+            int(source_2d.shape[1]),
+            padded_in_features,
+            out_features,
+            expected_m,
+            None,
+        )
+
+    tokens = int(source_2d.shape[0])
+    if tokens > parallel_max_tokens:
+        return (
+            project(
+                primary_weight_values,
+                primary_weight_scale_rows,
+                primary_weight_scale_mma,
+                primary_padded_in_features,
+                primary_out_features,
+            ),
+            project(
+                secondary_weight_values,
+                secondary_weight_scale_rows,
+                secondary_weight_scale_mma,
+                secondary_padded_in_features,
+                secondary_out_features,
+            ),
+        )
+
+    current_stream = torch.cuda.current_stream(source_2d.device)
+    secondary_stream = _paired_projection_stream(source_2d.device)
+    secondary_stream.wait_stream(current_stream)
+    primary = project(
+        primary_weight_values,
+        primary_weight_scale_rows,
+        primary_weight_scale_mma,
+        primary_padded_in_features,
+        primary_out_features,
+    )
+    with torch.cuda.stream(secondary_stream):
+        secondary = project(
+            secondary_weight_values,
+            secondary_weight_scale_rows,
+            secondary_weight_scale_mma,
+            secondary_padded_in_features,
+            secondary_out_features,
+        )
+    current_stream.wait_stream(secondary_stream)
+    return primary, secondary
+
+
+@_packed_mxfp8_pair_op.register_fake
+def _packed_mxfp8_pair_fake(
+    source_2d: torch.Tensor,
+    primary_weight_values: torch.Tensor,
+    primary_weight_scale_rows: torch.Tensor,
+    primary_weight_scale_mma: torch.Tensor,
+    primary_padded_in_features: int,
+    primary_out_features: int,
+    secondary_weight_values: torch.Tensor,
+    secondary_weight_scale_rows: torch.Tensor,
+    secondary_weight_scale_mma: torch.Tensor,
+    secondary_padded_in_features: int,
+    secondary_out_features: int,
+    expected_m: int,
+    parallel_max_tokens: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Describe paired projection outputs without allocating CUDA storage."""
+    del primary_weight_values, primary_weight_scale_rows, primary_weight_scale_mma
+    del secondary_weight_values, secondary_weight_scale_rows
+    del secondary_weight_scale_mma, primary_padded_in_features
+    del secondary_padded_in_features, expected_m, parallel_max_tokens
+    return (
+        source_2d.new_empty((source_2d.shape[0], primary_out_features)),
+        source_2d.new_empty((source_2d.shape[0], secondary_out_features)),
+    )
+
+
+@torch.library.custom_op(
     "b12x::blockscaled_packed_mxfp8_prequantized",
     mutates_args=(),
     tags=(torch.Tag.needs_fixed_stride_order,),
@@ -770,6 +909,75 @@ def mxfp8_linear(
     if bias is not None:
         output = output + bias
     return output.view(*source_values.shape[:-1], out_features)
+
+
+def mxfp8_linear_pair(
+    source: torch.Tensor,
+    primary_weight: MXFP8LinearWeight,
+    secondary_weight: MXFP8LinearWeight,
+    *,
+    expected_m: int | None = None,
+    parallel_max_tokens: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Project one activation tensor through two independent MXFP8 weights.
+
+    The primary projection runs on the caller's current CUDA stream. When the
+    row count does not exceed ``parallel_max_tokens``, the secondary projection
+    runs on a B12X-owned process-local stream and the current stream waits for
+    it before the function returns. Larger inputs execute serially on the
+    current stream so bandwidth-bound prefill projections do not contend with
+    each other.
+    """
+    if not isinstance(primary_weight, MXFP8LinearWeight):
+        raise TypeError("primary_weight must be an MXFP8LinearWeight")
+    if not isinstance(secondary_weight, MXFP8LinearWeight):
+        raise TypeError("secondary_weight must be an MXFP8LinearWeight")
+    _check_gpu_tensor("source", source)
+    source_2d = _source_2d(source)
+    tokens, in_features = map(int, source_2d.shape)
+    if source_2d.dtype not in (torch.bfloat16, torch.float16):
+        raise ValueError(f"source dtype must be bf16/fp16, got {source_2d.dtype}")
+    if parallel_max_tokens <= 0:
+        raise ValueError("parallel_max_tokens must be positive")
+    if expected_m is not None and int(expected_m) <= 0:
+        raise ValueError("expected_m must be positive when provided")
+    for name, weight in (
+        ("primary_weight", primary_weight),
+        ("secondary_weight", secondary_weight),
+    ):
+        if in_features != int(weight.in_features):
+            raise ValueError(
+                f"source K={in_features} does not match {name} K={weight.in_features}"
+            )
+        if weight.weight.values.device != source_2d.device:
+            raise ValueError(f"source and {name} must be on the same device")
+
+    leading_shape = source.shape[:-1]
+    if tokens == 0:
+        return (
+            source.new_empty((*leading_shape, primary_weight.out_features)),
+            source.new_empty((*leading_shape, secondary_weight.out_features)),
+        )
+
+    primary, secondary = torch.ops.b12x.blockscaled_packed_mxfp8_pair(
+        source_2d,
+        primary_weight.weight.values,
+        primary_weight.weight.scale_rows,
+        primary_weight.weight.scale_mma,
+        primary_weight.padded_in_features,
+        primary_weight.out_features,
+        secondary_weight.weight.values,
+        secondary_weight.weight.scale_rows,
+        secondary_weight.weight.scale_mma,
+        secondary_weight.padded_in_features,
+        secondary_weight.out_features,
+        int(expected_m) if expected_m is not None else tokens,
+        int(parallel_max_tokens),
+    )
+    return (
+        primary.view(*leading_shape, primary_weight.out_features),
+        secondary.view(*leading_shape, secondary_weight.out_features),
+    )
 
 
 @torch.library.custom_op(
@@ -1243,6 +1451,7 @@ __all__ = [
     "is_mxfp8_linear_supported",
     "is_tensor_fp8_linear_supported",
     "mxfp8_linear",
+    "mxfp8_linear_pair",
     "pack_mxfp8_linear_weight",
     "pack_weight",
     "pack_tensor_fp8_linear_weight",

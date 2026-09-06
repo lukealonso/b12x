@@ -14,6 +14,7 @@ import torch
 from b12x._lib.utils import convert_sf_from_mma_layout
 from b12x.gemm import block_fp8_linear as bfl
 from b12x.gemm import blockscaled, mxfp8_linear
+from b12x.gemm.blockscaled import _linear as blockscaled_linear
 from b12x.gemm._shared.wo_mxfp8 import (
     dequantize_mxfp8_rows_torch,
 )
@@ -216,6 +217,97 @@ def test_mm_default_fused_path_captures_with_k_padding() -> None:
     torch.cuda.synchronize()
 
     torch.testing.assert_close(actual, eager, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("tokens", (0, 4, 8, 9))
+def test_mm_pair_matches_independent_projections(tokens: int) -> None:
+    """Paired execution preserves both independently computed MXFP8 results."""
+    require_b12x()
+    require_mxf8_mma()
+    torch.manual_seed(20260904 + tokens)
+
+    source, _, primary = _make_inputs(tokens, 256, 384)
+    _, _, secondary = _make_inputs(tokens, 256, 64)
+    expected_primary = mxfp8_linear.mm(source, primary)
+    expected_secondary = mxfp8_linear.mm(source, secondary)
+    actual_primary, actual_secondary = mxfp8_linear.mm_pair(
+        source,
+        primary,
+        secondary,
+        parallel_max_tokens=8,
+    )
+    current_stream = torch.cuda.current_stream(source.device)
+    observed_primary = actual_primary.clone()
+    observed_secondary = actual_secondary.clone()
+    current_stream.synchronize()
+
+    torch.testing.assert_close(observed_primary, expected_primary, rtol=0, atol=0)
+    torch.testing.assert_close(observed_secondary, expected_secondary, rtol=0, atol=0)
+
+
+def test_mm_pair_joins_secondary_work_to_the_caller_stream() -> None:
+    """A caller-stream read observes secondary output without a device sync."""
+    require_b12x()
+    require_mxf8_mma()
+    torch.manual_seed(20260906)
+
+    source, _, primary = _make_inputs(4, 256, 384)
+    _, _, secondary = _make_inputs(4, 256, 64)
+    expected_secondary = mxfp8_linear.mm(source, secondary)
+    current_stream = torch.cuda.current_stream(source.device)
+    secondary_stream = blockscaled_linear._paired_projection_stream(source.device)
+    current_stream.synchronize()
+    with torch.cuda.stream(secondary_stream):
+        torch.cuda._sleep(20_000_000)
+
+    _, actual_secondary = mxfp8_linear.mm_pair(
+        source,
+        primary,
+        secondary,
+        parallel_max_tokens=8,
+    )
+    observed_secondary = actual_secondary.clone()
+    current_stream.synchronize()
+
+    torch.testing.assert_close(observed_secondary, expected_secondary, rtol=0, atol=0)
+
+
+def test_mm_pair_captures_both_streams_and_replays() -> None:
+    """Graph replay waits for the secondary projection before returning outputs."""
+    require_b12x()
+    require_mxf8_mma()
+    torch.manual_seed(20260905)
+
+    source, _, primary = _make_inputs(4, 256, 384)
+    _, _, secondary = _make_inputs(4, 256, 64)
+    replacement = torch.randn_like(source).div_(4)
+    mxfp8_linear.mm_pair(
+        source,
+        primary,
+        secondary,
+        parallel_max_tokens=8,
+    )
+    current_stream = torch.cuda.current_stream(source.device)
+    current_stream.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual_primary, actual_secondary = mxfp8_linear.mm_pair(
+            source,
+            primary,
+            secondary,
+            parallel_max_tokens=8,
+        )
+    source.copy_(replacement)
+    expected_primary = mxfp8_linear.mm(source, primary)
+    expected_secondary = mxfp8_linear.mm(source, secondary)
+    graph.replay()
+    observed_primary = actual_primary.clone()
+    observed_secondary = actual_secondary.clone()
+    current_stream.synchronize()
+
+    torch.testing.assert_close(observed_primary, expected_primary, rtol=0, atol=0)
+    torch.testing.assert_close(observed_secondary, expected_secondary, rtol=0, atol=0)
 
 
 def test_blockscaled_mm_accepts_prequantized_mxfp8_and_replays() -> None:
