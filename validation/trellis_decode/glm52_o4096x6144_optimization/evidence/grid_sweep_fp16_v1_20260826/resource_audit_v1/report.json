@@ -1,0 +1,3896 @@
+{
+  "argv": [
+    "validation/trellis_decode/glm52_o4096x6144_optimization/audit_grid_artifacts.py",
+    "--sweep-root",
+    "validation/trellis_decode/glm52_o4096x6144_optimization/evidence/grid_sweep_fp16_v1_20260826",
+    "--output-dir",
+    "validation/trellis_decode/glm52_o4096x6144_optimization/evidence/grid_sweep_fp16_v1_20260826/resource_audit_v1/artifacts",
+    "--output",
+    "validation/trellis_decode/glm52_o4096x6144_optimization/evidence/grid_sweep_fp16_v1_20260826/resource_audit_v1/report.json",
+    "--occupancy-device",
+    "6"
+  ],
+  "captured_at": "2026-08-26T08:44:37.242096+00:00",
+  "occupancy_gpu": {
+    "name": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+    "ordinal": 6,
+    "uuid": "GPU-5e983ae0-0c39-779f-3f35-fc3744a2398d"
+  },
+  "pass": true,
+  "rows": [
+    {
+      "cubin": {
+        "architecture": "sm_120a",
+        "bytes": 57072,
+        "path": "/home/jon/git/local-inference-lab/b12x-glm52-pr243-o-opt/validation/trellis_decode/glm52_o4096x6144_optimization/evidence/grid_sweep_fp16_v1_20260826/resource_audit_v1/artifacts/grid_048.cubin",
+        "ptxas_flags": "-O 2 -arch sm_120a",
+        "ptxas_version": "Cuda compilation tools, release 13.3, V13.3.27",
+        "sha256": "b8d6ce59ab173addbb7b5af56f93cbb5b00d63810fbb29443e41026e7e827370"
+      },
+      "grid_x": 48,
+      "kernel": "kernel_cutlass_kernel_sparkinfergemmtrellis_linear_k6_mcg_cuteK6McgSmallMKernel_object_at__tensorptrf16gmemalign16oi641_tensorptri32gmemalign16o47185921_tensorptrf16gmemalign16oi641_tenso_0",
+      "manifest": {
+        "artifact_evidence_sha256": "fa25ff1801fa85e8611d84b7d76f915da46b8e250b2b92769129a67249ceaebc",
+        "bytes": 7719,
+        "cache_key": "6fe343fba0bfb899f2b95c3bbdb37b9201f4e3cbf08845fe40a91bcb07b2c614",
+        "compile_environment": [
+          [
+            "CC",
+            ""
+          ],
+          [
+            "CUDACXX",
+            ""
+          ],
+          [
+            "CUDA_HOME",
+            ""
+          ],
+          [
+            "CUDA_PATH",
+            ""
+          ],
+          [
+            "CUDA_TOOLKIT_PATH",
+            ""
+          ],
+          [
+            "CUTE_DSL_ARCH",
+            "sm_120a"
+          ],
+          [
+            "CUTE_DSL_LIBS",
+            "/opt/venv/lib/python3.12/site-packages/nvidia_cutlass_dsl/cu13/lib/libcute_dsl_runtime.so"
+          ],
+          [
+            "CXX",
+            ""
+          ],
+          [
+            "NVCC_APPEND_FLAGS",
+            ""
+          ],
+          [
+            "NVCC_PREPEND_FLAGS",
+            ""
+          ]
+        ],
+        "compile_options": [
+          "opt-level=2",
+          "rdc=false",
+          "enable-assertions=false",
+          "preserve-line-info=false"
+        ],
+        "compile_spec_hash": "100a96382b6b86379717a22fa2cdb29ec3b6fe9e31c6ab4b010fd7c1273978ed",
+        "integrity": "pass",
+        "package_fingerprint": "34f03fa47ee407fae5fdca7d78c261a27eda2c81262f318da82dbe6c963bbc34",
+        "path": "/home/jon/git/local-inference-lab/b12x-glm52-pr243-o-opt/validation/trellis_decode/glm52_o4096x6144_optimization/evidence/grid_sweep_fp16_v1_20260826/grid_048/sparkinfer-cache/6f/6fe343fba0bfb899f2b95c3bbdb37b9201f4e3cbf08845fe40a91bcb07b2c614.json",
+        "schema": "sparkinfer._lib.compile_manifest.v3",
+        "semantic_key": "767a654c635c44a3c65768c62b65c7c18a30c18cb592e1cc3e7d85c64fd72359",
+        "sha256": "e648b492f90ecdc5d628e1104f8b60eabde29ce72e156f47f2e2af0b685e8d28",
+        "toolchain": [
+          [
+            "python",
+            "cpython",
+            [
+              3,
+              12,
+              3
+            ]
+          ],
+          [
+            "torch",
+            "2.12.0+cu132"
+          ],
+          [
+            "torch_cuda",
+            "13.2"
+          ],
+          [
+            "cutlass_dsl",
+            "4.6.0"
+          ],
+          [
+            "cutlass_dsl_libs_base",
+            "4.6.0"
+          ],
+          [
+            "cutlass_dsl_libs_core",
+            "4.6.0"
+          ],
+          [
+            "cutlass_dsl_libs_cu12",
+            "4.6.0"
+          ],
+          [
+            "cutlass_dsl_libs_cu13",
+            "4.6.0"
+          ],
+          [
+            "cuda_python",
+            "13.2.0"
+          ],
+          [
+            "cuda_bindings",
+            "13.2.0"
+          ],
+          [
+            "sparkinfer_runtime_patches",
+            [
+              [
+                "compile_only_warning",
+                true
+              ],
+              [
+                "memory_debug",
+                true
+              ],
+              [
+                "direct_frameinfo",
+                true
+              ]
+            ]
+          ]
+        ]
+      },
+      "object": {
+        "bytes": 68536,
+        "path": "/home/jon/git/local-inference-lab/b12x-glm52-pr243-o-opt/validation/trellis_decode/glm52_o4096x6144_optimization/evidence/grid_sweep_fp16_v1_20260826/grid_048/sparkinfer-cache/6f/6fe343fba0bfb899f2b95c3bbdb37b9201f4e3cbf08845fe40a91bcb07b2c614.o",
+        "sha256": "a3f204988d1dac47a296d26a61131f9b0e1cdaa61adce82da7cfd8b41d0a44dc"
+      },
+      "resources": {
+        "allocated_registers": 132,
+        "cubin_static_shared_bytes": 1024,
+        "driver": {
+          "active_ctas_per_sm": 1,
+          "local_bytes": 0,
+          "max_threads_per_block": 384,
+          "registers": 132,
+          "static_shared_bytes": 0
+        },
+        "frame_bytes": 0,
+        "launch_dynamic_shared_bytes": 50176,
+        "max_register_count": 255,
+        "min_stack_bytes": 0,
+        "occupancy_active_ctas_per_sm": 1,
+        "parameter_bytes": 136,
+        "threads": [
+          256,
+          1,
+          1
+        ],
+        "threads_per_cta": 256,
+        "total_launch_shared_bytes": 51200
+      },
+      "sass": {
+        "bytes": 194453,
+        "code_bytes": 41728,
+        "instructions": 2608,
+        "local_load_instructions": 0,
+        "local_store_instructions": 0,
+        "path": "/home/jon/git/local-inference-lab/b12x-glm52-pr243-o-opt/validation/trellis_decode/glm52_o4096x6144_optimization/evidence/grid_sweep_fp16_v1_20260826/resource_audit_v1/artifacts/grid_048.sass",
+        "register_reconfiguration": [],
+        "register_sets": {
+          "p": {
+            "count": 7,
+            "indices": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6
+            ],
+            "span": 7
+          },
+          "r": {
+            "count": 130,
+            "indices": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6,
+              7,
+              8,
+              9,
+              10,
+              11,
+              12,
+              13,
+              14,
+              15,
+              16,
+              17,
+              18,
+              19,
+              20,
+              21,
+              22,
+              23,
+              24,
+              25,
+              26,
+              27,
+              28,
+              29,
+              30,
+              31,
+              32,
+              33,
+              34,
+              35,
+              36,
+              37,
+              38,
+              39,
+              40,
+              41,
+              42,
+              43,
+              44,
+              45,
+              46,
+              47,
+              48,
+              49,
+              50,
+              51,
+              52,
+              53,
+              54,
+              55,
+              56,
+              57,
+              58,
+              59,
+              60,
+              61,
+              62,
+              63,
+              64,
+              65,
+              66,
+              67,
+              68,
+              69,
+              70,
+              71,
+              72,
+              73,
+              74,
+              75,
+              76,
+              77,
+              78,
+              79,
+              80,
+              81,
+              82,
+              83,
+              84,
+              85,
+              86,
+              87,
+              88,
+              89,
+              90,
+              91,
+              92,
+              93,
+              94,
+              95,
+              96,
+              97,
+              98,
+              99,
+              100,
+              101,
+              102,
+              103,
+              104,
+              105,
+              106,
+              107,
+              108,
+              109,
+              110,
+              111,
+              112,
+              113,
+              114,
+              115,
+              116,
+              117,
+              118,
+              119,
+              120,
+              121,
+              122,
+              123,
+              124,
+              125,
+              126,
+              127,
+              128,
+              129
+            ],
+            "span": 130
+          },
+          "up": {
+            "count": 1,
+            "indices": [
+              0
+            ],
+            "span": 1
+          },
+          "ur": {
+            "count": 13,
+            "indices": [
+              4,
+              5,
+              6,
+              7,
+              8,
+              9,
+              10,
+              11,
+              12,
+              14,
+              16,
+              18,
+              19
+            ],
+            "span": 20
+          }
+        },
+        "sha256": "4b774726d63d7f7ba254d7c5faa6ff0f4ce31ae765e6e0f3d298bb5132514e78"
+      }
+    },
+    {
+      "cubin": {
+        "architecture": "sm_120a",
+        "bytes": 57072,
+        "path": "/home/jon/git/local-inference-lab/b12x-glm52-pr243-o-opt/validation/trellis_decode/glm52_o4096x6144_optimization/evidence/grid_sweep_fp16_v1_20260826/resource_audit_v1/artifacts/grid_064.cubin",
+        "ptxas_flags": "-O 2 -arch sm_120a",
+        "ptxas_version": "Cuda compilation tools, release 13.3, V13.3.27",
+        "sha256": "b8d6ce59ab173addbb7b5af56f93cbb5b00d63810fbb29443e41026e7e827370"
+      },
+      "grid_x": 64,
+      "kernel": "kernel_cutlass_kernel_sparkinfergemmtrellis_linear_k6_mcg_cuteK6McgSmallMKernel_object_at__tensorptrf16gmemalign16oi641_tensorptri32gmemalign16o47185921_tensorptrf16gmemalign16oi641_tenso_0",
+      "manifest": {
+        "artifact_evidence_sha256": "dbc06bb2b2d5e712b9b1de15efad8b693033c10db123ae2291f97c6372c4c897",
+        "bytes": 7719,
+        "cache_key": "b32d3e32085969666f19f986f16dd083da79e3913efb1c0b1abcdf5f1b10984f",
+        "compile_environment": [
+          [
+            "CC",
+            ""
+          ],
+          [
+            "CUDACXX",
+            ""
+          ],
+          [
+            "CUDA_HOME",
+            ""
+          ],
+          [
+            "CUDA_PATH",
+            ""
+          ],
+          [
+            "CUDA_TOOLKIT_PATH",
+            ""
+          ],
+          [
+            "CUTE_DSL_ARCH",
+            "sm_120a"
+          ],
+          [
+            "CUTE_DSL_LIBS",
+            "/opt/venv/lib/python3.12/site-packages/nvidia_cutlass_dsl/cu13/lib/libcute_dsl_runtime.so"
+          ],
+          [
+            "CXX",
+            ""
+          ],
+          [
+            "NVCC_APPEND_FLAGS",
+            ""
+          ],
+          [
+            "NVCC_PREPEND_FLAGS",
+            ""
+          ]
+        ],
+        "compile_options": [
+          "opt-level=2",
+          "rdc=false",
+          "enable-assertions=false",
+          "preserve-line-info=false"
+        ],
+        "compile_spec_hash": "8bddc512670a1df8750e0f711fd7dc5e7d4db6a0d8a4f604a8277b921638cbd8",
+        "integrity": "pass",
+        "package_fingerprint": "34f03fa47ee407fae5fdca7d78c261a27eda2c81262f318da82dbe6c963bbc34",
+        "path": "/home/jon/git/local-inference-lab/b12x-glm52-pr243-o-opt/validation/trellis_decode/glm52_o4096x6144_optimization/evidence/grid_sweep_fp16_v1_20260826/grid_064/sparkinfer-cache/b3/b32d3e32085969666f19f986f16dd083da79e3913efb1c0b1abcdf5f1b10984f.json",
+        "schema": "sparkinfer._lib.compile_manifest.v3",
+        "semantic_key": "7605d83e97e4f6d69780cf15d78aa91e7910f05c1b76f74ff5f05ce9146fbbd2",
+        "sha256": "067613767551567083dfd0b3e7cdaff21c90299a52b6f9296dcd6b5f0a369000",
+        "toolchain": [
+          [
+            "python",
+            "cpython",
+            [
+              3,
+              12,
+              3
+            ]
+          ],
+          [
+            "torch",
+            "2.12.0+cu132"
+          ],
+          [
+            "torch_cuda",
+            "13.2"
+          ],
+          [
+            "cutlass_dsl",
+            "4.6.0"
+          ],
+          [
+            "cutlass_dsl_libs_base",
+            "4.6.0"
+          ],
+          [
+            "cutlass_dsl_libs_core",
+            "4.6.0"
+          ],
+          [
+            "cutlass_dsl_libs_cu12",
+            "4.6.0"
+          ],
+          [
+            "cutlass_dsl_libs_cu13",
+            "4.6.0"
+          ],
+          [
+            "cuda_python",
+            "13.2.0"
+          ],
+          [
+            "cuda_bindings",
+            "13.2.0"
+          ],
+          [
+            "sparkinfer_runtime_patches",
+            [
+              [
+                "compile_only_warning",
+                true
+              ],
+              [
+                "memory_debug",
+                true
+              ],
+              [
+                "direct_frameinfo",
+                true
+              ]
+            ]
+          ]
+        ]
+      },
+      "object": {
+        "bytes": 68536,
+        "path": "/home/jon/git/local-inference-lab/b12x-glm52-pr243-o-opt/validation/trellis_decode/glm52_o4096x6144_optimization/evidence/grid_sweep_fp16_v1_20260826/grid_064/sparkinfer-cache/b3/b32d3e32085969666f19f986f16dd083da79e3913efb1c0b1abcdf5f1b10984f.o",
+        "sha256": "2cb76069f7ea2e05a1ad671ed0fbf676e973d4086e94ad5b81cd9c1398e07b74"
+      },
+      "resources": {
+        "allocated_registers": 132,
+        "cubin_static_shared_bytes": 1024,
+        "driver": {
+          "active_ctas_per_sm": 1,
+          "local_bytes": 0,
+          "max_threads_per_block": 384,
+          "registers": 132,
+          "static_shared_bytes": 0
+        },
+        "frame_bytes": 0,
+        "launch_dynamic_shared_bytes": 50176,
+        "max_register_count": 255,
+        "min_stack_bytes": 0,
+        "occupancy_active_ctas_per_sm": 1,
+        "parameter_bytes": 136,
+        "threads": [
+          256,
+          1,
+          1
+        ],
+        "threads_per_cta": 256,
+        "total_launch_shared_bytes": 51200
+      },
+      "sass": {
+        "bytes": 194453,
+        "code_bytes": 41728,
+        "instructions": 2608,
+        "local_load_instructions": 0,
+        "local_store_instructions": 0,
+        "path": "/home/jon/git/local-inference-lab/b12x-glm52-pr243-o-opt/validation/trellis_decode/glm52_o4096x6144_optimization/evidence/grid_sweep_fp16_v1_20260826/resource_audit_v1/artifacts/grid_064.sass",
+        "register_reconfiguration": [],
+        "register_sets": {
+          "p": {
+            "count": 7,
+            "indices": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6
+            ],
+            "span": 7
+          },
+          "r": {
+            "count": 130,
+            "indices": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6,
+              7,
+              8,
+              9,
+              10,
+              11,
+              12,
+              13,
+              14,
+              15,
+              16,
+              17,
+              18,
+              19,
+              20,
+              21,
+              22,
+              23,
+              24,
+              25,
+              26,
+              27,
+              28,
+              29,
+              30,
+              31,
+              32,
+              33,
+              34,
+              35,
+              36,
+              37,
+              38,
+              39,
+              40,
+              41,
+              42,
+              43,
+              44,
+              45,
+              46,
+              47,
+              48,
+              49,
+              50,
+              51,
+              52,
+              53,
+              54,
+              55,
+              56,
+              57,
+              58,
+              59,
+              60,
+              61,
+              62,
+              63,
+              64,
+              65,
+              66,
+              67,
+              68,
+              69,
+              70,
+              71,
+              72,
+              73,
+              74,
+              75,
+              76,
+              77,
+              78,
+              79,
+              80,
+              81,
+              82,
+              83,
+              84,
+              85,
+              86,
+              87,
+              88,
+              89,
+              90,
+              91,
+              92,
+              93,
+              94,
+              95,
+              96,
+              97,
+              98,
+              99,
+              100,
+              101,
+              102,
+              103,
+              104,
+              105,
+              106,
+              107,
+              108,
+              109,
+              110,
+              111,
+              112,
+              113,
+              114,
+              115,
+              116,
+              117,
+              118,
+              119,
+              120,
+              121,
+              122,
+              123,
+              124,
+              125,
+              126,
+              127,
+              128,
+              129
+            ],
+            "span": 130
+          },
+          "up": {
+            "count": 1,
+            "indices": [
+              0
+            ],
+            "span": 1
+          },
+          "ur": {
+            "count": 13,
+            "indices": [
+              4,
+              5,
+              6,
+              7,
+              8,
+              9,
+              10,
+              11,
+              12,
+              14,
+              16,
+              18,
+              19
+            ],
+            "span": 20
+          }
+        },
+        "sha256": "4b774726d63d7f7ba254d7c5faa6ff0f4ce31ae765e6e0f3d298bb5132514e78"
+      }
+    },
+    {
+      "cubin": {
+        "architecture": "sm_120a",
+        "bytes": 57072,
+        "path": "/home/jon/git/local-inference-lab/b12x-glm52-pr243-o-opt/validation/trellis_decode/glm52_o4096x6144_optimization/evidence/grid_sweep_fp16_v1_20260826/resource_audit_v1/artifacts/grid_080.cubin",
+        "ptxas_flags": "-O 2 -arch sm_120a",
+        "ptxas_version": "Cuda compilation tools, release 13.3, V13.3.27",
+        "sha256": "b8d6ce59ab173addbb7b5af56f93cbb5b00d63810fbb29443e41026e7e827370"
+      },
+      "grid_x": 80,
+      "kernel": "kernel_cutlass_kernel_sparkinfergemmtrellis_linear_k6_mcg_cuteK6McgSmallMKernel_object_at__tensorptrf16gmemalign16oi641_tensorptri32gmemalign16o47185921_tensorptrf16gmemalign16oi641_tenso_0",
+      "manifest": {
+        "artifact_evidence_sha256": "aee081479e05d90ed1ce729c6b116ceca930efbd404853f2cc0a248d301c2d89",
+        "bytes": 7719,
+        "cache_key": "83d930299e42af8c361876ab68b6b694d63630fc113e6aa25dec1bc55317e100",
+        "compile_environment": [
+          [
+            "CC",
+            ""
+          ],
+          [
+            "CUDACXX",
+            ""
+          ],
+          [
+            "CUDA_HOME",
+            ""
+          ],
+          [
+            "CUDA_PATH",
+            ""
+          ],
+          [
+            "CUDA_TOOLKIT_PATH",
+            ""
+          ],
+          [
+            "CUTE_DSL_ARCH",
+            "sm_120a"
+          ],
+          [
+            "CUTE_DSL_LIBS",
+            "/opt/venv/lib/python3.12/site-packages/nvidia_cutlass_dsl/cu13/lib/libcute_dsl_runtime.so"
+          ],
+          [
+            "CXX",
+            ""
+          ],
+          [
+            "NVCC_APPEND_FLAGS",
+            ""
+          ],
+          [
+            "NVCC_PREPEND_FLAGS",
+            ""
+          ]
+        ],
+        "compile_options": [
+          "opt-level=2",
+          "rdc=false",
+          "enable-assertions=false",
+          "preserve-line-info=false"
+        ],
+        "compile_spec_hash": "c226acbbd61ad6457be0886e1c0af8132e4e1307417194654c8eb21e5d37cd7f",
+        "integrity": "pass",
+        "package_fingerprint": "34f03fa47ee407fae5fdca7d78c261a27eda2c81262f318da82dbe6c963bbc34",
+        "path": "/home/jon/git/local-inference-lab/b12x-glm52-pr243-o-opt/validation/trellis_decode/glm52_o4096x6144_optimization/evidence/grid_sweep_fp16_v1_20260826/grid_080/sparkinfer-cache/83/83d930299e42af8c361876ab68b6b694d63630fc113e6aa25dec1bc55317e100.json",
+        "schema": "sparkinfer._lib.compile_manifest.v3",
+        "semantic_key": "6b74860c590da934193f35d59d880f2e98ca23089b8200b287fca4af1451e3d7",
+        "sha256": "d1d82c325477ea723cd0457db9d7aa4cd1e80bec9fa8a2a54eaa922291aa6071",
+        "toolchain": [
+          [
+            "python",
+            "cpython",
+            [
+              3,
+              12,
+              3
+            ]
+          ],
+          [
+            "torch",
+            "2.12.0+cu132"
+          ],
+          [
+            "torch_cuda",
+            "13.2"
+          ],
+          [
+            "cutlass_dsl",
+            "4.6.0"
+          ],
+          [
+            "cutlass_dsl_libs_base",
+            "4.6.0"
+          ],
+          [
+            "cutlass_dsl_libs_core",
+            "4.6.0"
+          ],
+          [
+            "cutlass_dsl_libs_cu12",
+            "4.6.0"
+          ],
+          [
+            "cutlass_dsl_libs_cu13",
+            "4.6.0"
+          ],
+          [
+            "cuda_python",
+            "13.2.0"
+          ],
+          [
+            "cuda_bindings",
+            "13.2.0"
+          ],
+          [
+            "sparkinfer_runtime_patches",
+            [
+              [
+                "compile_only_warning",
+                true
+              ],
+              [
+                "memory_debug",
+                true
+              ],
+              [
+                "direct_frameinfo",
+                true
+              ]
+            ]
+          ]
+        ]
+      },
+      "object": {
+        "bytes": 68536,
+        "path": "/home/jon/git/local-inference-lab/b12x-glm52-pr243-o-opt/validation/trellis_decode/glm52_o4096x6144_optimization/evidence/grid_sweep_fp16_v1_20260826/grid_080/sparkinfer-cache/83/83d930299e42af8c361876ab68b6b694d63630fc113e6aa25dec1bc55317e100.o",
+        "sha256": "3cbaab54aaaaae0e38f32548656356090ba2894041952ee92227a0f7496730c0"
+      },
+      "resources": {
+        "allocated_registers": 132,
+        "cubin_static_shared_bytes": 1024,
+        "driver": {
+          "active_ctas_per_sm": 1,
+          "local_bytes": 0,
+          "max_threads_per_block": 384,
+          "registers": 132,
+          "static_shared_bytes": 0
+        },
+        "frame_bytes": 0,
+        "launch_dynamic_shared_bytes": 50176,
+        "max_register_count": 255,
+        "min_stack_bytes": 0,
+        "occupancy_active_ctas_per_sm": 1,
+        "parameter_bytes": 136,
+        "threads": [
+          256,
+          1,
+          1
+        ],
+        "threads_per_cta": 256,
+        "total_launch_shared_bytes": 51200
+      },
+      "sass": {
+        "bytes": 194453,
+        "code_bytes": 41728,
+        "instructions": 2608,
+        "local_load_instructions": 0,
+        "local_store_instructions": 0,
+        "path": "/home/jon/git/local-inference-lab/b12x-glm52-pr243-o-opt/validation/trellis_decode/glm52_o4096x6144_optimization/evidence/grid_sweep_fp16_v1_20260826/resource_audit_v1/artifacts/grid_080.sass",
+        "register_reconfiguration": [],
+        "register_sets": {
+          "p": {
+            "count": 7,
+            "indices": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6
+            ],
+            "span": 7
+          },
+          "r": {
+            "count": 130,
+            "indices": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6,
+              7,
+              8,
+              9,
+              10,
+              11,
+              12,
+              13,
+              14,
+              15,
+              16,
+              17,
+              18,
+              19,
+              20,
+              21,
+              22,
+              23,
+              24,
+              25,
+              26,
+              27,
+              28,
+              29,
+              30,
+              31,
+              32,
+              33,
+              34,
+              35,
+              36,
+              37,
+              38,
+              39,
+              40,
+              41,
+              42,
+              43,
+              44,
+              45,
+              46,
+              47,
+              48,
+              49,
+              50,
+              51,
+              52,
+              53,
+              54,
+              55,
+              56,
+              57,
+              58,
+              59,
+              60,
+              61,
+              62,
+              63,
+              64,
+              65,
+              66,
+              67,
+              68,
+              69,
+              70,
+              71,
+              72,
+              73,
+              74,
+              75,
+              76,
+              77,
+              78,
+              79,
+              80,
+              81,
+              82,
+              83,
+              84,
+              85,
+              86,
+              87,
+              88,
+              89,
+              90,
+              91,
+              92,
+              93,
+              94,
+              95,
+              96,
+              97,
+              98,
+              99,
+              100,
+              101,
+              102,
+              103,
+              104,
+              105,
+              106,
+              107,
+              108,
+              109,
+              110,
+              111,
+              112,
+              113,
+              114,
+              115,
+              116,
+              117,
+              118,
+              119,
+              120,
+              121,
+              122,
+              123,
+              124,
+              125,
+              126,
+              127,
+              128,
+              129
+            ],
+            "span": 130
+          },
+          "up": {
+            "count": 1,
+            "indices": [
+              0
+            ],
+            "span": 1
+          },
+          "ur": {
+            "count": 13,
+            "indices": [
+              4,
+              5,
+              6,
+              7,
+              8,
+              9,
+              10,
+              11,
+              12,
+              14,
+              16,
+              18,
+              19
+            ],
+            "span": 20
+          }
+        },
+        "sha256": "4b774726d63d7f7ba254d7c5faa6ff0f4ce31ae765e6e0f3d298bb5132514e78"
+      }
+    },
+    {
+      "cubin": {
+        "architecture": "sm_120a",
+        "bytes": 57072,
+        "path": "/home/jon/git/local-inference-lab/b12x-glm52-pr243-o-opt/validation/trellis_decode/glm52_o4096x6144_optimization/evidence/grid_sweep_fp16_v1_20260826/resource_audit_v1/artifacts/grid_096.cubin",
+        "ptxas_flags": "-O 2 -arch sm_120a",
+        "ptxas_version": "Cuda compilation tools, release 13.3, V13.3.27",
+        "sha256": "b8d6ce59ab173addbb7b5af56f93cbb5b00d63810fbb29443e41026e7e827370"
+      },
+      "grid_x": 96,
+      "kernel": "kernel_cutlass_kernel_sparkinfergemmtrellis_linear_k6_mcg_cuteK6McgSmallMKernel_object_at__tensorptrf16gmemalign16oi641_tensorptri32gmemalign16o47185921_tensorptrf16gmemalign16oi641_tenso_0",
+      "manifest": {
+        "artifact_evidence_sha256": "577698af3d9af6a74884e34d0a12cb48c0b85b2596d2b5b1aae5551b5fa89b78",
+        "bytes": 7719,
+        "cache_key": "cc83690f1b513f21d16905877de2f05ced181748d264dd13fe8b4116827d5e26",
+        "compile_environment": [
+          [
+            "CC",
+            ""
+          ],
+          [
+            "CUDACXX",
+            ""
+          ],
+          [
+            "CUDA_HOME",
+            ""
+          ],
+          [
+            "CUDA_PATH",
+            ""
+          ],
+          [
+            "CUDA_TOOLKIT_PATH",
+            ""
+          ],
+          [
+            "CUTE_DSL_ARCH",
+            "sm_120a"
+          ],
+          [
+            "CUTE_DSL_LIBS",
+            "/opt/venv/lib/python3.12/site-packages/nvidia_cutlass_dsl/cu13/lib/libcute_dsl_runtime.so"
+          ],
+          [
+            "CXX",
+            ""
+          ],
+          [
+            "NVCC_APPEND_FLAGS",
+            ""
+          ],
+          [
+            "NVCC_PREPEND_FLAGS",
+            ""
+          ]
+        ],
+        "compile_options": [
+          "opt-level=2",
+          "rdc=false",
+          "enable-assertions=false",
+          "preserve-line-info=false"
+        ],
+        "compile_spec_hash": "1fcded12051d96de36820edf47a7980bd5c13fe878ec994c94a7d9f77430f06c",
+        "integrity": "pass",
+        "package_fingerprint": "34f03fa47ee407fae5fdca7d78c261a27eda2c81262f318da82dbe6c963bbc34",
+        "path": "/home/jon/git/local-inference-lab/b12x-glm52-pr243-o-opt/validation/trellis_decode/glm52_o4096x6144_optimization/evidence/grid_sweep_fp16_v1_20260826/grid_096/sparkinfer-cache/cc/cc83690f1b513f21d16905877de2f05ced181748d264dd13fe8b4116827d5e26.json",
+        "schema": "sparkinfer._lib.compile_manifest.v3",
+        "semantic_key": "d6419c34862793ffefb07ef75207265840310027af5ca43400222b55478cc263",
+        "sha256": "e13d2a6822e894ba2d0afe4510094f40c93801e44db1c80c9eec1dc01bc1b5e0",
+        "toolchain": [
+          [
+            "python",
+            "cpython",
+            [
+              3,
+              12,
+              3
+            ]
+          ],
+          [
+            "torch",
+            "2.12.0+cu132"
+          ],
+          [
+            "torch_cuda",
+            "13.2"
+          ],
+          [
+            "cutlass_dsl",
+            "4.6.0"
+          ],
+          [
+            "cutlass_dsl_libs_base",
+            "4.6.0"
+          ],
+          [
+            "cutlass_dsl_libs_core",
+            "4.6.0"
+          ],
+          [
+            "cutlass_dsl_libs_cu12",
+            "4.6.0"
+          ],
+          [
+            "cutlass_dsl_libs_cu13",
+            "4.6.0"
+          ],
+          [
+            "cuda_python",
+            "13.2.0"
+          ],
+          [
+            "cuda_bindings",
+            "13.2.0"
+          ],
+          [
+            "sparkinfer_runtime_patches",
+            [
+              [
+                "compile_only_warning",
+                true
+              ],
+              [
+                "memory_debug",
+                true
+              ],
+              [
+                "direct_frameinfo",
+                true
+              ]
+            ]
+          ]
+        ]
+      },
+      "object": {
+        "bytes": 68536,
+        "path": "/home/jon/git/local-inference-lab/b12x-glm52-pr243-o-opt/validation/trellis_decode/glm52_o4096x6144_optimization/evidence/grid_sweep_fp16_v1_20260826/grid_096/sparkinfer-cache/cc/cc83690f1b513f21d16905877de2f05ced181748d264dd13fe8b4116827d5e26.o",
+        "sha256": "ddabb42b4e943702847dcb444a66d26810dfa29891c8cb237bc5a24b427fcf78"
+      },
+      "resources": {
+        "allocated_registers": 132,
+        "cubin_static_shared_bytes": 1024,
+        "driver": {
+          "active_ctas_per_sm": 1,
+          "local_bytes": 0,
+          "max_threads_per_block": 384,
+          "registers": 132,
+          "static_shared_bytes": 0
+        },
+        "frame_bytes": 0,
+        "launch_dynamic_shared_bytes": 50176,
+        "max_register_count": 255,
+        "min_stack_bytes": 0,
+        "occupancy_active_ctas_per_sm": 1,
+        "parameter_bytes": 136,
+        "threads": [
+          256,
+          1,
+          1
+        ],
+        "threads_per_cta": 256,
+        "total_launch_shared_bytes": 51200
+      },
+      "sass": {
+        "bytes": 194453,
+        "code_bytes": 41728,
+        "instructions": 2608,
+        "local_load_instructions": 0,
+        "local_store_instructions": 0,
+        "path": "/home/jon/git/local-inference-lab/b12x-glm52-pr243-o-opt/validation/trellis_decode/glm52_o4096x6144_optimization/evidence/grid_sweep_fp16_v1_20260826/resource_audit_v1/artifacts/grid_096.sass",
+        "register_reconfiguration": [],
+        "register_sets": {
+          "p": {
+            "count": 7,
+            "indices": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6
+            ],
+            "span": 7
+          },
+          "r": {
+            "count": 130,
+            "indices": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6,
+              7,
+              8,
+              9,
+              10,
+              11,
+              12,
+              13,
+              14,
+              15,
+              16,
+              17,
+              18,
+              19,
+              20,
+              21,
+              22,
+              23,
+              24,
+              25,
+              26,
+              27,
+              28,
+              29,
+              30,
+              31,
+              32,
+              33,
+              34,
+              35,
+              36,
+              37,
+              38,
+              39,
+              40,
+              41,
+              42,
+              43,
+              44,
+              45,
+              46,
+              47,
+              48,
+              49,
+              50,
+              51,
+              52,
+              53,
+              54,
+              55,
+              56,
+              57,
+              58,
+              59,
+              60,
+              61,
+              62,
+              63,
+              64,
+              65,
+              66,
+              67,
+              68,
+              69,
+              70,
+              71,
+              72,
+              73,
+              74,
+              75,
+              76,
+              77,
+              78,
+              79,
+              80,
+              81,
+              82,
+              83,
+              84,
+              85,
+              86,
+              87,
+              88,
+              89,
+              90,
+              91,
+              92,
+              93,
+              94,
+              95,
+              96,
+              97,
+              98,
+              99,
+              100,
+              101,
+              102,
+              103,
+              104,
+              105,
+              106,
+              107,
+              108,
+              109,
+              110,
+              111,
+              112,
+              113,
+              114,
+              115,
+              116,
+              117,
+              118,
+              119,
+              120,
+              121,
+              122,
+              123,
+              124,
+              125,
+              126,
+              127,
+              128,
+              129
+            ],
+            "span": 130
+          },
+          "up": {
+            "count": 1,
+            "indices": [
+              0
+            ],
+            "span": 1
+          },
+          "ur": {
+            "count": 13,
+            "indices": [
+              4,
+              5,
+              6,
+              7,
+              8,
+              9,
+              10,
+              11,
+              12,
+              14,
+              16,
+              18,
+              19
+            ],
+            "span": 20
+          }
+        },
+        "sha256": "4b774726d63d7f7ba254d7c5faa6ff0f4ce31ae765e6e0f3d298bb5132514e78"
+      }
+    },
+    {
+      "cubin": {
+        "architecture": "sm_120a",
+        "bytes": 57072,
+        "path": "/home/jon/git/local-inference-lab/b12x-glm52-pr243-o-opt/validation/trellis_decode/glm52_o4096x6144_optimization/evidence/grid_sweep_fp16_v1_20260826/resource_audit_v1/artifacts/grid_112.cubin",
+        "ptxas_flags": "-O 2 -arch sm_120a",
+        "ptxas_version": "Cuda compilation tools, release 13.3, V13.3.27",
+        "sha256": "b8d6ce59ab173addbb7b5af56f93cbb5b00d63810fbb29443e41026e7e827370"
+      },
+      "grid_x": 112,
+      "kernel": "kernel_cutlass_kernel_sparkinfergemmtrellis_linear_k6_mcg_cuteK6McgSmallMKernel_object_at__tensorptrf16gmemalign16oi641_tensorptri32gmemalign16o47185921_tensorptrf16gmemalign16oi641_tenso_0",
+      "manifest": {
+        "artifact_evidence_sha256": "f39f4e35dd8a87fbc1cc0bbd773e9f8105b0564f2ffab3413405d6a133b5c267",
+        "bytes": 7723,
+        "cache_key": "80f991afb69a522d73176ea39f20fa48ec6da4a930362ba0380eb26ef06b6a28",
+        "compile_environment": [
+          [
+            "CC",
+            ""
+          ],
+          [
+            "CUDACXX",
+            ""
+          ],
+          [
+            "CUDA_HOME",
+            ""
+          ],
+          [
+            "CUDA_PATH",
+            ""
+          ],
+          [
+            "CUDA_TOOLKIT_PATH",
+            ""
+          ],
+          [
+            "CUTE_DSL_ARCH",
+            "sm_120a"
+          ],
+          [
+            "CUTE_DSL_LIBS",
+            "/opt/venv/lib/python3.12/site-packages/nvidia_cutlass_dsl/cu13/lib/libcute_dsl_runtime.so"
+          ],
+          [
+            "CXX",
+            ""
+          ],
+          [
+            "NVCC_APPEND_FLAGS",
+            ""
+          ],
+          [
+            "NVCC_PREPEND_FLAGS",
+            ""
+          ]
+        ],
+        "compile_options": [
+          "opt-level=2",
+          "rdc=false",
+          "enable-assertions=false",
+          "preserve-line-info=false"
+        ],
+        "compile_spec_hash": "a215da5be9f301d6accaf164c7b481b3135a45830c577eede9fd716292953b2b",
+        "integrity": "pass",
+        "package_fingerprint": "34f03fa47ee407fae5fdca7d78c261a27eda2c81262f318da82dbe6c963bbc34",
+        "path": "/home/jon/git/local-inference-lab/b12x-glm52-pr243-o-opt/validation/trellis_decode/glm52_o4096x6144_optimization/evidence/grid_sweep_fp16_v1_20260826/grid_112/sparkinfer-cache/80/80f991afb69a522d73176ea39f20fa48ec6da4a930362ba0380eb26ef06b6a28.json",
+        "schema": "sparkinfer._lib.compile_manifest.v3",
+        "semantic_key": "687e9ce21d25f2d9437c39a28b5e150e37c78264f35370193cda9d172e882428",
+        "sha256": "f92db7ba3d32cc7a3bdb9890fee6fda97e4b863ee394e1e437a34911880a83f6",
+        "toolchain": [
+          [
+            "python",
+            "cpython",
+            [
+              3,
+              12,
+              3
+            ]
+          ],
+          [
+            "torch",
+            "2.12.0+cu132"
+          ],
+          [
+            "torch_cuda",
+            "13.2"
+          ],
+          [
+            "cutlass_dsl",
+            "4.6.0"
+          ],
+          [
+            "cutlass_dsl_libs_base",
+            "4.6.0"
+          ],
+          [
+            "cutlass_dsl_libs_core",
+            "4.6.0"
+          ],
+          [
+            "cutlass_dsl_libs_cu12",
+            "4.6.0"
+          ],
+          [
+            "cutlass_dsl_libs_cu13",
+            "4.6.0"
+          ],
+          [
+            "cuda_python",
+            "13.2.0"
+          ],
+          [
+            "cuda_bindings",
+            "13.2.0"
+          ],
+          [
+            "sparkinfer_runtime_patches",
+            [
+              [
+                "compile_only_warning",
+                true
+              ],
+              [
+                "memory_debug",
+                true
+              ],
+              [
+                "direct_frameinfo",
+                true
+              ]
+            ]
+          ]
+        ]
+      },
+      "object": {
+        "bytes": 68536,
+        "path": "/home/jon/git/local-inference-lab/b12x-glm52-pr243-o-opt/validation/trellis_decode/glm52_o4096x6144_optimization/evidence/grid_sweep_fp16_v1_20260826/grid_112/sparkinfer-cache/80/80f991afb69a522d73176ea39f20fa48ec6da4a930362ba0380eb26ef06b6a28.o",
+        "sha256": "857976dafb7902c80ee51b2fd831d4597212400009b55e107723ea00db969699"
+      },
+      "resources": {
+        "allocated_registers": 132,
+        "cubin_static_shared_bytes": 1024,
+        "driver": {
+          "active_ctas_per_sm": 1,
+          "local_bytes": 0,
+          "max_threads_per_block": 384,
+          "registers": 132,
+          "static_shared_bytes": 0
+        },
+        "frame_bytes": 0,
+        "launch_dynamic_shared_bytes": 50176,
+        "max_register_count": 255,
+        "min_stack_bytes": 0,
+        "occupancy_active_ctas_per_sm": 1,
+        "parameter_bytes": 136,
+        "threads": [
+          256,
+          1,
+          1
+        ],
+        "threads_per_cta": 256,
+        "total_launch_shared_bytes": 51200
+      },
+      "sass": {
+        "bytes": 194453,
+        "code_bytes": 41728,
+        "instructions": 2608,
+        "local_load_instructions": 0,
+        "local_store_instructions": 0,
+        "path": "/home/jon/git/local-inference-lab/b12x-glm52-pr243-o-opt/validation/trellis_decode/glm52_o4096x6144_optimization/evidence/grid_sweep_fp16_v1_20260826/resource_audit_v1/artifacts/grid_112.sass",
+        "register_reconfiguration": [],
+        "register_sets": {
+          "p": {
+            "count": 7,
+            "indices": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6
+            ],
+            "span": 7
+          },
+          "r": {
+            "count": 130,
+            "indices": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6,
+              7,
+              8,
+              9,
+              10,
+              11,
+              12,
+              13,
+              14,
+              15,
+              16,
+              17,
+              18,
+              19,
+              20,
+              21,
+              22,
+              23,
+              24,
+              25,
+              26,
+              27,
+              28,
+              29,
+              30,
+              31,
+              32,
+              33,
+              34,
+              35,
+              36,
+              37,
+              38,
+              39,
+              40,
+              41,
+              42,
+              43,
+              44,
+              45,
+              46,
+              47,
+              48,
+              49,
+              50,
+              51,
+              52,
+              53,
+              54,
+              55,
+              56,
+              57,
+              58,
+              59,
+              60,
+              61,
+              62,
+              63,
+              64,
+              65,
+              66,
+              67,
+              68,
+              69,
+              70,
+              71,
+              72,
+              73,
+              74,
+              75,
+              76,
+              77,
+              78,
+              79,
+              80,
+              81,
+              82,
+              83,
+              84,
+              85,
+              86,
+              87,
+              88,
+              89,
+              90,
+              91,
+              92,
+              93,
+              94,
+              95,
+              96,
+              97,
+              98,
+              99,
+              100,
+              101,
+              102,
+              103,
+              104,
+              105,
+              106,
+              107,
+              108,
+              109,
+              110,
+              111,
+              112,
+              113,
+              114,
+              115,
+              116,
+              117,
+              118,
+              119,
+              120,
+              121,
+              122,
+              123,
+              124,
+              125,
+              126,
+              127,
+              128,
+              129
+            ],
+            "span": 130
+          },
+          "up": {
+            "count": 1,
+            "indices": [
+              0
+            ],
+            "span": 1
+          },
+          "ur": {
+            "count": 13,
+            "indices": [
+              4,
+              5,
+              6,
+              7,
+              8,
+              9,
+              10,
+              11,
+              12,
+              14,
+              16,
+              18,
+              19
+            ],
+            "span": 20
+          }
+        },
+        "sha256": "4b774726d63d7f7ba254d7c5faa6ff0f4ce31ae765e6e0f3d298bb5132514e78"
+      }
+    },
+    {
+      "cubin": {
+        "architecture": "sm_120a",
+        "bytes": 57072,
+        "path": "/home/jon/git/local-inference-lab/b12x-glm52-pr243-o-opt/validation/trellis_decode/glm52_o4096x6144_optimization/evidence/grid_sweep_fp16_v1_20260826/resource_audit_v1/artifacts/grid_120.cubin",
+        "ptxas_flags": "-O 2 -arch sm_120a",
+        "ptxas_version": "Cuda compilation tools, release 13.3, V13.3.27",
+        "sha256": "b8d6ce59ab173addbb7b5af56f93cbb5b00d63810fbb29443e41026e7e827370"
+      },
+      "grid_x": 120,
+      "kernel": "kernel_cutlass_kernel_sparkinfergemmtrellis_linear_k6_mcg_cuteK6McgSmallMKernel_object_at__tensorptrf16gmemalign16oi641_tensorptri32gmemalign16o47185921_tensorptrf16gmemalign16oi641_tenso_0",
+      "manifest": {
+        "artifact_evidence_sha256": "3d1d739a10d700e654b948440e16b56e8ff45ae2f8edb0065e6a9e247d38db18",
+        "bytes": 7723,
+        "cache_key": "7539e12ce37f9ac7f492682f1cdae99d069f2ce6b34fbb2992f675dcdb4e2a24",
+        "compile_environment": [
+          [
+            "CC",
+            ""
+          ],
+          [
+            "CUDACXX",
+            ""
+          ],
+          [
+            "CUDA_HOME",
+            ""
+          ],
+          [
+            "CUDA_PATH",
+            ""
+          ],
+          [
+            "CUDA_TOOLKIT_PATH",
+            ""
+          ],
+          [
+            "CUTE_DSL_ARCH",
+            "sm_120a"
+          ],
+          [
+            "CUTE_DSL_LIBS",
+            "/opt/venv/lib/python3.12/site-packages/nvidia_cutlass_dsl/cu13/lib/libcute_dsl_runtime.so"
+          ],
+          [
+            "CXX",
+            ""
+          ],
+          [
+            "NVCC_APPEND_FLAGS",
+            ""
+          ],
+          [
+            "NVCC_PREPEND_FLAGS",
+            ""
+          ]
+        ],
+        "compile_options": [
+          "opt-level=2",
+          "rdc=false",
+          "enable-assertions=false",
+          "preserve-line-info=false"
+        ],
+        "compile_spec_hash": "5cc8a04efe287c322646e518eda37576b5496c4af0601290dcd884eba4ee023d",
+        "integrity": "pass",
+        "package_fingerprint": "34f03fa47ee407fae5fdca7d78c261a27eda2c81262f318da82dbe6c963bbc34",
+        "path": "/home/jon/git/local-inference-lab/b12x-glm52-pr243-o-opt/validation/trellis_decode/glm52_o4096x6144_optimization/evidence/grid_sweep_fp16_v1_20260826/grid_120/sparkinfer-cache/75/7539e12ce37f9ac7f492682f1cdae99d069f2ce6b34fbb2992f675dcdb4e2a24.json",
+        "schema": "sparkinfer._lib.compile_manifest.v3",
+        "semantic_key": "ab30e9752dd0776b5cddcdb4c4316efe306a0ee00781a91e3fcfd8168c7cd5fc",
+        "sha256": "dfeb78ce72986b135512aaafd6988f15d7a0b2cf10c6c225cc1c9e34a1ec8392",
+        "toolchain": [
+          [
+            "python",
+            "cpython",
+            [
+              3,
+              12,
+              3
+            ]
+          ],
+          [
+            "torch",
+            "2.12.0+cu132"
+          ],
+          [
+            "torch_cuda",
+            "13.2"
+          ],
+          [
+            "cutlass_dsl",
+            "4.6.0"
+          ],
+          [
+            "cutlass_dsl_libs_base",
+            "4.6.0"
+          ],
+          [
+            "cutlass_dsl_libs_core",
+            "4.6.0"
+          ],
+          [
+            "cutlass_dsl_libs_cu12",
+            "4.6.0"
+          ],
+          [
+            "cutlass_dsl_libs_cu13",
+            "4.6.0"
+          ],
+          [
+            "cuda_python",
+            "13.2.0"
+          ],
+          [
+            "cuda_bindings",
+            "13.2.0"
+          ],
+          [
+            "sparkinfer_runtime_patches",
+            [
+              [
+                "compile_only_warning",
+                true
+              ],
+              [
+                "memory_debug",
+                true
+              ],
+              [
+                "direct_frameinfo",
+                true
+              ]
+            ]
+          ]
+        ]
+      },
+      "object": {
+        "bytes": 68536,
+        "path": "/home/jon/git/local-inference-lab/b12x-glm52-pr243-o-opt/validation/trellis_decode/glm52_o4096x6144_optimization/evidence/grid_sweep_fp16_v1_20260826/grid_120/sparkinfer-cache/75/7539e12ce37f9ac7f492682f1cdae99d069f2ce6b34fbb2992f675dcdb4e2a24.o",
+        "sha256": "a6bf71a174ab7f78b87668167c7904ea3fda70b20298f8c5180852ea9557354a"
+      },
+      "resources": {
+        "allocated_registers": 132,
+        "cubin_static_shared_bytes": 1024,
+        "driver": {
+          "active_ctas_per_sm": 1,
+          "local_bytes": 0,
+          "max_threads_per_block": 384,
+          "registers": 132,
+          "static_shared_bytes": 0
+        },
+        "frame_bytes": 0,
+        "launch_dynamic_shared_bytes": 50176,
+        "max_register_count": 255,
+        "min_stack_bytes": 0,
+        "occupancy_active_ctas_per_sm": 1,
+        "parameter_bytes": 136,
+        "threads": [
+          256,
+          1,
+          1
+        ],
+        "threads_per_cta": 256,
+        "total_launch_shared_bytes": 51200
+      },
+      "sass": {
+        "bytes": 194453,
+        "code_bytes": 41728,
+        "instructions": 2608,
+        "local_load_instructions": 0,
+        "local_store_instructions": 0,
+        "path": "/home/jon/git/local-inference-lab/b12x-glm52-pr243-o-opt/validation/trellis_decode/glm52_o4096x6144_optimization/evidence/grid_sweep_fp16_v1_20260826/resource_audit_v1/artifacts/grid_120.sass",
+        "register_reconfiguration": [],
+        "register_sets": {
+          "p": {
+            "count": 7,
+            "indices": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6
+            ],
+            "span": 7
+          },
+          "r": {
+            "count": 130,
+            "indices": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6,
+              7,
+              8,
+              9,
+              10,
+              11,
+              12,
+              13,
+              14,
+              15,
+              16,
+              17,
+              18,
+              19,
+              20,
+              21,
+              22,
+              23,
+              24,
+              25,
+              26,
+              27,
+              28,
+              29,
+              30,
+              31,
+              32,
+              33,
+              34,
+              35,
+              36,
+              37,
+              38,
+              39,
+              40,
+              41,
+              42,
+              43,
+              44,
+              45,
+              46,
+              47,
+              48,
+              49,
+              50,
+              51,
+              52,
+              53,
+              54,
+              55,
+              56,
+              57,
+              58,
+              59,
+              60,
+              61,
+              62,
+              63,
+              64,
+              65,
+              66,
+              67,
+              68,
+              69,
+              70,
+              71,
+              72,
+              73,
+              74,
+              75,
+              76,
+              77,
+              78,
+              79,
+              80,
+              81,
+              82,
+              83,
+              84,
+              85,
+              86,
+              87,
+              88,
+              89,
+              90,
+              91,
+              92,
+              93,
+              94,
+              95,
+              96,
+              97,
+              98,
+              99,
+              100,
+              101,
+              102,
+              103,
+              104,
+              105,
+              106,
+              107,
+              108,
+              109,
+              110,
+              111,
+              112,
+              113,
+              114,
+              115,
+              116,
+              117,
+              118,
+              119,
+              120,
+              121,
+              122,
+              123,
+              124,
+              125,
+              126,
+              127,
+              128,
+              129
+            ],
+            "span": 130
+          },
+          "up": {
+            "count": 1,
+            "indices": [
+              0
+            ],
+            "span": 1
+          },
+          "ur": {
+            "count": 13,
+            "indices": [
+              4,
+              5,
+              6,
+              7,
+              8,
+              9,
+              10,
+              11,
+              12,
+              14,
+              16,
+              18,
+              19
+            ],
+            "span": 20
+          }
+        },
+        "sha256": "4b774726d63d7f7ba254d7c5faa6ff0f4ce31ae765e6e0f3d298bb5132514e78"
+      }
+    },
+    {
+      "cubin": {
+        "architecture": "sm_120a",
+        "bytes": 57072,
+        "path": "/home/jon/git/local-inference-lab/b12x-glm52-pr243-o-opt/validation/trellis_decode/glm52_o4096x6144_optimization/evidence/grid_sweep_fp16_v1_20260826/resource_audit_v1/artifacts/grid_128.cubin",
+        "ptxas_flags": "-O 2 -arch sm_120a",
+        "ptxas_version": "Cuda compilation tools, release 13.3, V13.3.27",
+        "sha256": "b8d6ce59ab173addbb7b5af56f93cbb5b00d63810fbb29443e41026e7e827370"
+      },
+      "grid_x": 128,
+      "kernel": "kernel_cutlass_kernel_sparkinfergemmtrellis_linear_k6_mcg_cuteK6McgSmallMKernel_object_at__tensorptrf16gmemalign16oi641_tensorptri32gmemalign16o47185921_tensorptrf16gmemalign16oi641_tenso_0",
+      "manifest": {
+        "artifact_evidence_sha256": "20fb6e525d4f3d345e4356b3b8d23c21f78960de9173fc1478a8fa543a57c500",
+        "bytes": 7723,
+        "cache_key": "c1f3c2b622656c618d58a223232b3c1fd4ebef12bf4a1a3ee731cfae21796262",
+        "compile_environment": [
+          [
+            "CC",
+            ""
+          ],
+          [
+            "CUDACXX",
+            ""
+          ],
+          [
+            "CUDA_HOME",
+            ""
+          ],
+          [
+            "CUDA_PATH",
+            ""
+          ],
+          [
+            "CUDA_TOOLKIT_PATH",
+            ""
+          ],
+          [
+            "CUTE_DSL_ARCH",
+            "sm_120a"
+          ],
+          [
+            "CUTE_DSL_LIBS",
+            "/opt/venv/lib/python3.12/site-packages/nvidia_cutlass_dsl/cu13/lib/libcute_dsl_runtime.so"
+          ],
+          [
+            "CXX",
+            ""
+          ],
+          [
+            "NVCC_APPEND_FLAGS",
+            ""
+          ],
+          [
+            "NVCC_PREPEND_FLAGS",
+            ""
+          ]
+        ],
+        "compile_options": [
+          "opt-level=2",
+          "rdc=false",
+          "enable-assertions=false",
+          "preserve-line-info=false"
+        ],
+        "compile_spec_hash": "6c645f5305dca91c47c31e7863d59e6dc0a2f291d780603cc3cd36f4f669c56f",
+        "integrity": "pass",
+        "package_fingerprint": "34f03fa47ee407fae5fdca7d78c261a27eda2c81262f318da82dbe6c963bbc34",
+        "path": "/home/jon/git/local-inference-lab/b12x-glm52-pr243-o-opt/validation/trellis_decode/glm52_o4096x6144_optimization/evidence/grid_sweep_fp16_v1_20260826/grid_128/sparkinfer-cache/c1/c1f3c2b622656c618d58a223232b3c1fd4ebef12bf4a1a3ee731cfae21796262.json",
+        "schema": "sparkinfer._lib.compile_manifest.v3",
+        "semantic_key": "8eab2233a0ee97f457c7b95db67cc3c3e48ba046d60d52e1d7dc6be633c22bc3",
+        "sha256": "817c2fbc83a731f94ccc7648f1740a9c5fd0fd2377612fc731b2086a2010bfe9",
+        "toolchain": [
+          [
+            "python",
+            "cpython",
+            [
+              3,
+              12,
+              3
+            ]
+          ],
+          [
+            "torch",
+            "2.12.0+cu132"
+          ],
+          [
+            "torch_cuda",
+            "13.2"
+          ],
+          [
+            "cutlass_dsl",
+            "4.6.0"
+          ],
+          [
+            "cutlass_dsl_libs_base",
+            "4.6.0"
+          ],
+          [
+            "cutlass_dsl_libs_core",
+            "4.6.0"
+          ],
+          [
+            "cutlass_dsl_libs_cu12",
+            "4.6.0"
+          ],
+          [
+            "cutlass_dsl_libs_cu13",
+            "4.6.0"
+          ],
+          [
+            "cuda_python",
+            "13.2.0"
+          ],
+          [
+            "cuda_bindings",
+            "13.2.0"
+          ],
+          [
+            "sparkinfer_runtime_patches",
+            [
+              [
+                "compile_only_warning",
+                true
+              ],
+              [
+                "memory_debug",
+                true
+              ],
+              [
+                "direct_frameinfo",
+                true
+              ]
+            ]
+          ]
+        ]
+      },
+      "object": {
+        "bytes": 68536,
+        "path": "/home/jon/git/local-inference-lab/b12x-glm52-pr243-o-opt/validation/trellis_decode/glm52_o4096x6144_optimization/evidence/grid_sweep_fp16_v1_20260826/grid_128/sparkinfer-cache/c1/c1f3c2b622656c618d58a223232b3c1fd4ebef12bf4a1a3ee731cfae21796262.o",
+        "sha256": "a6ee1e53b19989685ab61fe58b7e5fd1f13d6446fbaccc57ea84641037c8269b"
+      },
+      "resources": {
+        "allocated_registers": 132,
+        "cubin_static_shared_bytes": 1024,
+        "driver": {
+          "active_ctas_per_sm": 1,
+          "local_bytes": 0,
+          "max_threads_per_block": 384,
+          "registers": 132,
+          "static_shared_bytes": 0
+        },
+        "frame_bytes": 0,
+        "launch_dynamic_shared_bytes": 50176,
+        "max_register_count": 255,
+        "min_stack_bytes": 0,
+        "occupancy_active_ctas_per_sm": 1,
+        "parameter_bytes": 136,
+        "threads": [
+          256,
+          1,
+          1
+        ],
+        "threads_per_cta": 256,
+        "total_launch_shared_bytes": 51200
+      },
+      "sass": {
+        "bytes": 194453,
+        "code_bytes": 41728,
+        "instructions": 2608,
+        "local_load_instructions": 0,
+        "local_store_instructions": 0,
+        "path": "/home/jon/git/local-inference-lab/b12x-glm52-pr243-o-opt/validation/trellis_decode/glm52_o4096x6144_optimization/evidence/grid_sweep_fp16_v1_20260826/resource_audit_v1/artifacts/grid_128.sass",
+        "register_reconfiguration": [],
+        "register_sets": {
+          "p": {
+            "count": 7,
+            "indices": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6
+            ],
+            "span": 7
+          },
+          "r": {
+            "count": 130,
+            "indices": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6,
+              7,
+              8,
+              9,
+              10,
+              11,
+              12,
+              13,
+              14,
+              15,
+              16,
+              17,
+              18,
+              19,
+              20,
+              21,
+              22,
+              23,
+              24,
+              25,
+              26,
+              27,
+              28,
+              29,
+              30,
+              31,
+              32,
+              33,
+              34,
+              35,
+              36,
+              37,
+              38,
+              39,
+              40,
+              41,
+              42,
+              43,
+              44,
+              45,
+              46,
+              47,
+              48,
+              49,
+              50,
+              51,
+              52,
+              53,
+              54,
+              55,
+              56,
+              57,
+              58,
+              59,
+              60,
+              61,
+              62,
+              63,
+              64,
+              65,
+              66,
+              67,
+              68,
+              69,
+              70,
+              71,
+              72,
+              73,
+              74,
+              75,
+              76,
+              77,
+              78,
+              79,
+              80,
+              81,
+              82,
+              83,
+              84,
+              85,
+              86,
+              87,
+              88,
+              89,
+              90,
+              91,
+              92,
+              93,
+              94,
+              95,
+              96,
+              97,
+              98,
+              99,
+              100,
+              101,
+              102,
+              103,
+              104,
+              105,
+              106,
+              107,
+              108,
+              109,
+              110,
+              111,
+              112,
+              113,
+              114,
+              115,
+              116,
+              117,
+              118,
+              119,
+              120,
+              121,
+              122,
+              123,
+              124,
+              125,
+              126,
+              127,
+              128,
+              129
+            ],
+            "span": 130
+          },
+          "up": {
+            "count": 1,
+            "indices": [
+              0
+            ],
+            "span": 1
+          },
+          "ur": {
+            "count": 13,
+            "indices": [
+              4,
+              5,
+              6,
+              7,
+              8,
+              9,
+              10,
+              11,
+              12,
+              14,
+              16,
+              18,
+              19
+            ],
+            "span": 20
+          }
+        },
+        "sha256": "4b774726d63d7f7ba254d7c5faa6ff0f4ce31ae765e6e0f3d298bb5132514e78"
+      }
+    },
+    {
+      "cubin": {
+        "architecture": "sm_120a",
+        "bytes": 57072,
+        "path": "/home/jon/git/local-inference-lab/b12x-glm52-pr243-o-opt/validation/trellis_decode/glm52_o4096x6144_optimization/evidence/grid_sweep_fp16_v1_20260826/resource_audit_v1/artifacts/grid_144.cubin",
+        "ptxas_flags": "-O 2 -arch sm_120a",
+        "ptxas_version": "Cuda compilation tools, release 13.3, V13.3.27",
+        "sha256": "b8d6ce59ab173addbb7b5af56f93cbb5b00d63810fbb29443e41026e7e827370"
+      },
+      "grid_x": 144,
+      "kernel": "kernel_cutlass_kernel_sparkinfergemmtrellis_linear_k6_mcg_cuteK6McgSmallMKernel_object_at__tensorptrf16gmemalign16oi641_tensorptri32gmemalign16o47185921_tensorptrf16gmemalign16oi641_tenso_0",
+      "manifest": {
+        "artifact_evidence_sha256": "8f29eb206581e558f85f792b5c12191c72f132b0d3f5be8de8c5c09b5a6c2691",
+        "bytes": 7723,
+        "cache_key": "88bbee17c25b55b29cf716aae04e9704c5314f25e0129c4f143a47cea1057e2e",
+        "compile_environment": [
+          [
+            "CC",
+            ""
+          ],
+          [
+            "CUDACXX",
+            ""
+          ],
+          [
+            "CUDA_HOME",
+            ""
+          ],
+          [
+            "CUDA_PATH",
+            ""
+          ],
+          [
+            "CUDA_TOOLKIT_PATH",
+            ""
+          ],
+          [
+            "CUTE_DSL_ARCH",
+            "sm_120a"
+          ],
+          [
+            "CUTE_DSL_LIBS",
+            "/opt/venv/lib/python3.12/site-packages/nvidia_cutlass_dsl/cu13/lib/libcute_dsl_runtime.so"
+          ],
+          [
+            "CXX",
+            ""
+          ],
+          [
+            "NVCC_APPEND_FLAGS",
+            ""
+          ],
+          [
+            "NVCC_PREPEND_FLAGS",
+            ""
+          ]
+        ],
+        "compile_options": [
+          "opt-level=2",
+          "rdc=false",
+          "enable-assertions=false",
+          "preserve-line-info=false"
+        ],
+        "compile_spec_hash": "98e1d5bbe9f8975e249cdcdf11ab7ec255966223d5938afbdb432e1cd65968a2",
+        "integrity": "pass",
+        "package_fingerprint": "34f03fa47ee407fae5fdca7d78c261a27eda2c81262f318da82dbe6c963bbc34",
+        "path": "/home/jon/git/local-inference-lab/b12x-glm52-pr243-o-opt/validation/trellis_decode/glm52_o4096x6144_optimization/evidence/grid_sweep_fp16_v1_20260826/grid_144/sparkinfer-cache/88/88bbee17c25b55b29cf716aae04e9704c5314f25e0129c4f143a47cea1057e2e.json",
+        "schema": "sparkinfer._lib.compile_manifest.v3",
+        "semantic_key": "b9b31470132491bfaa84f3ac932b23577418c3d13342da17a00c0524e1139028",
+        "sha256": "d0c67afaeda82c19c695907bb2e3dcd6efd0e47f3cb503cfeffe238f096136dc",
+        "toolchain": [
+          [
+            "python",
+            "cpython",
+            [
+              3,
+              12,
+              3
+            ]
+          ],
+          [
+            "torch",
+            "2.12.0+cu132"
+          ],
+          [
+            "torch_cuda",
+            "13.2"
+          ],
+          [
+            "cutlass_dsl",
+            "4.6.0"
+          ],
+          [
+            "cutlass_dsl_libs_base",
+            "4.6.0"
+          ],
+          [
+            "cutlass_dsl_libs_core",
+            "4.6.0"
+          ],
+          [
+            "cutlass_dsl_libs_cu12",
+            "4.6.0"
+          ],
+          [
+            "cutlass_dsl_libs_cu13",
+            "4.6.0"
+          ],
+          [
+            "cuda_python",
+            "13.2.0"
+          ],
+          [
+            "cuda_bindings",
+            "13.2.0"
+          ],
+          [
+            "sparkinfer_runtime_patches",
+            [
+              [
+                "compile_only_warning",
+                true
+              ],
+              [
+                "memory_debug",
+                true
+              ],
+              [
+                "direct_frameinfo",
+                true
+              ]
+            ]
+          ]
+        ]
+      },
+      "object": {
+        "bytes": 68536,
+        "path": "/home/jon/git/local-inference-lab/b12x-glm52-pr243-o-opt/validation/trellis_decode/glm52_o4096x6144_optimization/evidence/grid_sweep_fp16_v1_20260826/grid_144/sparkinfer-cache/88/88bbee17c25b55b29cf716aae04e9704c5314f25e0129c4f143a47cea1057e2e.o",
+        "sha256": "d7164fe866e62388b9a9fe6f5785eac7e4eacf3ab54680908bcdf908a3a7da46"
+      },
+      "resources": {
+        "allocated_registers": 132,
+        "cubin_static_shared_bytes": 1024,
+        "driver": {
+          "active_ctas_per_sm": 1,
+          "local_bytes": 0,
+          "max_threads_per_block": 384,
+          "registers": 132,
+          "static_shared_bytes": 0
+        },
+        "frame_bytes": 0,
+        "launch_dynamic_shared_bytes": 50176,
+        "max_register_count": 255,
+        "min_stack_bytes": 0,
+        "occupancy_active_ctas_per_sm": 1,
+        "parameter_bytes": 136,
+        "threads": [
+          256,
+          1,
+          1
+        ],
+        "threads_per_cta": 256,
+        "total_launch_shared_bytes": 51200
+      },
+      "sass": {
+        "bytes": 194453,
+        "code_bytes": 41728,
+        "instructions": 2608,
+        "local_load_instructions": 0,
+        "local_store_instructions": 0,
+        "path": "/home/jon/git/local-inference-lab/b12x-glm52-pr243-o-opt/validation/trellis_decode/glm52_o4096x6144_optimization/evidence/grid_sweep_fp16_v1_20260826/resource_audit_v1/artifacts/grid_144.sass",
+        "register_reconfiguration": [],
+        "register_sets": {
+          "p": {
+            "count": 7,
+            "indices": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6
+            ],
+            "span": 7
+          },
+          "r": {
+            "count": 130,
+            "indices": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6,
+              7,
+              8,
+              9,
+              10,
+              11,
+              12,
+              13,
+              14,
+              15,
+              16,
+              17,
+              18,
+              19,
+              20,
+              21,
+              22,
+              23,
+              24,
+              25,
+              26,
+              27,
+              28,
+              29,
+              30,
+              31,
+              32,
+              33,
+              34,
+              35,
+              36,
+              37,
+              38,
+              39,
+              40,
+              41,
+              42,
+              43,
+              44,
+              45,
+              46,
+              47,
+              48,
+              49,
+              50,
+              51,
+              52,
+              53,
+              54,
+              55,
+              56,
+              57,
+              58,
+              59,
+              60,
+              61,
+              62,
+              63,
+              64,
+              65,
+              66,
+              67,
+              68,
+              69,
+              70,
+              71,
+              72,
+              73,
+              74,
+              75,
+              76,
+              77,
+              78,
+              79,
+              80,
+              81,
+              82,
+              83,
+              84,
+              85,
+              86,
+              87,
+              88,
+              89,
+              90,
+              91,
+              92,
+              93,
+              94,
+              95,
+              96,
+              97,
+              98,
+              99,
+              100,
+              101,
+              102,
+              103,
+              104,
+              105,
+              106,
+              107,
+              108,
+              109,
+              110,
+              111,
+              112,
+              113,
+              114,
+              115,
+              116,
+              117,
+              118,
+              119,
+              120,
+              121,
+              122,
+              123,
+              124,
+              125,
+              126,
+              127,
+              128,
+              129
+            ],
+            "span": 130
+          },
+          "up": {
+            "count": 1,
+            "indices": [
+              0
+            ],
+            "span": 1
+          },
+          "ur": {
+            "count": 13,
+            "indices": [
+              4,
+              5,
+              6,
+              7,
+              8,
+              9,
+              10,
+              11,
+              12,
+              14,
+              16,
+              18,
+              19
+            ],
+            "span": 20
+          }
+        },
+        "sha256": "4b774726d63d7f7ba254d7c5faa6ff0f4ce31ae765e6e0f3d298bb5132514e78"
+      }
+    },
+    {
+      "cubin": {
+        "architecture": "sm_120a",
+        "bytes": 57072,
+        "path": "/home/jon/git/local-inference-lab/b12x-glm52-pr243-o-opt/validation/trellis_decode/glm52_o4096x6144_optimization/evidence/grid_sweep_fp16_v1_20260826/resource_audit_v1/artifacts/grid_160.cubin",
+        "ptxas_flags": "-O 2 -arch sm_120a",
+        "ptxas_version": "Cuda compilation tools, release 13.3, V13.3.27",
+        "sha256": "b8d6ce59ab173addbb7b5af56f93cbb5b00d63810fbb29443e41026e7e827370"
+      },
+      "grid_x": 160,
+      "kernel": "kernel_cutlass_kernel_sparkinfergemmtrellis_linear_k6_mcg_cuteK6McgSmallMKernel_object_at__tensorptrf16gmemalign16oi641_tensorptri32gmemalign16o47185921_tensorptrf16gmemalign16oi641_tenso_0",
+      "manifest": {
+        "artifact_evidence_sha256": "165b8ece94cee73e6d2863b20b618f39c665c63a022eb75ec8b4d98669e84b51",
+        "bytes": 7723,
+        "cache_key": "65decff3c4179cff86e1395c4ead05e8cc33706eaf98f719f973bdc4534bd3c3",
+        "compile_environment": [
+          [
+            "CC",
+            ""
+          ],
+          [
+            "CUDACXX",
+            ""
+          ],
+          [
+            "CUDA_HOME",
+            ""
+          ],
+          [
+            "CUDA_PATH",
+            ""
+          ],
+          [
+            "CUDA_TOOLKIT_PATH",
+            ""
+          ],
+          [
+            "CUTE_DSL_ARCH",
+            "sm_120a"
+          ],
+          [
+            "CUTE_DSL_LIBS",
+            "/opt/venv/lib/python3.12/site-packages/nvidia_cutlass_dsl/cu13/lib/libcute_dsl_runtime.so"
+          ],
+          [
+            "CXX",
+            ""
+          ],
+          [
+            "NVCC_APPEND_FLAGS",
+            ""
+          ],
+          [
+            "NVCC_PREPEND_FLAGS",
+            ""
+          ]
+        ],
+        "compile_options": [
+          "opt-level=2",
+          "rdc=false",
+          "enable-assertions=false",
+          "preserve-line-info=false"
+        ],
+        "compile_spec_hash": "355923fbb5bf3a3d3a4401d19e466cf488acdd28f48dcba2f452dafb0af5c8ff",
+        "integrity": "pass",
+        "package_fingerprint": "34f03fa47ee407fae5fdca7d78c261a27eda2c81262f318da82dbe6c963bbc34",
+        "path": "/home/jon/git/local-inference-lab/b12x-glm52-pr243-o-opt/validation/trellis_decode/glm52_o4096x6144_optimization/evidence/grid_sweep_fp16_v1_20260826/grid_160/sparkinfer-cache/65/65decff3c4179cff86e1395c4ead05e8cc33706eaf98f719f973bdc4534bd3c3.json",
+        "schema": "sparkinfer._lib.compile_manifest.v3",
+        "semantic_key": "91e8a0958f7e71310db0b5dd0ea1c9e459b3f058c9d048f3bd1b7b895bc13ae8",
+        "sha256": "5c3567f6de75917cf3d1f84bf9fc549c068c10b86562f4c6da88e32e5a297d33",
+        "toolchain": [
+          [
+            "python",
+            "cpython",
+            [
+              3,
+              12,
+              3
+            ]
+          ],
+          [
+            "torch",
+            "2.12.0+cu132"
+          ],
+          [
+            "torch_cuda",
+            "13.2"
+          ],
+          [
+            "cutlass_dsl",
+            "4.6.0"
+          ],
+          [
+            "cutlass_dsl_libs_base",
+            "4.6.0"
+          ],
+          [
+            "cutlass_dsl_libs_core",
+            "4.6.0"
+          ],
+          [
+            "cutlass_dsl_libs_cu12",
+            "4.6.0"
+          ],
+          [
+            "cutlass_dsl_libs_cu13",
+            "4.6.0"
+          ],
+          [
+            "cuda_python",
+            "13.2.0"
+          ],
+          [
+            "cuda_bindings",
+            "13.2.0"
+          ],
+          [
+            "sparkinfer_runtime_patches",
+            [
+              [
+                "compile_only_warning",
+                true
+              ],
+              [
+                "memory_debug",
+                true
+              ],
+              [
+                "direct_frameinfo",
+                true
+              ]
+            ]
+          ]
+        ]
+      },
+      "object": {
+        "bytes": 68536,
+        "path": "/home/jon/git/local-inference-lab/b12x-glm52-pr243-o-opt/validation/trellis_decode/glm52_o4096x6144_optimization/evidence/grid_sweep_fp16_v1_20260826/grid_160/sparkinfer-cache/65/65decff3c4179cff86e1395c4ead05e8cc33706eaf98f719f973bdc4534bd3c3.o",
+        "sha256": "0b6b2fabfa4e203a63a696d6b32e14c0e5275650250c879507c11698484a09f0"
+      },
+      "resources": {
+        "allocated_registers": 132,
+        "cubin_static_shared_bytes": 1024,
+        "driver": {
+          "active_ctas_per_sm": 1,
+          "local_bytes": 0,
+          "max_threads_per_block": 384,
+          "registers": 132,
+          "static_shared_bytes": 0
+        },
+        "frame_bytes": 0,
+        "launch_dynamic_shared_bytes": 50176,
+        "max_register_count": 255,
+        "min_stack_bytes": 0,
+        "occupancy_active_ctas_per_sm": 1,
+        "parameter_bytes": 136,
+        "threads": [
+          256,
+          1,
+          1
+        ],
+        "threads_per_cta": 256,
+        "total_launch_shared_bytes": 51200
+      },
+      "sass": {
+        "bytes": 194453,
+        "code_bytes": 41728,
+        "instructions": 2608,
+        "local_load_instructions": 0,
+        "local_store_instructions": 0,
+        "path": "/home/jon/git/local-inference-lab/b12x-glm52-pr243-o-opt/validation/trellis_decode/glm52_o4096x6144_optimization/evidence/grid_sweep_fp16_v1_20260826/resource_audit_v1/artifacts/grid_160.sass",
+        "register_reconfiguration": [],
+        "register_sets": {
+          "p": {
+            "count": 7,
+            "indices": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6
+            ],
+            "span": 7
+          },
+          "r": {
+            "count": 130,
+            "indices": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6,
+              7,
+              8,
+              9,
+              10,
+              11,
+              12,
+              13,
+              14,
+              15,
+              16,
+              17,
+              18,
+              19,
+              20,
+              21,
+              22,
+              23,
+              24,
+              25,
+              26,
+              27,
+              28,
+              29,
+              30,
+              31,
+              32,
+              33,
+              34,
+              35,
+              36,
+              37,
+              38,
+              39,
+              40,
+              41,
+              42,
+              43,
+              44,
+              45,
+              46,
+              47,
+              48,
+              49,
+              50,
+              51,
+              52,
+              53,
+              54,
+              55,
+              56,
+              57,
+              58,
+              59,
+              60,
+              61,
+              62,
+              63,
+              64,
+              65,
+              66,
+              67,
+              68,
+              69,
+              70,
+              71,
+              72,
+              73,
+              74,
+              75,
+              76,
+              77,
+              78,
+              79,
+              80,
+              81,
+              82,
+              83,
+              84,
+              85,
+              86,
+              87,
+              88,
+              89,
+              90,
+              91,
+              92,
+              93,
+              94,
+              95,
+              96,
+              97,
+              98,
+              99,
+              100,
+              101,
+              102,
+              103,
+              104,
+              105,
+              106,
+              107,
+              108,
+              109,
+              110,
+              111,
+              112,
+              113,
+              114,
+              115,
+              116,
+              117,
+              118,
+              119,
+              120,
+              121,
+              122,
+              123,
+              124,
+              125,
+              126,
+              127,
+              128,
+              129
+            ],
+            "span": 130
+          },
+          "up": {
+            "count": 1,
+            "indices": [
+              0
+            ],
+            "span": 1
+          },
+          "ur": {
+            "count": 13,
+            "indices": [
+              4,
+              5,
+              6,
+              7,
+              8,
+              9,
+              10,
+              11,
+              12,
+              14,
+              16,
+              18,
+              19
+            ],
+            "span": 20
+          }
+        },
+        "sha256": "4b774726d63d7f7ba254d7c5faa6ff0f4ce31ae765e6e0f3d298bb5132514e78"
+      }
+    },
+    {
+      "cubin": {
+        "architecture": "sm_120a",
+        "bytes": 57072,
+        "path": "/home/jon/git/local-inference-lab/b12x-glm52-pr243-o-opt/validation/trellis_decode/glm52_o4096x6144_optimization/evidence/grid_sweep_fp16_v1_20260826/resource_audit_v1/artifacts/grid_176.cubin",
+        "ptxas_flags": "-O 2 -arch sm_120a",
+        "ptxas_version": "Cuda compilation tools, release 13.3, V13.3.27",
+        "sha256": "b8d6ce59ab173addbb7b5af56f93cbb5b00d63810fbb29443e41026e7e827370"
+      },
+      "grid_x": 176,
+      "kernel": "kernel_cutlass_kernel_sparkinfergemmtrellis_linear_k6_mcg_cuteK6McgSmallMKernel_object_at__tensorptrf16gmemalign16oi641_tensorptri32gmemalign16o47185921_tensorptrf16gmemalign16oi641_tenso_0",
+      "manifest": {
+        "artifact_evidence_sha256": "c757ec9c831d29984b96472f331bad973c2b4b31c24d1d1d304b2ea5cc668ba5",
+        "bytes": 7723,
+        "cache_key": "bc9b69b1d0184fa43d09919679e78fb67499bdc590669c0200e847d62ac6d482",
+        "compile_environment": [
+          [
+            "CC",
+            ""
+          ],
+          [
+            "CUDACXX",
+            ""
+          ],
+          [
+            "CUDA_HOME",
+            ""
+          ],
+          [
+            "CUDA_PATH",
+            ""
+          ],
+          [
+            "CUDA_TOOLKIT_PATH",
+            ""
+          ],
+          [
+            "CUTE_DSL_ARCH",
+            "sm_120a"
+          ],
+          [
+            "CUTE_DSL_LIBS",
+            "/opt/venv/lib/python3.12/site-packages/nvidia_cutlass_dsl/cu13/lib/libcute_dsl_runtime.so"
+          ],
+          [
+            "CXX",
+            ""
+          ],
+          [
+            "NVCC_APPEND_FLAGS",
+            ""
+          ],
+          [
+            "NVCC_PREPEND_FLAGS",
+            ""
+          ]
+        ],
+        "compile_options": [
+          "opt-level=2",
+          "rdc=false",
+          "enable-assertions=false",
+          "preserve-line-info=false"
+        ],
+        "compile_spec_hash": "523cebf73f2e5560989b2f7091f85b7d264389c0dc1e995b8d22e13a0f346239",
+        "integrity": "pass",
+        "package_fingerprint": "34f03fa47ee407fae5fdca7d78c261a27eda2c81262f318da82dbe6c963bbc34",
+        "path": "/home/jon/git/local-inference-lab/b12x-glm52-pr243-o-opt/validation/trellis_decode/glm52_o4096x6144_optimization/evidence/grid_sweep_fp16_v1_20260826/grid_176/sparkinfer-cache/bc/bc9b69b1d0184fa43d09919679e78fb67499bdc590669c0200e847d62ac6d482.json",
+        "schema": "sparkinfer._lib.compile_manifest.v3",
+        "semantic_key": "8dab410e9ad46310010f5fa0a31c2233a29020c4d80e6acbfbd2f2a9ba81cfab",
+        "sha256": "635902a2f981df29860dab60f615f9936a3da5affca7485153473693e91384a3",
+        "toolchain": [
+          [
+            "python",
+            "cpython",
+            [
+              3,
+              12,
+              3
+            ]
+          ],
+          [
+            "torch",
+            "2.12.0+cu132"
+          ],
+          [
+            "torch_cuda",
+            "13.2"
+          ],
+          [
+            "cutlass_dsl",
+            "4.6.0"
+          ],
+          [
+            "cutlass_dsl_libs_base",
+            "4.6.0"
+          ],
+          [
+            "cutlass_dsl_libs_core",
+            "4.6.0"
+          ],
+          [
+            "cutlass_dsl_libs_cu12",
+            "4.6.0"
+          ],
+          [
+            "cutlass_dsl_libs_cu13",
+            "4.6.0"
+          ],
+          [
+            "cuda_python",
+            "13.2.0"
+          ],
+          [
+            "cuda_bindings",
+            "13.2.0"
+          ],
+          [
+            "sparkinfer_runtime_patches",
+            [
+              [
+                "compile_only_warning",
+                true
+              ],
+              [
+                "memory_debug",
+                true
+              ],
+              [
+                "direct_frameinfo",
+                true
+              ]
+            ]
+          ]
+        ]
+      },
+      "object": {
+        "bytes": 68536,
+        "path": "/home/jon/git/local-inference-lab/b12x-glm52-pr243-o-opt/validation/trellis_decode/glm52_o4096x6144_optimization/evidence/grid_sweep_fp16_v1_20260826/grid_176/sparkinfer-cache/bc/bc9b69b1d0184fa43d09919679e78fb67499bdc590669c0200e847d62ac6d482.o",
+        "sha256": "424f0b818894137d6f6c484c9ab3943cbace63366d641806920f54416ed2bfff"
+      },
+      "resources": {
+        "allocated_registers": 132,
+        "cubin_static_shared_bytes": 1024,
+        "driver": {
+          "active_ctas_per_sm": 1,
+          "local_bytes": 0,
+          "max_threads_per_block": 384,
+          "registers": 132,
+          "static_shared_bytes": 0
+        },
+        "frame_bytes": 0,
+        "launch_dynamic_shared_bytes": 50176,
+        "max_register_count": 255,
+        "min_stack_bytes": 0,
+        "occupancy_active_ctas_per_sm": 1,
+        "parameter_bytes": 136,
+        "threads": [
+          256,
+          1,
+          1
+        ],
+        "threads_per_cta": 256,
+        "total_launch_shared_bytes": 51200
+      },
+      "sass": {
+        "bytes": 194453,
+        "code_bytes": 41728,
+        "instructions": 2608,
+        "local_load_instructions": 0,
+        "local_store_instructions": 0,
+        "path": "/home/jon/git/local-inference-lab/b12x-glm52-pr243-o-opt/validation/trellis_decode/glm52_o4096x6144_optimization/evidence/grid_sweep_fp16_v1_20260826/resource_audit_v1/artifacts/grid_176.sass",
+        "register_reconfiguration": [],
+        "register_sets": {
+          "p": {
+            "count": 7,
+            "indices": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6
+            ],
+            "span": 7
+          },
+          "r": {
+            "count": 130,
+            "indices": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6,
+              7,
+              8,
+              9,
+              10,
+              11,
+              12,
+              13,
+              14,
+              15,
+              16,
+              17,
+              18,
+              19,
+              20,
+              21,
+              22,
+              23,
+              24,
+              25,
+              26,
+              27,
+              28,
+              29,
+              30,
+              31,
+              32,
+              33,
+              34,
+              35,
+              36,
+              37,
+              38,
+              39,
+              40,
+              41,
+              42,
+              43,
+              44,
+              45,
+              46,
+              47,
+              48,
+              49,
+              50,
+              51,
+              52,
+              53,
+              54,
+              55,
+              56,
+              57,
+              58,
+              59,
+              60,
+              61,
+              62,
+              63,
+              64,
+              65,
+              66,
+              67,
+              68,
+              69,
+              70,
+              71,
+              72,
+              73,
+              74,
+              75,
+              76,
+              77,
+              78,
+              79,
+              80,
+              81,
+              82,
+              83,
+              84,
+              85,
+              86,
+              87,
+              88,
+              89,
+              90,
+              91,
+              92,
+              93,
+              94,
+              95,
+              96,
+              97,
+              98,
+              99,
+              100,
+              101,
+              102,
+              103,
+              104,
+              105,
+              106,
+              107,
+              108,
+              109,
+              110,
+              111,
+              112,
+              113,
+              114,
+              115,
+              116,
+              117,
+              118,
+              119,
+              120,
+              121,
+              122,
+              123,
+              124,
+              125,
+              126,
+              127,
+              128,
+              129
+            ],
+            "span": 130
+          },
+          "up": {
+            "count": 1,
+            "indices": [
+              0
+            ],
+            "span": 1
+          },
+          "ur": {
+            "count": 13,
+            "indices": [
+              4,
+              5,
+              6,
+              7,
+              8,
+              9,
+              10,
+              11,
+              12,
+              14,
+              16,
+              18,
+              19
+            ],
+            "span": 20
+          }
+        },
+        "sha256": "4b774726d63d7f7ba254d7c5faa6ff0f4ce31ae765e6e0f3d298bb5132514e78"
+      }
+    },
+    {
+      "cubin": {
+        "architecture": "sm_120a",
+        "bytes": 57072,
+        "path": "/home/jon/git/local-inference-lab/b12x-glm52-pr243-o-opt/validation/trellis_decode/glm52_o4096x6144_optimization/evidence/grid_sweep_fp16_v1_20260826/resource_audit_v1/artifacts/grid_188.cubin",
+        "ptxas_flags": "-O 2 -arch sm_120a",
+        "ptxas_version": "Cuda compilation tools, release 13.3, V13.3.27",
+        "sha256": "b8d6ce59ab173addbb7b5af56f93cbb5b00d63810fbb29443e41026e7e827370"
+      },
+      "grid_x": 188,
+      "kernel": "kernel_cutlass_kernel_sparkinfergemmtrellis_linear_k6_mcg_cuteK6McgSmallMKernel_object_at__tensorptrf16gmemalign16oi641_tensorptri32gmemalign16o47185921_tensorptrf16gmemalign16oi641_tenso_0",
+      "manifest": {
+        "artifact_evidence_sha256": "285c44ffd77efb65f09bfadeaa4b55768938803bff6e94f5977997608ee1ce60",
+        "bytes": 7723,
+        "cache_key": "df9c58d945e3eee6d23c132201a9e47be62bd9715da120956d69fe5ff5e4287f",
+        "compile_environment": [
+          [
+            "CC",
+            ""
+          ],
+          [
+            "CUDACXX",
+            ""
+          ],
+          [
+            "CUDA_HOME",
+            ""
+          ],
+          [
+            "CUDA_PATH",
+            ""
+          ],
+          [
+            "CUDA_TOOLKIT_PATH",
+            ""
+          ],
+          [
+            "CUTE_DSL_ARCH",
+            "sm_120a"
+          ],
+          [
+            "CUTE_DSL_LIBS",
+            "/opt/venv/lib/python3.12/site-packages/nvidia_cutlass_dsl/cu13/lib/libcute_dsl_runtime.so"
+          ],
+          [
+            "CXX",
+            ""
+          ],
+          [
+            "NVCC_APPEND_FLAGS",
+            ""
+          ],
+          [
+            "NVCC_PREPEND_FLAGS",
+            ""
+          ]
+        ],
+        "compile_options": [
+          "opt-level=2",
+          "rdc=false",
+          "enable-assertions=false",
+          "preserve-line-info=false"
+        ],
+        "compile_spec_hash": "4c003068e34276b9926a987edecfacb12b5149569d8a850a379e6d63b1bf3601",
+        "integrity": "pass",
+        "package_fingerprint": "34f03fa47ee407fae5fdca7d78c261a27eda2c81262f318da82dbe6c963bbc34",
+        "path": "/home/jon/git/local-inference-lab/b12x-glm52-pr243-o-opt/validation/trellis_decode/glm52_o4096x6144_optimization/evidence/grid_sweep_fp16_v1_20260826/grid_188/sparkinfer-cache/df/df9c58d945e3eee6d23c132201a9e47be62bd9715da120956d69fe5ff5e4287f.json",
+        "schema": "sparkinfer._lib.compile_manifest.v3",
+        "semantic_key": "78be00e5f3191582e1e0fed1d6116d788ba823775422bd22b4f1b391bc49d067",
+        "sha256": "4d4144901e1b627a9cc3e49c3e97a7c35f87ef1953896ebd7161107a6202be5a",
+        "toolchain": [
+          [
+            "python",
+            "cpython",
+            [
+              3,
+              12,
+              3
+            ]
+          ],
+          [
+            "torch",
+            "2.12.0+cu132"
+          ],
+          [
+            "torch_cuda",
+            "13.2"
+          ],
+          [
+            "cutlass_dsl",
+            "4.6.0"
+          ],
+          [
+            "cutlass_dsl_libs_base",
+            "4.6.0"
+          ],
+          [
+            "cutlass_dsl_libs_core",
+            "4.6.0"
+          ],
+          [
+            "cutlass_dsl_libs_cu12",
+            "4.6.0"
+          ],
+          [
+            "cutlass_dsl_libs_cu13",
+            "4.6.0"
+          ],
+          [
+            "cuda_python",
+            "13.2.0"
+          ],
+          [
+            "cuda_bindings",
+            "13.2.0"
+          ],
+          [
+            "sparkinfer_runtime_patches",
+            [
+              [
+                "compile_only_warning",
+                true
+              ],
+              [
+                "memory_debug",
+                true
+              ],
+              [
+                "direct_frameinfo",
+                true
+              ]
+            ]
+          ]
+        ]
+      },
+      "object": {
+        "bytes": 68536,
+        "path": "/home/jon/git/local-inference-lab/b12x-glm52-pr243-o-opt/validation/trellis_decode/glm52_o4096x6144_optimization/evidence/grid_sweep_fp16_v1_20260826/grid_188/sparkinfer-cache/df/df9c58d945e3eee6d23c132201a9e47be62bd9715da120956d69fe5ff5e4287f.o",
+        "sha256": "210c3dd74974105eedcca0923e8f03180017f49341c07bd95ec60d93b8a15cf8"
+      },
+      "resources": {
+        "allocated_registers": 132,
+        "cubin_static_shared_bytes": 1024,
+        "driver": {
+          "active_ctas_per_sm": 1,
+          "local_bytes": 0,
+          "max_threads_per_block": 384,
+          "registers": 132,
+          "static_shared_bytes": 0
+        },
+        "frame_bytes": 0,
+        "launch_dynamic_shared_bytes": 50176,
+        "max_register_count": 255,
+        "min_stack_bytes": 0,
+        "occupancy_active_ctas_per_sm": 1,
+        "parameter_bytes": 136,
+        "threads": [
+          256,
+          1,
+          1
+        ],
+        "threads_per_cta": 256,
+        "total_launch_shared_bytes": 51200
+      },
+      "sass": {
+        "bytes": 194453,
+        "code_bytes": 41728,
+        "instructions": 2608,
+        "local_load_instructions": 0,
+        "local_store_instructions": 0,
+        "path": "/home/jon/git/local-inference-lab/b12x-glm52-pr243-o-opt/validation/trellis_decode/glm52_o4096x6144_optimization/evidence/grid_sweep_fp16_v1_20260826/resource_audit_v1/artifacts/grid_188.sass",
+        "register_reconfiguration": [],
+        "register_sets": {
+          "p": {
+            "count": 7,
+            "indices": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6
+            ],
+            "span": 7
+          },
+          "r": {
+            "count": 130,
+            "indices": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6,
+              7,
+              8,
+              9,
+              10,
+              11,
+              12,
+              13,
+              14,
+              15,
+              16,
+              17,
+              18,
+              19,
+              20,
+              21,
+              22,
+              23,
+              24,
+              25,
+              26,
+              27,
+              28,
+              29,
+              30,
+              31,
+              32,
+              33,
+              34,
+              35,
+              36,
+              37,
+              38,
+              39,
+              40,
+              41,
+              42,
+              43,
+              44,
+              45,
+              46,
+              47,
+              48,
+              49,
+              50,
+              51,
+              52,
+              53,
+              54,
+              55,
+              56,
+              57,
+              58,
+              59,
+              60,
+              61,
+              62,
+              63,
+              64,
+              65,
+              66,
+              67,
+              68,
+              69,
+              70,
+              71,
+              72,
+              73,
+              74,
+              75,
+              76,
+              77,
+              78,
+              79,
+              80,
+              81,
+              82,
+              83,
+              84,
+              85,
+              86,
+              87,
+              88,
+              89,
+              90,
+              91,
+              92,
+              93,
+              94,
+              95,
+              96,
+              97,
+              98,
+              99,
+              100,
+              101,
+              102,
+              103,
+              104,
+              105,
+              106,
+              107,
+              108,
+              109,
+              110,
+              111,
+              112,
+              113,
+              114,
+              115,
+              116,
+              117,
+              118,
+              119,
+              120,
+              121,
+              122,
+              123,
+              124,
+              125,
+              126,
+              127,
+              128,
+              129
+            ],
+            "span": 130
+          },
+          "up": {
+            "count": 1,
+            "indices": [
+              0
+            ],
+            "span": 1
+          },
+          "ur": {
+            "count": 13,
+            "indices": [
+              4,
+              5,
+              6,
+              7,
+              8,
+              9,
+              10,
+              11,
+              12,
+              14,
+              16,
+              18,
+              19
+            ],
+            "span": 20
+          }
+        },
+        "sha256": "4b774726d63d7f7ba254d7c5faa6ff0f4ce31ae765e6e0f3d298bb5132514e78"
+      }
+    }
+  ],
+  "schema": "b12x.glm52_o4096x6144_grid_resources.v1",
+  "sweep_root": "/home/jon/git/local-inference-lab/b12x-glm52-pr243-o-opt/validation/trellis_decode/glm52_o4096x6144_optimization/evidence/grid_sweep_fp16_v1_20260826"
+}

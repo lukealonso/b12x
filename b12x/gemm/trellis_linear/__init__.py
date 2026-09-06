@@ -5,8 +5,10 @@ The operation consumes the checkpoint-native ``trellis_t256`` payload
 its two Hadamard sign vectors.  Preparation validates and records zero-copy
 views; execution performs input rotation, a W4A16 or direct E4M3-W4A8 GEMM,
 and output rotation.
-Callers that need CUDA-graph capture must provide stable ``output``,
-``gemm_output``, and ``c_tmp`` tensors to :func:`run`.
+Callers that need CUDA-graph capture must provide stable ``output`` and
+``c_tmp`` tensors plus the intermediates for every route they may execute.
+The fused K6/MCG route uses activation-typed ``rotated_compute``; the generic
+route keeps its FP16 rotation in ``rotated_f16``.
 """
 
 from __future__ import annotations
@@ -23,6 +25,7 @@ META = OpMeta(
         "PreparedWeight",
         "prepare_weight",
         "prepare_pair_weight",
+        "k6_mcg_small_m_scratch_elements",
         "run",
         "is_supported",
         "clear_caches",
@@ -51,6 +54,7 @@ if TYPE_CHECKING:
         PreparedWeight,
         clear_caches,
         is_supported,
+        k6_mcg_small_m_scratch_elements,
         prepare_weight,
         prepare_pair_weight,
         run,

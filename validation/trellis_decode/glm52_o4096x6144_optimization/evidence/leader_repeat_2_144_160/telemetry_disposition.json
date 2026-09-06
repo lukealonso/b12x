@@ -1,0 +1,40 @@
+{
+  "disposition": {
+    "grid_160_m1_comparison": "excluded",
+    "impact": "The excluded reverse-order sample is not needed to select grid 144. The fully valid 160-to-144 repeat measured both M=1 arms at 2272 MHz with identical 20.032 microsecond medians. The reverse-order M=4 comparison also had stable 2257/2265 MHz clocks and identical 20.064 microsecond medians. Grid 144 uses 10 percent less FP32 scratch than grid 160.",
+    "selected_grid": 144
+  },
+  "observation": {
+    "active_snapshot_sm_clock_mhz": 832,
+    "grid_x": 160,
+    "m": 1,
+    "pstate": "P1",
+    "reason": "The post-timing active GPU snapshot was not clock-comparable with the grid-144 M=1 snapshot at 2280 MHz.",
+    "throttle_mask": "0x0000000000000000"
+  },
+  "schema": "b12x.glm52_o4096x6144_repeat_telemetry_disposition.v1",
+  "source_manifest": "sweep_manifest.json",
+  "supporting_measurements": {
+    "reverse_order_m4": {
+      "grid_144": {
+        "fused_median_us": 20.06400004029274,
+        "sm_clock_mhz": 2265
+      },
+      "grid_160": {
+        "fused_median_us": 20.06400004029274,
+        "sm_clock_mhz": 2257
+      }
+    },
+    "valid_160_to_144_m1_repeat": {
+      "grid_144": {
+        "fused_median_us": 20.031999796628952,
+        "sm_clock_mhz": 2272
+      },
+      "grid_160": {
+        "fused_median_us": 20.031999796628952,
+        "sm_clock_mhz": 2272
+      },
+      "source_manifest": "../leader_repeat_1_160_144/sweep_manifest.json"
+    }
+  }
+}

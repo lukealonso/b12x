@@ -1,0 +1,87 @@
+{
+  "schema": "b12x.glm52_service_cache_inventory.v1",
+  "captured_at": "2026-08-26T11:40:14Z",
+  "scope": "fresh per-arm service compilation caches",
+  "method": {
+    "all_files": "find <arm>/cache -type f; count and sum byte sizes",
+    "directory_count": "find <arm>/cache -type d",
+    "file_shape_sha256": "SHA-256 of sorted relative-path and byte-size rows",
+    "torch_extension_manifest_sha256": "SHA-256 of sorted relative-path and content-SHA-256 rows",
+    "b12x_cute_pattern": "*/b12x-cute/*",
+    "torch_extension_pattern": "*/torch_extensions/*"
+  },
+  "arms": {
+    "a1": {
+      "file_count": 11182,
+      "bytes": 1675582881,
+      "directory_count": 2322,
+      "b12x_cute_file_count": 0,
+      "b12x_cute_bytes": 0,
+      "torch_extension_file_count": 20,
+      "torch_extension_bytes": 16095329,
+      "file_shape_sha256": "a9839e6361dbdf673db421632e1f9a5db15c101bc88ac1292e9fcdb1e1db03c7",
+      "torch_extension_manifest_sha256": "b30cbd2d93e279a8563d44c6974794258c520bfa13cb19427e35cee05e54ade5"
+    },
+    "b1": {
+      "file_count": 11206,
+      "bytes": 1674970549,
+      "directory_count": 2322,
+      "b12x_cute_file_count": 0,
+      "b12x_cute_bytes": 0,
+      "torch_extension_file_count": 20,
+      "torch_extension_bytes": 16095329,
+      "file_shape_sha256": "0826acd2f761430c43914863a9965f6144de5acf25559aa370ef05bedbf4c529",
+      "torch_extension_manifest_sha256": "9c17b544c231958e1822b4fcd8e149dd07f49815057da7dc94c75478bf1a12c0"
+    },
+    "a2": {
+      "file_count": 10846,
+      "bytes": 1672781453,
+      "directory_count": 2280,
+      "b12x_cute_file_count": 0,
+      "b12x_cute_bytes": 0,
+      "torch_extension_file_count": 20,
+      "torch_extension_bytes": 16095329,
+      "file_shape_sha256": "1cc91e6c0acc3b4585d72ff20942a9c07b522259ac31b5945cbf1ccfe584babe",
+      "torch_extension_manifest_sha256": "b05c1a187fb891738aa0b24488512081406a7ea1a11310f1edf16229de7d14d2"
+    },
+    "c1": {
+      "file_count": 11182,
+      "bytes": 1676147368,
+      "directory_count": 2320,
+      "b12x_cute_file_count": 0,
+      "b12x_cute_bytes": 0,
+      "torch_extension_file_count": 20,
+      "torch_extension_bytes": 16095329,
+      "file_shape_sha256": "618488177cafb0428efef258e21b7730631f046fc92ea0edd19311e688e88895",
+      "torch_extension_manifest_sha256": "93236497ea81dc8f834d622eacaa6d73ab35c4eaff3027347b1ad1e14bab7562"
+    },
+    "b2": {
+      "file_count": 11206,
+      "bytes": 1676903929,
+      "directory_count": 2322,
+      "b12x_cute_file_count": 0,
+      "b12x_cute_bytes": 0,
+      "torch_extension_file_count": 20,
+      "torch_extension_bytes": 16095329,
+      "file_shape_sha256": "31beb1016f4d422b45be06f595f9005179a479fa2652926c336609e95f67956a",
+      "torch_extension_manifest_sha256": "b9dd2ec348a681def203fdab7f06e4a9e47f12b453f25c9f175c75347860093d"
+    },
+    "c2": {
+      "file_count": 11182,
+      "bytes": 1675508489,
+      "directory_count": 2320,
+      "b12x_cute_file_count": 0,
+      "b12x_cute_bytes": 0,
+      "torch_extension_file_count": 20,
+      "torch_extension_bytes": 16095329,
+      "file_shape_sha256": "50f17b56154388b359d9b50fd9fb0361d97e4f3342cab6c6103a69a534af8ca0",
+      "torch_extension_manifest_sha256": "d920ce26001e775a5fbfc2902f18f05cc0f017064b71b816199817744856460a"
+    }
+  },
+  "interpretation": {
+    "cache_isolation": "Each service arm used its own empty cache root.",
+    "b12x_cute_disk_cache": "No b12x CuTe files were emitted in the service cache roots; service route attribution therefore comes from image/source receipts and the same-image import-time kill-switch panel, not a disk-cache filename.",
+    "torch_extensions": "Every arm emitted the same 20 external-extension file paths and 16095329 aggregate bytes. Build artifacts are not byte-identical across independent compilations and are not used as cross-arm b12x kernel identity evidence.",
+    "cleanup": "The six generated cache directories were removed after this inventory because they are reproducible build products; benchmark, service, graph, telemetry, and comparison receipts were retained."
+  }
+}

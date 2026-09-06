@@ -1,0 +1,420 @@
+{
+  "schema": "b12x.glm52_o4096x6144_optimization_qualification.v1",
+  "generated_at": "2026-08-26T13:34:27Z",
+  "publication": {
+    "target": "https://github.com/local-inference-lab/b12x/pull/243",
+    "qualified_source_binding": "PR #243 revision 706ad0eb54014ed9156dc82a7e0acff691662a89 plus tracked diff SHA-256 a33e6f38db7b3ac594183b312fb234fa4fdadd1bb01c12ee27f9bead05b355a4",
+    "qualified_implementation_revision": "e7465a425bfa04c816901ee30a5f9c4f6a092a43",
+    "runtime_semantic_identity": "The published K6/MCG runtime source has AST SHA-256 3b070bc70075e8db6f0014faf83de9d02162d405b67672f88ce2931ce4a8c7dc, identical to qualified implementation revision e7465a425bfa04c816901ee30a5f9c4f6a092a43. Planner-table comments, qualification tooling, and evidence interpretation do not alter that executable AST.",
+    "evidence_policy": "Commit the compact files listed in evidence/README.md. Full raw samples, caches, generated fixtures, logs, and extracted binaries remain host-local and are bound by the hashes in this receipt."
+  },
+  "verdict": {
+    "overall": "qualified_with_workload_scope",
+    "kernel_performance": "pass",
+    "exact_checkpoint_correctness": "pass",
+    "cuda_graph_and_allocator_safety": "pass",
+    "unrelated_shape_regression": "pass",
+    "full_service_safety": "pass",
+    "full_service_performance": "mixed",
+    "kld": "pass",
+    "summary": "The b12x-owned 144-CTA policy is qualified for the exact TP4 rank-zero FP16 GLM o_proj payload. It beats the served ExLlamaV3 projection at M=1 and M=4 and is at parity at M=8, M=12, and M=16. The full service shows a measurable short-concurrency-1 E2E win, but the rest of the service matrix is mixed or within drift, so this receipt does not assert a universal service-level speedup."
+  },
+  "scope": {
+    "checkpoint": "/data/models/brandonmusic/GLM-5.2-EXL3-TR3v4-3.5bpw-MTP78",
+    "tensor_prefix": "model.layers.3.self_attn.o_proj",
+    "tp_rank": 0,
+    "tp_size": 4,
+    "shape_m_k_n": "M x 4096 x 6144",
+    "rows": [1, 4, 8, 12, 16],
+    "activation_dtype": "torch.float16",
+    "trellis_bits": 6,
+    "codebook": "mcg",
+    "excluded": "M=17..128 medium-row kernel design and qualification"
+  },
+  "source_identities": {
+    "worktree": "/home/jon/git/local-inference-lab/b12x-glm52-pr243-o-opt",
+    "branch": "codex/glm52-pr243-o-opt",
+    "b12x_head": "706ad0eb54014ed9156dc82a7e0acff691662a89",
+    "b12x_head_tree": "5e4c5566062306b76a6860d6a40c0f743aac0c89",
+    "tracked_diff_sha256": "a33e6f38db7b3ac594183b312fb234fa4fdadd1bb01c12ee27f9bead05b355a4",
+    "qualified_implementation_revision": "e7465a425bfa04c816901ee30a5f9c4f6a092a43",
+    "qualified_and_published_kernel_ast_sha256": "3b070bc70075e8db6f0014faf83de9d02162d405b67672f88ce2931ce4a8c7dc",
+    "origin_master": {
+      "head": "3a437ab5168060e4d625f05e1625c04089f1ba37",
+      "tree": "f5778d984546d08b1ed0e05f07029425aa999202"
+    },
+    "pr_221": {
+      "head": "413f96e889dad1ae0752fd1f4be9d37f56849600",
+      "tree": "e7d3c81fa4a9dda64a731a03c05fae3bab30001a",
+      "merge_base_with_master": "6714ff09bc5be749c6f674ac8e2ba6a3b6a40ab4"
+    },
+    "pr_243": {
+      "head": "706ad0eb54014ed9156dc82a7e0acff691662a89",
+      "tree": "5e4c5566062306b76a6860d6a40c0f743aac0c89",
+      "merge_base_with_master": "9ae32e297c7d8d5258e0953c111a933adcb687f5"
+    },
+    "vllm_integration": {
+      "worktree": "/home/jon/git/local-inference-lab/vllm-glm52-pr243-current",
+      "head": "8e7be4d5c97fb86d983bd5f83c825153452efaec",
+      "tree": "b930c0f215e4c18f105b4480022eca59299d6072",
+      "uncommitted_diff_sha256": "329ccd993a5fad0c15fe75b3d2483e73da7e3b72c3779f43d84faa05ee33007e",
+      "modified_during_glm_o_proj_qualification": false
+    },
+    "changed_file_sha256": {
+      "b12x/gemm/trellis_linear/_k6_mcg_cute.py": "d9c85d74f12d8e859727a9686e12798430d50d71985f263004ecd5ce80542c1c",
+      "benchmarks/benchmark_trellis_k6_mcg_checkpoint.py": "6b7d06f5c64d487ab2e63010e5fa69e2337802721261487b3e13ca316c1a4198",
+      "tests/gemm/test_benchmark_trellis_k6_mcg_checkpoint.py": "e2a3feaeb584733810b0fe3fff155b15bfb3ed9fcbba50418da50c98711951e7",
+      "tests/gemm/test_trellis_k6_mcg_cute.py": "697cdb6e359f07bef29a8b3100a1dec21e775f537e22824701d47aa65c9e3156"
+    },
+    "reproduction_tool_sha256": {
+      "validation/trellis_decode/glm52_o4096x6144_optimization/analyze_regression_panel.py": "fd4a7bb009d14f5bd3ddaa123993b5b5682040ec1f11ac2be0e9265cf794ff38",
+      "validation/trellis_decode/glm52_o4096x6144_optimization/audit_grid_artifacts.py": "6bfc460e9960c4a14a2a20988a90efbd480bca3689063149247161962212bf21",
+      "validation/trellis_decode/glm52_o4096x6144_optimization/benchmark_openai_stream.py": "5d3924204b3a3abd71166c052e858957d0c1d22c43bd63b82d9b054e3dfc3439",
+      "validation/trellis_decode/glm52_o4096x6144_optimization/capture_service_evidence.py": "acfb066ac45148473c050939c689dffc216256ec6ae781ad442234dcebd030f8",
+      "validation/trellis_decode/glm52_o4096x6144_optimization/compile_v39_grid_artifact.py": "ad52d0b95cd63c83e3eda2d52484189761d68381f10855a64fadb62663beb0c3",
+      "validation/trellis_decode/glm52_o4096x6144_optimization/run_grid_sweep.py": "0c72e6c9ec3bb09e93f0eca08cbb564e00c6791d64d5150dfd669bdff4ac26f0",
+      "validation/trellis_decode/glm52_o4096x6144_optimization/run_service_arm.py": "16da813c17be2d3ebc3faac362642c40b71e28fd1f551267a46f05c9569e698d"
+    }
+  },
+  "implementation": {
+    "planner_owner": "b12x",
+    "policy": {
+      "table": "_GLM_GRID_CTA",
+      "shape_k_n": [4096, 6144],
+      "grid_x": 144,
+      "threads_per_cta": 256,
+      "required_scratch_elements_fp32": 294912,
+      "scratch_bytes": 1179648
+    },
+    "benchmark_harness_fix": "The checkpoint harness now allocates scratch from the immutable bound launch.required_scratch_elements instead of recomputing public policy after a temporary experimental override has been restored.",
+    "common_kernel_math_changed": false,
+    "w4a16_contract_changed": false,
+    "qwen_policy_changed": false,
+    "qwen_5120x6144_grid_x": 120,
+    "kill_switch_preserved": "B12X_DISABLE_STANDALONE_K6=1",
+    "fail_closed_route_preserved": true
+  },
+  "checkpoint_identity": {
+    "shard": "model-layer-003.safetensors",
+    "shard_bytes": 165527424,
+    "shard_sha256": "4bfb3a07979529760f2643a6491b05c84027d7ebf510564a913f1d7962fcb5aa",
+    "shard_digest_mode": "recorded exact file SHA-256; checkpoint supplies no independent shard digest list",
+    "index_sha256": "20ed38193742d442a5ba444b07945527d49b5d68f152aa88131adf668ca54727",
+    "source_manifest_sha256": "df2f4c87b22c21c5234ef216149f5b5adc556820bb97ae4bc6dd7f4f0647b8db",
+    "source_manifest_verified": true,
+    "local_tensor_sha256": {
+      "mcg": "ade4fb124dda0f3537386cdd4a3cdcea3a223d386e506a4be89394bb33ee13fe",
+      "suh": "3e7f5e85647f01bd379bf81e85259957c31377fc93b2347e7354269c2fc046ba",
+      "svh": "0b1a2cb642e0c099af8fd0a23d4fff8ac5f0d85b883f1d10f2b772e5a440e75d",
+      "trellis": "f6ee5b32361052ac8fbcfc65cb529bcf2127104969704178acbc0bda3fa46aa4"
+    }
+  },
+  "runtime": {
+    "host": "epyc",
+    "physical_gpu_index_for_projection_qualification": 6,
+    "gpu": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+    "gpu_uuid": "GPU-5e983ae0-0c39-779f-3f35-fc3744a2398d",
+    "compute_capability": "12.0",
+    "architecture": "sm_120a",
+    "sm_count": 188,
+    "total_memory_bytes": 102014189568,
+    "power_limit_watts": 300,
+    "compute_mode": "Default",
+    "driver": "610.57.04",
+    "torch": "2.12.0+cu132",
+    "torch_cuda": "13.2",
+    "cuda_python": "13.2.0",
+    "cutlass_dsl": "4.6.0",
+    "runtime_nvcc_ptxas": "13.2.78",
+    "resource_recompile_ptxas": "13.3.27"
+  },
+  "images": {
+    "sweep_base": {
+      "tag": "local/glm52-pr243-candidate-integrated:706ad0e-v39-final",
+      "id": "sha256:d4cdc039cc3b7ef7be8e64ae51a70768cc7977994cd0547c01c3411a61339795"
+    },
+    "fallback_service": {
+      "tag": "local/glm52-pr243-integration-base:v39-33847ad",
+      "id": "sha256:87fc18209cf28e58b79b52c7cdc194be8aeb2f0624d2e222915dba364f1685fa"
+    },
+    "optimized": {
+      "tag": "local/glm52-pr243-o144:706ad0e-v39-v1",
+      "id": "sha256:c728d06ab95ee208bacecbf4b5948c735b5c0057cfffd179ef8b53b390c777d1",
+      "resolved_base_digest": "sha256:d4cdc039cc3b7ef7be8e64ae51a70768cc7977994cd0547c01c3411a61339795",
+      "internal_policy_source_before_sha256": "70edc835c03a0054ef29d56f869996fc4cf22df5b1cc4636734b9ea812a77f94",
+      "internal_policy_source_after_sha256": "4fde57ae373a161ea59ce091f8029e8cb8b1346f2689810ebdba2508ffca672f",
+      "reviewed_b12x_policy_snapshot_sha256": "99318df5db87635e845bcd1ba93d6714e17b1cebdad51150ac892b227c186872",
+      "published_b12x_policy_file_sha256_after_comment_cleanup": "d9c85d74f12d8e859727a9686e12798430d50d71985f263004ecd5ce80542c1c",
+      "verification_pass": true,
+      "namespace_note": "The pinned v39 serving image exposes the reviewed integration through the sparkinfer namespace. The image is a strict policy-only semantic port of the b12x decision, not a byte-for-byte copy of the published b12x source file. The source difference is comment-only; the executable 4096x6144 policy and kernel AST are unchanged."
+    }
+  },
+  "grid_sweep": {
+    "command_argv": [
+      "validation/trellis_decode/glm52_o4096x6144_optimization/run_grid_sweep.py",
+      "--source-tree", "/home/jon/git/local-inference-lab/b12x-glm52-pr243-o-opt",
+      "--model-dir", "/data/models/brandonmusic/GLM-5.2-EXL3-TR3v4-3.5bpw-MTP78",
+      "--output-root", "/home/jon/git/local-inference-lab/b12x-glm52-pr243-o-opt/validation/trellis_decode/glm52_o4096x6144_optimization/evidence/grid_sweep_fp16_v1_20260826",
+      "--image", "local/glm52-pr243-candidate-integrated:706ad0e-v39-final",
+      "--image-id", "sha256:d4cdc039cc3b7ef7be8e64ae51a70768cc7977994cd0547c01c3411a61339795",
+      "--source-revision", "706ad0eb54014ed9156dc82a7e0acff691662a89",
+      "--integration-tree", "8e7be4d5c97fb86d983bd5f83c825153452efaec+diff-329ccd993a5fad0c15fe75b3d2483e73da7e3b72c3779f43d84faa05ee33007e",
+      "--gpu", "6",
+      "--grids", "48,64,80,96,112,120,128,144,160,176,188",
+      "--warmups", "6000",
+      "--iterations", "240",
+      "--cold-replays", "12"
+    ],
+    "ratio_direction": "exllamav3_over_fused_latency > 1 favors fused",
+    "route_order": "all six permutations cycled equally",
+    "image_identity": {
+      "declared_id": "sha256:d4cdc039cc3b7ef7be8e64ae51a70768cc7977994cd0547c01c3411a61339795",
+      "recorded_docker_inspect_id": "sha256:d4cdc039cc3b7ef7be8e64ae51a70768cc7977994cd0547c01c3411a61339795",
+      "retained_manifest_match": true,
+      "published_runner_resolves_and_rejects_mismatch": true,
+      "published_runner_isolation": ["--pull=never", "--network=none", "--ipc=none"]
+    },
+    "all_correctness_and_graph_gates_passed": true,
+    "results_us": [
+      {"grid_x": 48, "scratch_elements": 98304, "m1": 32.256, "m4": 32.320, "m8": 32.352, "m12": 32.352, "m16": 32.352},
+      {"grid_x": 64, "scratch_elements": 131072, "m1": 28.256, "m4": 28.256, "m8": 28.224, "m12": 28.256, "m16": 30.064},
+      {"grid_x": 80, "scratch_elements": 163840, "m1": 26.208, "m4": 26.176, "m8": 26.208, "m12": 26.208, "m16": 26.192},
+      {"grid_x": 96, "scratch_elements": 196608, "m1": 22.112, "m4": 22.112, "m8": 22.080, "m12": 22.112, "m16": 22.080},
+      {"grid_x": 112, "scratch_elements": 229376, "m1": 22.112, "m4": 22.112, "m8": 24.128, "m12": 24.160, "m16": 24.160},
+      {"grid_x": 120, "scratch_elements": 245760, "m1": 22.080, "m4": 22.112, "m8": 22.112, "m12": 24.128, "m16": 24.160},
+      {"grid_x": 128, "scratch_elements": 262144, "m1": 22.080, "m4": 22.112, "m8": 22.112, "m12": 22.112, "m16": 22.112},
+      {"grid_x": 144, "scratch_elements": 294912, "m1": 20.032, "m4": 20.064, "m8": 22.112, "m12": 22.112, "m16": 22.112},
+      {"grid_x": 160, "scratch_elements": 327680, "m1": 20.064, "m4": 20.064, "m8": 22.080, "m12": 22.080, "m16": 22.080},
+      {"grid_x": 176, "scratch_elements": 360448, "m1": 20.096, "m4": 22.112, "m8": 22.112, "m12": 22.112, "m16": 22.112},
+      {"grid_x": 188, "scratch_elements": 385024, "m1": 20.096, "m4": 22.112, "m8": 22.080, "m12": 22.112, "m16": 22.080}
+    ],
+    "selection": {
+      "grid_x": 144,
+      "reason": "The fully valid 160-to-144 repeat measured both M=1 arms at 2272 MHz with identical 20.032 microsecond medians. The reverse-order M=4 arms were clock-comparable and tied at 20.064 microseconds. Grid 144 uses 10% less FP32 scratch and fewer CTAs than grid 160.",
+      "repeat_1_order": [160, 144],
+      "repeat_2_order": [144, 160],
+      "repeat_iterations": 600,
+      "excluded_comparison": {
+        "grid_x": 160,
+        "m": 1,
+        "repeat_order": [144, 160],
+        "observed_sm_clock_mhz": 832,
+        "reason": "The post-timing snapshot was not clock-comparable with the grid-144 arm and is excluded from the selection claim.",
+        "disposition_path": "evidence/leader_repeat_2_144_160/telemetry_disposition.json"
+      }
+    }
+  },
+  "normal_planner_qualification": {
+    "qualification_pass": true,
+    "planner_override": null,
+    "grid_x": 144,
+    "scratch_elements": 294912,
+    "warmups": 6000,
+    "iterations": 600,
+    "cold_replays": 12,
+    "replay_correctness_checks": 8,
+    "timing_us": {
+      "1": {"fused": 20.031999796628952, "served_exllamav3": 22.112000733613968, "exllamav3_over_fused": 1.1038339136432622, "fused_latency_reduction_percent": 9.406660944177085},
+      "4": {"fused": 20.672000013291836, "served_exllamav3": 22.112000733613968, "exllamav3_over_fused": 1.0696594775249724, "fused_latency_reduction_percent": 6.512304054571997},
+      "8": {"fused": 22.112000733613968, "served_exllamav3": 22.112000733613968, "exllamav3_over_fused": 1.0, "fused_latency_reduction_percent": 0.0},
+      "12": {"fused": 22.112000733613968, "served_exllamav3": 22.112000733613968, "exllamav3_over_fused": 1.0, "fused_latency_reduction_percent": 0.0},
+      "16": {"fused": 22.112000733613968, "served_exllamav3": 22.112000733613968, "exllamav3_over_fused": 1.0, "fused_latency_reduction_percent": 0.0}
+    },
+    "correctness": {
+      "comparison_count": 10,
+      "all_pass": true,
+      "minimum_cosine": 0.9999997019767761,
+      "maximum_relative_l2": 0.0005874503887951406,
+      "maximum_absolute_error": 0.0001220703125,
+      "minimum_top8_overlap": 0.875,
+      "top8_membership_mismatch_rows": 2,
+      "ambiguity_qualified_mismatch_rows": 2,
+      "unambiguous_membership_mismatch_rows": 0,
+      "all_finite": true,
+      "all_nonzero": true,
+      "all_outputs_fully_overwritten": true
+    },
+    "graph_and_allocator": {
+      "one_cooperative_k6_mcg_kernel_per_fused_graph": true,
+      "separate_rotation_kernel_count": 0,
+      "dynamic_shared_memory_bytes": 50176,
+      "stable_caller_owned_addresses": true,
+      "mutation_replay_pass": true,
+      "replay_allocator_deltas_all_zero": true,
+      "capture_bookkeeping_note": "Each route showed the same 1024-byte two-allocation framework graph bookkeeping signature; route storage was fully caller-owned and replay allocated nothing."
+    }
+  },
+  "resource_audit": {
+    "pass": true,
+    "grid_x": 144,
+    "cubin_sha256": "b8d6ce59ab173addbb7b5af56f93cbb5b00d63810fbb29443e41026e7e827370",
+    "allocated_registers": 132,
+    "sass_register_sets": {"R": 130, "UR": 13, "P": 7, "UP": 1},
+    "frame_bytes": 0,
+    "local_load_instructions": 0,
+    "local_store_instructions": 0,
+    "static_shared_memory_bytes": 1024,
+    "dynamic_shared_memory_bytes": 50176,
+    "total_launch_shared_memory_bytes": 51200,
+    "active_ctas_per_sm": 1,
+    "sass_instruction_count": 2608,
+    "code_bytes": 41728,
+    "cross_grid_identity": "All eleven grid values produced the same extracted cubin SHA-256; the policy changes only launch count and scratch capacity."
+  },
+  "regression_panels": {
+    "glm_q_b_fp16": {
+      "valid": true,
+      "shape_k_n": [2048, 4096],
+      "grid_x": 64,
+      "scratch_elements": 131072,
+      "balanced_order": ["base_before", "candidate", "base_after"],
+      "identical_cubin_sha256": "5748a801e29e76804c8dc7df9e3a52882d2efa4667808992368543bce1761c5d",
+      "worst_candidate_regression_percent": 0.10030166396841622,
+      "budget_percent": 1.0,
+      "max_sm_clock_spread_mhz": 30,
+      "observed_max_sm_clock_spread_mhz": 15
+    },
+    "qwen_down_bf16": {
+      "valid": true,
+      "shape_k_n": [17408, 5120],
+      "grid_x": 160,
+      "balanced_order": ["base_before", "candidate", "base_after"],
+      "identical_cubin_sha256": "615fcb7d1c6d8e79ad74a141c56f7ed03d2d9dd97f2953aea516299fe63959e0",
+      "candidate_regression_range_percent": [-0.06854061550111146, 0.07173655664027834],
+      "budget_percent": 1.0,
+      "max_sm_clock_spread_mhz": 30,
+      "observed_max_sm_clock_spread_mhz": 7,
+      "input_kind": "deterministic shape-only BF16 fixture",
+      "exact_checkpoint_available_for_rerun": false,
+      "retained_exact_checkpoint_evidence": {
+        "path": "validation/trellis_decode/evidence/qwen38_down_bf16_8159533/result.json",
+        "sha256": "74372b9860ebf1854e17130aa923037063c45e3386ed38158288f90f78b4f1ff",
+        "checkpoint_shard_sha256": "792b46b54a79871030a5a029a483b8938ff509912169a1c7627913d614365f0d",
+        "qualification_pass": true
+      }
+    }
+  },
+  "full_service": {
+    "profile": {
+      "gpus": [0, 1, 2, 3],
+      "tp": 4,
+      "dcp": 4,
+      "dcp_backend": "a2a",
+      "mtp_tokens": 3,
+      "mtp_moe_backend": "triton",
+      "draft_sampling": "greedy",
+      "quantization": "exl3",
+      "kv_cache_dtype": "nvfp4_ds_mla",
+      "bf16_rope": true,
+      "r7_fused_layers": 48,
+      "gpu_memory_utilization": 0.955,
+      "max_num_batched_tokens": 2048,
+      "max_num_seqs": 4,
+      "max_model_len": 262144,
+      "cuda_graph_capture_sizes": [4, 8, 12, 16],
+      "prefix_caching_enabled": true,
+      "chunked_prefill_enabled": true,
+      "measured_prefix_cache_hits": 0,
+      "fixed_kv_cache_tokens": 280320
+    },
+    "arms": {
+      "A": "fallback image",
+      "B": "optimized image with 144-CTA route",
+      "C": "same optimized image with B12X_DISABLE_STANDALONE_K6=1"
+    },
+    "upstream_aba": {
+      "order": ["A1", "B1", "A2"],
+      "valid": true,
+      "sign_convention": "positive improvement_percent means B is faster than the A1/A2 midpoint",
+      "workloads": {
+        "short_c1_p128_o256": {"decode_improvement_percent": 0.10733515622143308, "decode_outer_drift_percent": 0.5458039961775407, "e2e_improvement_percent": 0.3457601574129665, "e2e_outer_drift_percent": 0.02532018667853464, "acceptance_delta_percentage_points": 0.0},
+        "short_c4_p128_o256": {"decode_improvement_percent": -0.5584485240055614, "decode_outer_drift_percent": 0.15732668703357655, "e2e_improvement_percent": -0.4330276473544892, "e2e_outer_drift_percent": 1.250984496014662, "acceptance_delta_percentage_points": -5.92048003352007},
+        "long_c1_p32768_o256": {"decode_improvement_percent": 0.22015429869688408, "decode_outer_drift_percent": 0.39256182465806644, "e2e_improvement_percent": -0.08400478300114589, "e2e_outer_drift_percent": 0.12945536101598432, "acceptance_delta_percentage_points": 0.0},
+        "long_c4_p32768_o256": {"decode_improvement_percent": -0.8226460092011667, "decode_outer_drift_percent": 0.19091171237840543, "e2e_improvement_percent": -0.3208136283761709, "e2e_outer_drift_percent": 0.14758330987766355, "acceptance_delta_percentage_points": 0.15145878427128556},
+        "prefill_c1_p8039_o1": {"prefill_improvement_percent": -0.13333930311365538, "prefill_outer_drift_percent": 0.2785012640869944, "e2e_improvement_percent": -0.13364109780014122, "e2e_outer_drift_percent": 0.2778341337311363}
+      }
+    },
+    "same_image_kill_switch_cbc": {
+      "order": ["C1", "B2", "C2"],
+      "valid": true,
+      "sign_convention": "positive improvement_percent means B is faster than the C1/C2 midpoint",
+      "workloads": {
+        "short_c1_p128_o256": {"decode_improvement_percent": -0.014045746963342598, "decode_outer_drift_percent": 0.2827517602201346, "e2e_improvement_percent": 0.8456043517564127, "e2e_outer_drift_percent": 0.6490708052952598, "acceptance_delta_percentage_points": -0.3008630812621038},
+        "short_c4_p128_o256": {"decode_improvement_percent": 2.5181128364121896, "decode_outer_drift_percent": 3.0474917608522167, "e2e_improvement_percent": 1.1212533939668812, "e2e_outer_drift_percent": 0.4403497623624908, "acceptance_delta_percentage_points": -6.09753058568161},
+        "long_c1_p32768_o256": {"decode_improvement_percent": 0.019519705047832403, "decode_outer_drift_percent": 0.26633969995631945, "e2e_improvement_percent": -0.24366600812801842, "e2e_outer_drift_percent": 0.03296819530689277, "acceptance_delta_percentage_points": 0.0},
+        "long_c4_p32768_o256": {"decode_improvement_percent": 0.5205797874092033, "decode_outer_drift_percent": 0.17097498413203294, "e2e_improvement_percent": 0.10727825682762537, "e2e_outer_drift_percent": 0.0494838431958744, "acceptance_delta_percentage_points": 0.021701388888883955},
+        "prefill_c1_p8039_o1": {"prefill_improvement_percent": -0.08814470943995234, "prefill_outer_drift_percent": 0.3427235407630791, "e2e_improvement_percent": -0.08764312796269991, "e2e_outer_drift_percent": 0.3416296357812709}
+      }
+    },
+    "interpretation": "The upstream A-B-A panel establishes a short-concurrency-1 E2E gain of 0.346% against only 0.025% E2E outer drift. Other workload deltas are mixed, and several are smaller than drift. The same-image short-concurrency-4 result is not treated as a robust speed claim because decode outer drift exceeds the measured decode gain and MTP acceptance moved materially."
+  },
+  "kld": {
+    "pass": true,
+    "runs": 5,
+    "positions_per_run": 2047,
+    "values": [0.0742051223380301, 0.07473980871806742, 0.07322936113532515, 0.07184507772663147, 0.06899476952625154],
+    "mean": 0.07260282788886113,
+    "sample_standard_deviation": 0.0022977624404795253,
+    "minimum": 0.06899476952625154,
+    "maximum": 0.07473980871806742,
+    "prior_qualified_mean": 0.0713090033,
+    "prior_historical_range": [0.06398, 0.07462],
+    "documented_reference": 0.069527,
+    "broken_fc2_reference": 2.36,
+    "interpretation": "The optimized-image mean is inside the historical qualified range and is 1.81% above the prior qualified mean. One run is 0.00012 above the prior observed maximum; this is disclosed rather than hidden and remains far from the broken-FC2 signature."
+  },
+  "verification": {
+    "focused_pytest": "71 passed in 20.82s",
+    "ruff": "pass for all 17 changed Python files",
+    "python_syntax": "pass",
+    "regression_panel_clock_gate": "pass; the 30 MHz gate accepts both retained panels and a 7 MHz negative test rejects the GLM q_b panel",
+    "sweep_image_identity_gate": "pass against sha256:d4cdc039cc3b7ef7be8e64ae51a70768cc7977994cd0547c01c3411a61339795",
+    "qualification_tool_smoke": "pass for nested receipt creation, nonzero CUDA status rejection, and repository-local service tool discovery",
+    "git_diff_check": "pass"
+  },
+  "evidence": {
+    "grid_sweep_manifest": {"path": "evidence/grid_sweep_fp16_v1_20260826/sweep_manifest.json", "sha256": "4e7d2ba0f6df995cd7c26e028f61690372d3d63cee314bebc8379336ed6a2db7"},
+    "selected_grid_result": {"path": "evidence/grid_sweep_fp16_v1_20260826/grid_144/result.json", "sha256": "7011f814860a40ab45913ec643019e4d9ef874559f439844e61db0b493e141fe"},
+    "resource_audit": {"path": "evidence/grid_sweep_fp16_v1_20260826/resource_audit_v1/report.json", "sha256": "644988cfeece05c0a18c84b8a67a18c50ce60b5ab6ecd0f88b17f22112c8c7d5"},
+    "leader_repeat_1": {"path": "evidence/leader_repeat_1_160_144/sweep_manifest.json", "sha256": "9388cafaa9ef2f78c3c51c03cbf318df3a19aa2d1754e406478b99395299e030"},
+    "leader_repeat_2": {"path": "evidence/leader_repeat_2_144_160/sweep_manifest.json", "sha256": "d1e206c7b6052a11ee4a599207aeb738afbd98fb48833c43c4f320b6e024b3fe"},
+    "leader_repeat_2_telemetry_disposition": {"path": "evidence/leader_repeat_2_144_160/telemetry_disposition.json", "sha256": "5eb07bdd58398a6a72ed5be9f796c7daf214f611c940c38ca7b9f4a7a27de8ee"},
+    "normal_planner": {"path": "evidence/normal_planner_o_fp16_v1_20260826/qualification_receipt.json", "sha256": "ab3d964239593920f82126ae4455631c164a2d0a96d4f0a4b35c7ec1db641307"},
+    "glm_q_b_regression": {"path": "evidence/regression_qb_fp16_panel_20260826.json", "sha256": "9eda1ed089d224eb264fda0c5b5873b9e381f202b4e46cfa3bdddfe9a80253fc"},
+    "qwen_shape_regression": {"path": "evidence/regression_qwen_shape_bf16_panel_20260826.json", "sha256": "248dbb37f26665cf0c6f31ff81b2703a6c6afc123e633d1a273ea15b386abb2a"},
+    "service_upstream_aba": {"path": "evidence/service_mtp3_panel_v1_20260826/e2e_upstream_aba.json", "sha256": "a20e32c0818a0d0d4de3a6f8e08d4bf7e6bd2b95fe84888534ebdfed19b39aa4"},
+    "service_kill_switch_cbc": {"path": "evidence/service_mtp3_panel_v1_20260826/e2e_kill_switch_cbc.json", "sha256": "05f8e2028384bdc22c2df5013007db2aacf8fdf24fcb9212f50c68bea1c4fdf7"},
+    "service_cache_inventory": {"path": "evidence/service_mtp3_panel_v1_20260826/cache_inventory_before_cleanup.json", "sha256": "4baaa8606b06b1b63490858c2de624eb0aca036b790a055f72f39ce61ab362b5"},
+    "kld_summary": {"path": "evidence/kld_optimized_v1_20260826/summary.json", "sha256": "308c516f68407ecef17978552310eb253da9aa53d9226f5a5c2eab70686d75bc"},
+    "image_verification": {"path": "evidence/optimized_image_v1/image-verification.json", "sha256": "7fdcc30dce9cb798363d5cdfe4283932b8e260f36202f133bfed38ea7854aae9"},
+    "focused_pytest": {"path": "evidence/final_verification_20260826/focused_pytest.log", "sha256": "817d65f6ac1c216c8ae2bbbd9041b39f4b8491edfa1fe2b7bdfa996d00b7c09b"}
+  },
+  "limitations": [
+    "The service evidence supports a workload-scoped E2E improvement, not a universal decode or E2E speedup.",
+    "The reverse-order grid-160 M=1 leader sample had an 832 MHz post-timing SM-clock snapshot and is excluded from the grid-selection claim. The fully valid 160-to-144 repeat tied at M=1, and the clock-comparable reverse-order M=4 arms also tied.",
+    "MTP acceptance variation makes the short-concurrency-4 service comparison especially noisy.",
+    "The exact Qwen checkpoint is absent from its recorded local path. Qwen no-regression evidence combines a deterministic shape-only BF16 base-candidate-base panel with retained exact-checkpoint evidence; this qualification generated no exact-checkpoint Qwen result.",
+    "The checkpoint provides no independent shard checksum list, so the exact shard hash is recorded but cannot be independently verified against a checkpoint-owned digest.",
+    "The resource audit recompiled retained PTX with ptxas 13.3.27; runtime compilation and timing used CUDA/ptxas 13.2.78.",
+    "An unrelated Triton draft-routing kernel JIT appeared during the service workload warmup. Timed samples followed the warmup, and K6 capture/replay qualification separately proved no K6 JIT or replay allocation."
+  ],
+  "side_effects": {
+    "scope": "Qualification execution before repository publication",
+    "source_committed_during_qualification": false,
+    "source_pushed_during_qualification": false,
+    "pull_request_updated_during_qualification": false,
+    "image_deployed_during_qualification": false,
+    "image_promoted_during_qualification": false,
+    "vllm_integration_worktree_modified_during_qualification": false,
+    "host_services_modified_during_qualification": false,
+    "generated_service_caches_removed_after_hash_inventory": true,
+    "final_host_check": {
+      "captured_at": "2026-08-26T11:54:47Z",
+      "running_original_containers": ["actual", "epyc-api", "ida-mcp", "open-webui", "searxng"],
+      "qualification_containers_remaining": 0,
+      "service_arm_cache_directories_remaining": 0,
+      "active_gpu_compute_processes": 0,
+      "vllm_integration_diff_sha256": "329ccd993a5fad0c15fe75b3d2483e73da7e3b72c3779f43d84faa05ee33007e"
+    }
+  }
+}

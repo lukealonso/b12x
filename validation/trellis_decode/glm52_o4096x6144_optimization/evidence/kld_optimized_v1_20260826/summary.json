@@ -1,0 +1,40 @@
+{
+  "schema": "b12x.glm52_pr243.kld.v1",
+  "image": "local/glm52-pr243-o144:706ad0e-v39-v1",
+  "reference_dataset_commit": "a8fbe8a277394e838c75190a0ab376625dfb1393",
+  "reference_sha256": "87f992a689c054a0548a4b3863da6c809f9239beacd5786d0401e45904fec063",
+  "outer_scales_sha256": "b64fdcbec3396939610a8be6c5403c7e7b2c5118826185184012adea317d224e",
+  "kv_cache_dtype": "nvfp4_ds_mla",
+  "rope_dtype": "bfloat16",
+  "r7_fused_layers": 48,
+  "harness": "checkpoint-owned eager full-logit KLD gate",
+  "gpu_memory_utilization": 0.89,
+  "full_vocab_logprob_policy": "identity-order FP32 log-softmax; chunk D2H",
+  "max_model_len": 2049,
+  "max_num_batched_tokens": 2048,
+  "max_num_seqs": 1,
+  "decode_context_parallel_size": 4,
+  "dcp_kv_cache_interleave_size": 64,
+  "runs": 5,
+  "values": [
+    0.0742051223380301,
+    0.07473980871806742,
+    0.07322936113532515,
+    0.07184507772663147,
+    0.06899476952625154
+  ],
+  "mean_kld": 0.07260282788886113,
+  "sample_sd_kld": 0.0022977624404795253,
+  "min_kld": 0.06899476952625154,
+  "max_kld": 0.07473980871806742,
+  "positions": [
+    2047
+  ],
+  "elapsed_seconds": [
+    57.187490701675415,
+    58.8810818195343,
+    54.56297183036804,
+    55.75295615196228,
+    59.221527338027954
+  ]
+}

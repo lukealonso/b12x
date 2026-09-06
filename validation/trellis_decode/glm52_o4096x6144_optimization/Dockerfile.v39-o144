@@ -1,0 +1,14 @@
+ARG BASE_IMAGE=local/glm52-pr243-candidate-integrated:706ad0e-v39-final
+FROM ${BASE_IMAGE}
+
+ARG B12X_SOURCE_SHA256
+COPY validation/trellis_decode/glm52_o4096x6144_optimization/patch_v39_grid_policy.py /tmp/patch_v39_grid_policy.py
+RUN /opt/venv/bin/python /tmp/patch_v39_grid_policy.py \
+      --path /opt/venv/lib/python3.12/site-packages/sparkinfer/gemm/trellis_linear/_k6_mcg_cute.py \
+      --receipt /opt/qualification/glm52_o4096x6144_v39_policy_patch.json \
+      --b12x-source-sha256 "${B12X_SOURCE_SHA256}" \
+    && rm /tmp/patch_v39_grid_policy.py
+
+LABEL org.opencontainers.image.description="GLM v39 PR243 candidate with b12x-owned 4096x6144 grid=144 policy"
+LABEL local-inference-lab.b12x.pr243="706ad0eb54014ed9156dc82a7e0acff691662a89"
+LABEL local-inference-lab.b12x.glm-o-proj-grid="144"

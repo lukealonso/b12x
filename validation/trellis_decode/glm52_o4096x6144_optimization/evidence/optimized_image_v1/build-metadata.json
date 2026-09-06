@@ -1,0 +1,64 @@
+{
+  "buildx.build.provenance": {
+    "builder": {
+      "id": ""
+    },
+    "buildType": "https://mobyproject.org/buildkit@v1",
+    "materials": [
+      {
+        "uri": "pkg:docker/local/glm52-pr243-candidate-integrated@706ad0e-v39-final?platform=linux%2Famd64",
+        "digest": {
+          "sha256": "d4cdc039cc3b7ef7be8e64ae51a70768cc7977994cd0547c01c3411a61339795"
+        }
+      }
+    ],
+    "invocation": {
+      "configSource": {
+        "entryPoint": "Dockerfile.v39-o144"
+      },
+      "parameters": {
+        "frontend": "dockerfile.v0",
+        "args": {
+          "build-arg:B12X_SOURCE_SHA256": "99318df5db87635e845bcd1ba93d6714e17b1cebdad51150ac892b227c186872",
+          "build-arg:BASE_IMAGE": "local/glm52-pr243-candidate-integrated:706ad0e-v39-final"
+        },
+        "locals": [
+          {
+            "name": "context"
+          },
+          {
+            "name": "dockerfile"
+          }
+        ],
+        "root": {
+          "configSource": {
+            "path": "Dockerfile.v39-o144"
+          },
+          "request": {
+            "args": {
+              "build-arg:B12X_SOURCE_SHA256": "99318df5db87635e845bcd1ba93d6714e17b1cebdad51150ac892b227c186872",
+              "build-arg:BASE_IMAGE": "local/glm52-pr243-candidate-integrated:706ad0e-v39-final",
+              "vcs:localdir:context": ".",
+              "vcs:localdir:dockerfile": "validation/trellis_decode/glm52_o4096x6144_optimization",
+              "vcs:revision": "706ad0eb54014ed9156dc82a7e0acff691662a89",
+              "vcs:source": "https://github.com/local-inference-lab/b12x"
+            }
+          }
+        },
+        "compatibilityVersion": 30
+      },
+      "environment": {
+        "dockerfileVersion": "1.26.0",
+        "platform": "linux/amd64"
+      }
+    }
+  },
+  "buildx.build.ref": "default/default/3nc2wjzy5i5hu4pn5ywyz3rxi",
+  "containerimage.descriptor": {
+    "mediaType": "application/vnd.oci.image.index.v1+json",
+    "digest": "sha256:c728d06ab95ee208bacecbf4b5948c735b5c0057cfffd179ef8b53b390c777d1",
+    "size": 857
+  },
+  "containerimage.digest": "sha256:c728d06ab95ee208bacecbf4b5948c735b5c0057cfffd179ef8b53b390c777d1",
+  "image.name": "docker.io/local/glm52-pr243-o144:706ad0e-v39-v1"
+}
