@@ -553,6 +553,34 @@ class MoEMicroKernelBackend:
         return fp4_dot4_sum_f32acc(u_packed, x0, x1, x2, x3)
 
     @cute.jit
+    def _fc2_route(
+        self,
+        topk_ids: cute.Tensor,
+        topk_weights: cute.Tensor,
+        eid_addr: Int32,
+        route_expert_limit: Int32,
+    ) -> Tuple[Int32, Float32, Int32]:
+        """Resolve an FC2 route without addressing absent expert tensors.
+
+        Fused launches compile with the exact resident expert count. The
+        FC2-only endpoint compiles against a capacity bucket, so it uses the
+        caller's actual tensor extent instead. Route IDs are checked at source
+        width before conversion to the 32-bit address arithmetic type.
+        """
+        raw_expert = Int64(topk_ids[eid_addr])
+        expert_limit = Int64(self._cfg.weight_E)
+        if cutlass.const_expr(self.compile_time_phase == 2):
+            expert_limit = Int64(route_expert_limit)
+        expert = Int32(0)
+        weight = Float32(0.0)
+        route_active = Int32(0)
+        if raw_expert >= Int64(0) and raw_expert < expert_limit:
+            expert = Int32(raw_expert)
+            weight = Float32(topk_weights[eid_addr])
+            route_active = Int32(1)
+        return expert, weight, route_active
+
+    @cute.jit
     def _scale_byte_to_f32(self, byte: Uint32) -> Float32:
         """Decode one block-scale byte to f32 (E8M0 in MXFP4 mode, else E4M3)."""
         if cutlass.const_expr(self.scale_format_e8m0_k32):
@@ -934,14 +962,14 @@ class MoEMicroKernelBackend:
         cute.arch.sync_threads()
 
     @cute.jit
-    def _resolve_route_expert(self, route_eid: Int32) -> Tuple[Int32, Int32]:
+    def _resolve_route_expert(self, route_eid: Int64) -> Tuple[Int32, Int32]:
         """Return an in-range expert id and an integer active-route predicate."""
 
         cfg = self._cfg
         eid = Int32(0)
         route_active = Int32(0)
-        if route_eid >= Int32(0) and route_eid < Int32(cfg.weight_E):
-            eid = route_eid
+        if route_eid >= Int64(0) and route_eid < Int64(cfg.weight_E):
+            eid = Int32(route_eid)
             route_active = Int32(1)
         return eid, route_active
 
@@ -957,6 +985,7 @@ class MoEMicroKernelBackend:
         w2_alphas: cute.Tensor,
         topk_ids: cute.Tensor,
         topk_weights: cute.Tensor,
+        route_expert_limit: Int32,
         scatter_output: cute.Tensor,
     ):
         cfg = self._cfg
@@ -987,9 +1016,9 @@ class MoEMicroKernelBackend:
 
         for kk in cutlass.range_constexpr(cfg.num_topk):
             eid_addr = Int32(kk)
-            route_eid = Int32(topk_ids[eid_addr])
-            eid, route_active = self._resolve_route_expert(route_eid)
-            router_w = topk_weights[eid_addr]
+            eid, router_w, route_active = self._fc2_route(
+                topk_ids, topk_weights, eid_addr, route_expert_limit
+            )
             if cutlass.const_expr(
                 self.w4a16_mode
                 and (not self.is_gated)
@@ -1190,6 +1219,7 @@ class MoEMicroKernelBackend:
         w2_alphas: cute.Tensor,
         topk_ids: cute.Tensor,
         topk_weights: cute.Tensor,
+        route_expert_limit: Int32,
         scatter_output: cute.Tensor,
     ):
         cfg = self._cfg
@@ -1215,9 +1245,9 @@ class MoEMicroKernelBackend:
 
         for kk in cutlass.range_constexpr(cfg.num_topk):
             eid_addr = Int32(kk)
-            route_eid = Int32(topk_ids[eid_addr])
-            eid, route_active = self._resolve_route_expert(route_eid)
-            router_w = topk_weights[eid_addr]
+            eid, router_w, route_active = self._fc2_route(
+                topk_ids, topk_weights, eid_addr, route_expert_limit
+            )
             if cutlass.const_expr(
                 self.w4a16_mode
                 and (not self.is_gated)
@@ -1336,14 +1366,6 @@ class MoEMicroKernelBackend:
                         if w_valid > Int32(0)
                         else Float32(0.0)
                     )
-                if route_active > Int32(0):
-                    out_acc0 = (
-                        out_acc0
-                        + bsf_f0
-                        * self._fp4_dot4_for_math(u_packed0, xh0, xh1, xh2, xh3)
-                        * scale_lane
-                    )
-
                 u_packed1 = (
                     ld_global_nc_u32(
                         w2_base_addr
@@ -1399,6 +1421,16 @@ class MoEMicroKernelBackend:
                         if w_valid > Int32(0)
                         else Float32(0.0)
                     )
+                # Issue both independent row loads before consuming either
+                # value. This preserves each row's accumulation order while
+                # exposing sibling-row memory-level parallelism.
+                if route_active > Int32(0):
+                    out_acc0 = (
+                        out_acc0
+                        + bsf_f0
+                        * self._fp4_dot4_for_math(u_packed0, xh0, xh1, xh2, xh3)
+                        * scale_lane
+                    )
                 if route_active > Int32(0):
                     out_acc1 = (
                         out_acc1
@@ -1425,6 +1457,7 @@ class MoEMicroKernelBackend:
         w2_alphas: cute.Tensor,
         topk_ids: cute.Tensor,
         topk_weights: cute.Tensor,
+        route_expert_limit: Int32,
         scatter_output: cute.Tensor,
     ):
         cfg = self._cfg
@@ -1467,9 +1500,9 @@ class MoEMicroKernelBackend:
 
         for kk in cutlass.range_constexpr(cfg.num_topk):
             eid_addr = t * Int32(cfg.num_topk) + Int32(kk)
-            route_eid = Int32(topk_ids[eid_addr])
-            eid, route_active = self._resolve_route_expert(route_eid)
-            router_w = topk_weights[eid_addr]
+            eid, router_w, route_active = self._fc2_route(
+                topk_ids, topk_weights, eid_addr, route_expert_limit
+            )
             if cutlass.const_expr(
                 self.w4a16_mode
                 and (not self.is_gated)
@@ -1705,6 +1738,7 @@ class MoEMicroKernelBackend:
         w2_alphas: cute.Tensor,
         topk_ids: cute.Tensor,
         topk_weights: cute.Tensor,
+        route_expert_limit: Int32,
         scatter_output: cute.Tensor,
     ):
         cfg = self._cfg
@@ -1742,9 +1776,9 @@ class MoEMicroKernelBackend:
 
         for kk in cutlass.range_constexpr(cfg.num_topk):
             eid_addr = t * Int32(cfg.num_topk) + Int32(kk)
-            route_eid = Int32(topk_ids[eid_addr])
-            eid, route_active = self._resolve_route_expert(route_eid)
-            router_w = topk_weights[eid_addr]
+            eid, router_w, route_active = self._fc2_route(
+                topk_ids, topk_weights, eid_addr, route_expert_limit
+            )
             if cutlass.const_expr(
                 self.w4a16_mode
                 and (not self.is_gated)
@@ -1942,6 +1976,7 @@ class MoEMicroKernelBackend:
         w2_alphas: cute.Tensor,
         topk_ids: cute.Tensor,
         topk_weights: cute.Tensor,
+        route_expert_limit: Int32,
         scatter_output: cute.Tensor,
     ):
         cfg = self._cfg
@@ -1991,9 +2026,9 @@ class MoEMicroKernelBackend:
 
         for kk in cutlass.range_constexpr(cfg.num_topk):
             eid_addr = t * Int32(cfg.num_topk) + Int32(kk)
-            route_eid = Int32(topk_ids[eid_addr])
-            eid, route_active = self._resolve_route_expert(route_eid)
-            router_w = topk_weights[eid_addr]
+            eid, router_w, route_active = self._fc2_route(
+                topk_ids, topk_weights, eid_addr, route_expert_limit
+            )
             if cutlass.const_expr(
                 self.w4a16_mode
                 and (not self.is_gated)
@@ -2058,7 +2093,7 @@ class MoEMicroKernelBackend:
                         )
                 elif cutlass.const_expr(kk + 1 < cfg.num_topk):
                     next_eid_addr = t * Int32(cfg.num_topk) + Int32(kk + 1)
-                    next_route_eid = Int32(topk_ids[next_eid_addr])
+                    next_route_eid = Int64(topk_ids[next_eid_addr])
                     next_eid, _ = self._resolve_route_expert(next_route_eid)
                     next_ebase_w = Int64(next_eid) * Int64(cfg.k_dim * cfg.n_half)
                     next_ebase_sf = Int64(next_eid) * Int64(
@@ -2463,6 +2498,7 @@ class MoEMicroKernelBackend:
         barrier_epoch: cute.Tensor,
         trellis_lut: cute.Tensor,
         trellis_rotations: cute.Tensor,
+        route_expert_limit: Int32,
         m_val: Int32,
     ):
         cfg = self._cfg
@@ -2482,6 +2518,7 @@ class MoEMicroKernelBackend:
                 intermediate,
                 topk_ids,
                 topk_weights,
+                route_expert_limit,
                 scatter_output,
                 trellis_lut,
             )
@@ -2554,7 +2591,7 @@ class MoEMicroKernelBackend:
                 eid_addr_0 = t0 * Int32(cfg.num_topk) + (
                     route_idx_0 - t0 * Int32(cfg.num_topk)
                 )
-                route_eid_0 = Int32(topk_ids[eid_addr_0])
+                route_eid_0 = Int64(topk_ids[eid_addr_0])
                 eid_0, _ = self._resolve_route_expert(route_eid_0)
                 gs_fc1_0 = input_gs[eid_0]
                 in_blk = tidx
@@ -2638,7 +2675,7 @@ class MoEMicroKernelBackend:
             i_chunk_off = chunk_idx * Int32(cfg.i_chunk)
 
             eid_addr = t * Int32(cfg.num_topk) + k_idx
-            route_eid = Int32(topk_ids[eid_addr])
+            route_eid = Int64(topk_ids[eid_addr])
             eid, route_active = self._resolve_route_expert(route_eid)
             if cutlass.const_expr(
                 self.w4a16_mode
@@ -5312,7 +5349,7 @@ class MoEMicroKernelBackend:
                         next_eid_addr = t_next * Int32(cfg.num_topk) + (
                             next_route - t_next * Int32(cfg.num_topk)
                         )
-                        next_route_eid = Int32(topk_ids[next_eid_addr])
+                        next_route_eid = Int64(topk_ids[next_eid_addr])
                         next_eid, _ = self._resolve_route_expert(next_route_eid)
                         gs_fc1_next = input_gs[next_eid]
                         next_buf_base = (Int32(1) - buf_idx) * Int32(cfg.smem_xh_size)
@@ -5562,6 +5599,7 @@ class MoEMicroKernelBackend:
             intermediate,
             topk_ids,
             topk_weights,
+            route_expert_limit,
             scatter_output,
             trellis_lut,
         )
@@ -5685,6 +5723,7 @@ class MoEMicroKernelBackend:
         intermediate: cute.Tensor,
         topk_ids: cute.Tensor,
         topk_weights: cute.Tensor,
+        route_expert_limit: Int32,
         scatter_output: cute.Tensor,
         trellis_lut: cute.Tensor,
     ):
@@ -5728,6 +5767,7 @@ class MoEMicroKernelBackend:
                             w2_alphas,
                             topk_ids,
                             topk_weights,
+                            route_expert_limit,
                             scatter_output,
                         )
                     else:
@@ -5741,6 +5781,7 @@ class MoEMicroKernelBackend:
                             w2_alphas,
                             topk_ids,
                             topk_weights,
+                            route_expert_limit,
                             scatter_output,
                         )
             else:
@@ -5757,6 +5798,7 @@ class MoEMicroKernelBackend:
                             w2_alphas,
                             topk_ids,
                             topk_weights,
+                            route_expert_limit,
                             scatter_output,
                         )
                     else:
@@ -5770,6 +5812,7 @@ class MoEMicroKernelBackend:
                             w2_alphas,
                             topk_ids,
                             topk_weights,
+                            route_expert_limit,
                             scatter_output,
                         )
                     fc2_task += Int32(gdim_x)
@@ -5794,6 +5837,7 @@ class MoEMicroKernelBackend:
                         w2_alphas,
                         topk_ids,
                         topk_weights,
+                        route_expert_limit,
                         scatter_output,
                     )
                 elif cutlass.const_expr(cfg.fc2_n_chunks > 1):
@@ -5807,6 +5851,7 @@ class MoEMicroKernelBackend:
                         w2_alphas,
                         topk_ids,
                         topk_weights,
+                        route_expert_limit,
                         scatter_output,
                     )
                 else:
@@ -5820,6 +5865,7 @@ class MoEMicroKernelBackend:
                         w2_alphas,
                         topk_ids,
                         topk_weights,
+                        route_expert_limit,
                         scatter_output,
                     )
                 fc2_task += Int32(gdim_x)
@@ -5842,6 +5888,7 @@ class MoEMicroKernelBackend:
         out_ptr: cute.Pointer,
         barrier_count: cute.Tensor,
         barrier_epoch: cute.Tensor,
+        route_expert_limit: Int32,
         m_val: Int32,
         grid_x: Int32,
         stream,
@@ -5936,6 +5983,7 @@ class MoEMicroKernelBackend:
                 if cutlass.const_expr(trellis_rot_ptr is not None)
                 else barrier_count
             ),
+            route_expert_limit,
             m_val,
         ).launch(
             grid=(grid_x, Int32(1), Int32(1)),
@@ -5998,6 +6046,7 @@ class MoEMicroKernelBackend:
             ptr(cutlass.BFloat16, out),
             barrier_count,
             barrier_epoch,
+            Int32(w1_alphas.numel()),
             Int32(m),
             Int32(grid_x),
             stream,

@@ -23,6 +23,7 @@ DSV4 + GLM DECODE kernels are untouched and stay byte-identical.
 from __future__ import annotations
 
 import os
+from dataclasses import replace
 
 import torch
 
@@ -327,7 +328,7 @@ def run_unified_prefill(
                 scale_format=scale_format,
                 fp8_rope=bool(traits.fp8_rope),
                 latent_scale_per_token=bool(traits.latent_scale_per_token),
-                traits_override=traits,
+                traits_override=replace(traits, compute_mode=compute_mode),
             )
             if extra_kv_cache is not None:
                 kwargs.update(
