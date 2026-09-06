@@ -155,12 +155,13 @@ GDN_GEOMETRIES = (
                 f"{'decode' if query_lengths == (1,) else 'spec6'}-bs1"
             ),
             query_lengths=query_lengths,
-            key_heads=64 // tp_size,
-            value_heads=64 // tp_size,
+            key_heads=local_heads,
+            value_heads=local_heads,
             source="GLM-5.3 Flash KDA serving geometry",
             decay_recipe="kda",
         )
-        for tp_size in (1, 2, 4, 8, 16)
+        # TP3: 64 KDA heads are zero-padded to 66 at load (22 per rank).
+        for tp_size, local_heads in ((1, 64), (2, 32), (3, 22), (4, 16), (8, 8), (16, 4))
         for query_lengths in ((1,), (6,))
     ),
 )

@@ -196,8 +196,8 @@ MOE_RECIPES = (
         family_id="modelopt-nvfp4",
         quant_mode="nvfp4",
         source_format="modelopt_nvfp4",
-        intermediate_alignment=16,
-        minimum_intermediate_size=16,
+        intermediate_alignment=128,
+        minimum_intermediate_size=128,
         compatible_activations=("silu", "situ", "swigluoai_uninterleave", "relu2"),
     ),
     MoeRecipe(

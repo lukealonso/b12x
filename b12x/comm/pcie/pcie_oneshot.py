@@ -21,7 +21,10 @@ from ._cuda_ipc import CudaRTLibrary
 
 logger = logging.getLogger(__name__)
 
-SUPPORTED_WORLD_SIZES = (2, 4, 6, 8, 10)
+# World size 3 (TP3 on three RTX PRO 6000): the generic one-shot kernel is
+# world-size-agnostic (range_constexpr over the peer table); the topology
+# transports (tp2/tp4 remote push, tp8 owner) stay gated to 2/4/8.
+SUPPORTED_WORLD_SIZES = (2, 3, 4, 6, 8, 10)
 SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 DEFAULT_MAX_SIZE = 8 * 1024 * 1024
 DEFAULT_RANK_DATA_BYTES = 8 * 1024 * 1024

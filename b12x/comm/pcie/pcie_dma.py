@@ -33,7 +33,9 @@ SUPPORTED_DTYPES = {
     torch.float16: 1,
     torch.float32: 2,
 }
-SUPPORTED_WORLD_SIZES = (2, 4, 6, 8, 10)
+# World size 3: the DMA ring (2 x (world - 1) steps, next = (rank + 1) % world)
+# is world-size generic; the caller pads to numel % (world x 8).
+SUPPORTED_WORLD_SIZES = (2, 3, 4, 6, 8, 10)
 FLAG_STRIDE = 128
 FLAG_SLOTS = 256
 MAX_PIECES = 8
