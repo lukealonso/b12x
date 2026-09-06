@@ -112,13 +112,17 @@ def main():
                         launch(**kwargs)
 
                 graphs[name] = capture_cuda_graph(repeated, warmup=2)
+            gpu_before_timing = nvidia_smi_gpu_mode_snapshot()
             samples = {name: [] for name in graphs}
             for name in ("triton", "cute", "cute", "triton"):
                 samples[name].extend(
                     v / 32
                     for v in bench_cuda_graph(graphs[name], replays=30)["replay_us"]
                 )
+            gpu_after_timing = nvidia_smi_gpu_mode_snapshot()
             record = {
+                "gpu_before_timing": gpu_before_timing,
+                "gpu_after_timing": gpu_after_timing,
                 "correctness": "passed",
                 "rtol": 1e-5,
                 "atol": 1e-5,
@@ -132,7 +136,7 @@ def main():
             )
             result["cases"].append(record)
             print(
-                json.dumps({k: v for k, v in record.items() if k != "samples_us"}),
+                json.dumps({k: v for k, v in record.items() if k not in ("samples_us", "gpu_before_timing", "gpu_after_timing")}),
                 flush=True,
             )
     result["gpu_after"] = nvidia_smi_gpu_mode_snapshot()
