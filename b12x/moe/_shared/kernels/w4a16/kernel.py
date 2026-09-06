@@ -11448,6 +11448,82 @@ def _run_trellis256_dense_current_device(
     Outer rotations follow EXL3 order exactly: fp16 ``suh`` multiply before the
     input H128, and fp16 ``svh`` multiply after the output H128.
     """
+    # Weight preparation has already validated every immutable K6/MCG weight,
+    # workspace, LUT, and launch property. Admit that bound route before the
+    # generic scheduler's static metadata validation so serving only checks the
+    # runtime input, call controls, and caller-owned buffers.
+    small_m_launch = getattr(prepared_dense, "k6_mcg_small_m_launch", None)
+    if small_m_launch is not None:
+        compute_dtype = small_m_launch.params_dtype
+        if x.ndim != 2 or int(x.shape[0]) <= 0:
+            raise ValueError(
+                f"x must be a non-empty rank-2 tensor, got {tuple(x.shape)}"
+            )
+        if x.dtype not in (torch.float16, torch.bfloat16):
+            raise TypeError(f"x must be fp16 or bf16, got {x.dtype}")
+        if not x.is_cuda or not x.is_contiguous():
+            raise ValueError("x must be a contiguous CUDA tensor")
+        m, size_k = (int(v) for v in x.shape)
+        size_n = int(small_m_launch.size_n)
+        if x.dtype != compute_dtype:
+            raise TypeError(
+                "bound K6/MCG weight and input must use one dtype: "
+                f"prepared={compute_dtype}, input={x.dtype}"
+            )
+        output = _trellis_dense_buffer(
+            "output",
+            output,
+            shape=(m, size_n),
+            dtype=x.dtype,
+            device=x.device,
+        )
+        if c_tmp is not None and int(c_tmp.data_ptr()) % 16 != 0:
+            raise ValueError("c_tmp must be at least 16-byte aligned")
+        if (
+            hadamard_128 is None
+            and _moe_block_size == 64
+            and _force_tile_config is None
+        ):
+            from b12x.gemm.trellis_linear._k6_mcg_cute import (
+                run_k6_mcg_small_m,
+            )
+
+            fused_scratch_elements = int(
+                small_m_launch.required_scratch_elements
+            )
+            fused_c_tmp_compatible = c_tmp is None or (
+                c_tmp.dtype == torch.float32
+                and c_tmp.device == x.device
+                and c_tmp.is_contiguous()
+                and int(c_tmp.numel()) >= fused_scratch_elements
+            )
+            if small_m_launch.accepts_input(x) and fused_c_tmp_compatible:
+                rotated_compute = _trellis_dense_buffer(
+                    "rotated_compute",
+                    rotated_compute,
+                    shape=(m, size_k),
+                    dtype=compute_dtype,
+                    device=x.device,
+                )
+                if c_tmp is None:
+                    if torch.cuda.is_current_stream_capturing():
+                        raise RuntimeError(
+                            "Trellis dense c_tmp is not initialized for CUDA "
+                            "graph capture; provide caller-owned storage"
+                        )
+                    c_tmp = torch.empty(
+                        (fused_scratch_elements,),
+                        dtype=torch.float32,
+                        device=x.device,
+                    )
+                return run_k6_mcg_small_m(
+                    x,
+                    prepared_dense,
+                    output=output,
+                    rotated=rotated_compute,
+                    c_tmp=c_tmp,
+                )
+
     if getattr(prepared_dense, "weight_layout", None) != "trellis_t256":
         raise ValueError("run_trellis256_dense requires prepared trellis_t256 weights")
     if int(getattr(prepared_dense, "num_experts", 0)) != 1:

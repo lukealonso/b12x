@@ -1,0 +1,40 @@
+digraph dot {
+subgraph cluster_16 {
+label="graph_16" graph[style="dashed"];
+"graph_16_node_0"[style="bold" shape="record" label="{KERNEL
+| {ID | 0 (topoId: 2) | _ZN2at6native27unrolled_elementwise_kernelIZZZNS0_23direct_copy_kernel_cudaERNS_18TensorIteratorBaseEENKUlvE1_clEvENKUlvE8_clEvEUlN3c104HalfEE_St5arrayIPcLm2EELi4E23TrivialOffsetCalculatorILi1EjESD_NS0_6memory12LoadWithCastILi1EEENSE_13StoreWithCastILi1EEEEEviT_T0_T2_T3_T4_T5_\<\<\<136,128,0\>\>\>}
+| {{node handle | func handle} | {0x00000000428E9F68 | 0x000000003C238B10}}
+| {accessPolicyWindow | {base_ptr | num_bytes | hitRatio | hitProp | missProp} | {0x0000000000000000 | 0 | 0.000000 | N | N}}
+| {cooperative | 0}
+| {priority | 0}
+| {cluster dim | (0,0,0)}
+| {preferred cluster dim | (0,0,0)}
+| {cluster scheduling policy preference | 1}
+}"];
+
+"graph_16_node_1"[style="bold" shape="record" label="{KERNEL
+| {ID | 1 (topoId: 1) | _Z16exl3_gemm_kernelILi6ELb0ELi1ELi16ELi32ELi128ELi4ELi3EEvPK6__halfPKtPviiiPiS2_PS0_S2_\<\<\<188,512,92160\>\>\>}
+| {{node handle | func handle} | {0x00000000428E9760 | 0x000000004250D870}}
+| {accessPolicyWindow | {base_ptr | num_bytes | hitRatio | hitProp | missProp} | {0x0000000000000000 | 0 | 0.000000 | N | N}}
+| {cooperative | 1}
+| {priority | 0}
+| {cluster dim | (0,0,0)}
+| {preferred cluster dim | (0,0,0)}
+| {cluster scheduling policy preference | 1}
+}"];
+
+"graph_16_node_2"[style="bold" shape="record" label="{KERNEL
+| {ID | 2 (topoId: 0) | _ZN2at6native27unrolled_elementwise_kernelIZZZNS0_23direct_copy_kernel_cudaERNS_18TensorIteratorBaseEENKUlvE1_clEvENKUlvE10_clEvEUlN3c108BFloat16EE_St5arrayIPcLm2EELi4E23TrivialOffsetCalculatorILi1EjESD_NS0_6memory12LoadWithCastILi1EEENSE_13StoreWithCastILi1EEEEEviT_T0_T2_T3_T4_T5_\<\<\<40,128,0\>\>\>}
+| {{node handle | func handle} | {0x00000000428E8F58 | 0x000000003B5E9A20}}
+| {accessPolicyWindow | {base_ptr | num_bytes | hitRatio | hitProp | missProp} | {0x0000000000000000 | 0 | 0.000000 | N | N}}
+| {cooperative | 0}
+| {priority | 0}
+| {cluster dim | (0,0,0)}
+| {preferred cluster dim | (0,0,0)}
+| {cluster scheduling policy preference | 1}
+}"];
+
+"graph_16_node_0" -> "graph_16_node_1" [headlabel=0];
+"graph_16_node_1" -> "graph_16_node_2" [headlabel=0];
+}
+}
