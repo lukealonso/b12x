@@ -21,6 +21,13 @@ _FAST_COUNT_BLOCK_T = 1024
 _STABLE_SORT_MIN_ROUTES = 4096
 _STABLE_SORT_BLOCK_T = 4096
 _STABLE_SORT_EXPERTS_PER_PROGRAM = 1
+# Stable packing sorts each expert's scattered segment in registers: segments
+# up to the small width take the short sorting network, segments up to the
+# large width the longer one, and anything longer is rebuilt by the
+# sequential workspace scan (same layout, one program per expert).
+_STABLE_SEGMENT_SORT_SMALL = 256
+_STABLE_SEGMENT_SORT_LARGE = 2048
+_STABLE_SEGMENT_SCAN_BLOCK_T = 4096
 
 
 @triton.jit
@@ -356,6 +363,88 @@ def _pack_topk_routes_stable_kernel(
         output_counts += tl.sum(match_i32, axis=1)
 
 
+@triton.jit
+def _pack_topk_routes_segment_sort_kernel(
+    topk_ids,
+    expert_map,
+    packed_route_indices,
+    expert_offsets,
+    expert_counts,
+    live_numel,
+    NUMEL_CAPACITY: tl.constexpr,
+    NUM_EXPERTS: tl.constexpr,
+    HAS_EXPERT_MAP: tl.constexpr,
+    SORT_SMALL: tl.constexpr,
+    SORT_LARGE: tl.constexpr,
+    SCAN_BLOCK_T: tl.constexpr,
+):
+    """Order one expert's packed segment by ascending route id.
+
+    Runs after ``_pack_topk_routes_sort_kernel`` scattered the routes and
+    advanced ``expert_offsets[e]`` to the end of expert ``e``'s live routes;
+    the segment is ``[expert_offsets[e] - expert_counts[e], expert_offsets[e])``
+    and its padding slots keep their sentinel. Segments up to ``SORT_LARGE``
+    routes are sorted in registers (route ids are distinct, so the order is
+    unique); a longer segment is rebuilt in place by the sequential workspace
+    scan of ``_pack_topk_routes_stable_kernel``, which yields the same layout.
+    """
+    expert = tl.program_id(0)
+    end = tl.load(expert_offsets + expert)
+    count = tl.load(expert_counts + expert)
+    start = end - count
+    if count <= SORT_SMALL:
+        lanes = tl.arange(0, SORT_SMALL)
+        mask = lanes < count
+        routes = tl.load(
+            packed_route_indices + start + lanes, mask=mask, other=2147483647
+        )
+        routes = tl.sort(routes)
+        tl.store(packed_route_indices + start + lanes, routes, mask=mask)
+    elif count <= SORT_LARGE:
+        lanes = tl.arange(0, SORT_LARGE)
+        mask = lanes < count
+        routes = tl.load(
+            packed_route_indices + start + lanes, mask=mask, other=2147483647
+        )
+        routes = tl.sort(routes)
+        tl.store(packed_route_indices + start + lanes, routes, mask=mask)
+    else:
+        lanes = tl.arange(0, SCAN_BLOCK_T)
+        written = tl.zeros((1,), dtype=tl.int32)
+        for chunk in tl.range(0, NUMEL_CAPACITY, SCAN_BLOCK_T):
+            offsets = chunk + lanes
+            raw_ids = tl.load(
+                topk_ids + offsets, mask=offsets < live_numel, other=-1
+            ).to(tl.int32)
+            valid = (offsets < live_numel) & (raw_ids >= 0) & (raw_ids < NUM_EXPERTS)
+            ids = raw_ids
+            if HAS_EXPERT_MAP:
+                safe_ids = tl.minimum(tl.maximum(raw_ids, 0), NUM_EXPERTS - 1)
+                ids = tl.load(expert_map + safe_ids, mask=valid, other=-1).to(
+                    tl.int32
+                )
+                valid = valid & (ids >= 0) & (ids < NUM_EXPERTS)
+            matches = valid & (ids == expert)
+            match_i32 = matches.to(tl.int32)
+            local_ranks = tl.cumsum(match_i32, axis=0) - 1
+            tl.store(
+                packed_route_indices + start + written + local_ranks,
+                offsets,
+                mask=matches,
+            )
+            written += tl.sum(match_i32, axis=0)
+
+
+def _stable_route_pack_uses_scan() -> bool:
+    """Select the sequential per-expert scan for stable packing.
+
+    The default stable path scatters with atomics and sorts each expert's
+    segment; the scan is the reference implementation of the same layout and
+    is kept for A/B comparison (``B12X_W4A16_STABLE_ROUTE_PACK_SCAN=1``).
+    """
+    return env_flag("W4A16_STABLE_ROUTE_PACK_SCAN")
+
+
 def pack_topk_routes_by_expert(
     topk_ids: torch.Tensor,
     block_size: int,
@@ -580,10 +669,10 @@ def pack_topk_routes_by_expert(
             SEARCH_STEPS=block_e.bit_length(),
             num_warps=4,
         )
-    if (
-        env_flag("W4A16_STABLE_ROUTE_PACK")
-        and numel >= _STABLE_SORT_MIN_ROUTES
-    ):
+    stable = env_flag("W4A16_STABLE_ROUTE_PACK") and numel >= _STABLE_SORT_MIN_ROUTES
+    if stable and _stable_route_pack_uses_scan():
+        # Reference stable layout: one program per expert scans the whole
+        # route workspace and writes its routes in ascending order.
         stable_grid = (
             triton.cdiv(num_experts, _STABLE_SORT_EXPERTS_PER_PROGRAM),
         )
@@ -600,17 +689,38 @@ def pack_topk_routes_by_expert(
             EXPERTS_PER_PROGRAM=_STABLE_SORT_EXPERTS_PER_PROGRAM,
             num_warps=8,
         )
-    else:
-        _pack_topk_routes_sort_kernel[sort_grid](
+        return packed_route_indices, block_expert_ids, packed_route_count
+    _pack_topk_routes_sort_kernel[sort_grid](
+        topk_ids,
+        expert_map_tensor,
+        packed_route_indices,
+        expert_offsets,
+        numel,
+        NUM_EXPERTS=int(num_experts),
+        HAS_EXPERT_MAP=expert_map is not None,
+        BLOCK_T=_SORT_BLOCK_T,
+        num_warps=4,
+    )
+    if stable:
+        # The atomic scatter above fills each expert's segment in arrival
+        # order and leaves expert_offsets[e] at the segment end; sorting each
+        # segment yields the ascending layout of the reference scan at a
+        # fraction of its cost (the scan reads the whole workspace once per
+        # expert).
+        _pack_topk_routes_segment_sort_kernel[(int(num_experts),)](
             topk_ids,
             expert_map_tensor,
             packed_route_indices,
             expert_offsets,
+            expert_counts,
             numel,
+            NUMEL_CAPACITY=numel_capacity,
             NUM_EXPERTS=int(num_experts),
             HAS_EXPERT_MAP=expert_map is not None,
-            BLOCK_T=_SORT_BLOCK_T,
-            num_warps=4,
+            SORT_SMALL=_STABLE_SEGMENT_SORT_SMALL,
+            SORT_LARGE=_STABLE_SEGMENT_SORT_LARGE,
+            SCAN_BLOCK_T=_STABLE_SEGMENT_SCAN_BLOCK_T,
+            num_warps=8,
         )
     return packed_route_indices, block_expert_ids, packed_route_count
 

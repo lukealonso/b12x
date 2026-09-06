@@ -2,15 +2,23 @@
 """Benchmark the production W4A16 MoE route packer.
 
 The default corpus covers the mapped decode geometries used by Kimi K3 and
-GLM-5.2 hybrid checkpoints.  Both eager launches and CUDA graph replay are
-timed with caller-owned workspaces, matching the serving contract.
+GLM-5.2 hybrid checkpoints and the Kimi K3 TP9 prefill chunk (4,608 tokens,
+top-16 over 896 experts, route blocks 48 and 64).  Both eager launches and
+CUDA graph replay are timed with caller-owned workspaces, matching the
+serving contract.  The packer honours ``B12X_W4A16_STABLE_ROUTE_PACK`` (the
+served setting is 1) and ``B12X_W4A16_STABLE_ROUTE_PACK_SCAN`` (1 selects the
+sequential per-expert scan kernel instead of the atomic scatter + segment
+sort); with the stable flag the packed layout is a pure function of the
+routing, so ``packed_sha256`` of two runs must match.
 """
 
 from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+import hashlib
 import json
+import os
 import pathlib
 import statistics
 import subprocess
@@ -57,6 +65,22 @@ CASES = {
         num_experts=256,
         local_experts=192,
         block_size=8,
+    ),
+    "k3-prefill-b48": RoutePackCase(
+        name="k3-tp9-prefill-chunk-block48",
+        tokens=4608,
+        topk=16,
+        num_experts=896,
+        local_experts=896,
+        block_size=48,
+    ),
+    "k3-prefill-b64": RoutePackCase(
+        name="k3-tp9-prefill-chunk-block64",
+        tokens=4608,
+        topk=16,
+        num_experts=896,
+        local_experts=896,
+        block_size=64,
     ),
 }
 
@@ -107,12 +131,28 @@ def _make_routes(
     seed: int,
 ) -> torch.Tensor:
     generator = torch.Generator(device="cpu").manual_seed(seed)
-    routes = torch.randperm(case.num_experts, generator=generator)[
-        : case.tokens * case.topk
-    ]
-    return routes.reshape(case.tokens, case.topk).to(
-        dtype=torch.int32,
-        device=device,
+    if case.tokens * case.topk <= case.num_experts:
+        routes = torch.randperm(case.num_experts, generator=generator)[
+            : case.tokens * case.topk
+        ].reshape(case.tokens, case.topk)
+    else:
+        # Prefill: every token routes to topk distinct experts, all experts
+        # equally likely (the served router's marginal at 4,608 tokens is
+        # close to uniform; skewed traffic is replayed through the extent
+        # harness's captured routings instead).
+        routes = torch.multinomial(
+            torch.ones((case.tokens, case.num_experts)),
+            case.topk,
+            replacement=False,
+            generator=generator,
+        )
+    return routes.to(dtype=torch.int32, device=device)
+
+
+def _stable_layout_requested(case: RoutePackCase) -> bool:
+    flag = os.environ.get("B12X_W4A16_STABLE_ROUTE_PACK", "")
+    return flag.strip().lower() not in {"", "0", "false", "no", "off"} and (
+        case.tokens * case.topk >= 4096
     )
 
 
@@ -206,6 +246,33 @@ def _validate(
             raise AssertionError(
                 f"{case.name}: block {block} contains another expert"
             )
+    if _stable_layout_requested(case):
+        # Stable packing: inside every expert segment the live routes ascend
+        # and the padding slots hold the live route count.
+        cursor = 0
+        for expert, live in enumerate(counts.tolist()):
+            padded_rows = int(padded[expert])
+            segment = packed[cursor : cursor + padded_rows]
+            live_routes = segment[:live]
+            if not torch.all(live_routes[1:] > live_routes[:-1]):
+                raise AssertionError(
+                    f"{case.name}: expert {expert} segment is not ascending"
+                )
+            if not torch.all(segment[live:] == raw_ids.numel()):
+                raise AssertionError(
+                    f"{case.name}: expert {expert} padding is not the sentinel"
+                )
+            cursor += padded_rows
+
+
+def _packed_digest(case: RoutePackCase, workspace: dict[str, torch.Tensor]) -> str:
+    count = int(workspace["packed_route_count"].cpu().item())
+    packed = workspace["packed_route_indices"][:count].cpu().contiguous()
+    blocks = workspace["block_expert_ids"][: count // case.block_size].cpu().contiguous()
+    digest = hashlib.sha256()
+    digest.update(packed.numpy().tobytes())
+    digest.update(blocks.numpy().tobytes())
+    return digest.hexdigest()[:16]
 
 
 def _eager_samples(
@@ -271,6 +338,8 @@ def _run_case(
     _validate(case, routes, expert_map, workspace)
     return {
         "case": case.__dict__,
+        "stable_layout": _stable_layout_requested(case),
+        "packed_sha256": _packed_digest(case, workspace),
         "eager": _summary(eager),
         "graph": _summary(graph_samples),
         "raw_eager_us": eager,
