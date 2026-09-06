@@ -8,7 +8,7 @@ IDs for direct micro, dynamic prefill, and both tiny-decode phases.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import pytest
 import torch
@@ -499,6 +499,16 @@ def _reset_dispatch_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("B12X_MICRO_DYNAMIC_CUTOVER_PAIRS", raising=False)
     monkeypatch.delenv("B12X_DYNAMIC_TILE_MN", raising=False)
     monkeypatch.delenv("B12X_DYNAMIC_EXTERNAL_ROUTE_PLAN", raising=False)
+    monkeypatch.delenv("B12X_DYNAMIC_SPLIT_ROUTE_COMPUTE", raising=False)
+    monkeypatch.delenv("B12X_DYNAMIC_SPLIT_PREPARE_MAC", raising=False)
+    monkeypatch.delenv("B12X_DYNAMIC_SPLIT_COMPUTE_WAVES", raising=False)
+    monkeypatch.delenv("B12X_DYNAMIC_SPLIT_COMPUTE_MAC", raising=False)
+    monkeypatch.delenv("B12X_DYNAMIC_SPLIT_LOW_SMEM", raising=False)
+    monkeypatch.delenv("B12X_DYNAMIC_FUSED_LOW_SMEM", raising=False)
+    monkeypatch.delenv("B12X_DYNAMIC_SPLIT_FAST_PREPARE", raising=False)
+    monkeypatch.delenv("B12X_DYNAMIC_DIRECT_EXPERT_SCALES", raising=False)
+    monkeypatch.delenv("B12X_DYNAMIC_SKIP_SPLIT_BARRIER_RESET", raising=False)
+    monkeypatch.delenv("B12X_DYNAMIC_WORK_SOURCE", raising=False)
     monkeypatch.delenv("B12X_W4A8_TINY_DECODE", raising=False)
     from b12x.moe.fused_moe._impl import clear_tp_moe_caches
 
@@ -1494,6 +1504,151 @@ def test_standard_moe_dynamic_inactive_route_live_graph_oracle(
     )
     assert case.binding.output is not None
     assert torch.count_nonzero(case.binding.output[-8:]).item() == 0
+
+
+def test_standard_moe_glm53_m8_split_route_compute_live_graph_oracle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Exercise the exact GLM-5.3 M8 split route/compute specialization."""
+
+    num_experts = 288
+    hidden_size = 4096
+    intermediate_size = 512
+    topk = 8
+    m = 8
+    device = require_b12x()
+    _reset_dispatch_environment(monkeypatch)
+    monkeypatch.setenv("B12X_MICRO_DYNAMIC_CUTOVER_PAIRS", "0")
+    monkeypatch.setenv("B12X_DYNAMIC_EXTERNAL_ROUTE_PLAN", "1")
+    monkeypatch.setenv("B12X_DYNAMIC_SPLIT_ROUTE_COMPUTE", "1")
+    monkeypatch.setenv("B12X_DYNAMIC_SPLIT_LOW_SMEM", "1")
+    monkeypatch.setenv("B12X_DYNAMIC_SPLIT_FAST_PREPARE", "1")
+    monkeypatch.setenv("B12X_DYNAMIC_DIRECT_EXPERT_SCALES", "1")
+    monkeypatch.setenv("B12X_DYNAMIC_SKIP_SPLIT_BARRIER_RESET", "1")
+    monkeypatch.setenv("B12X_DYNAMIC_WORK_SOURCE", "persistent_grid")
+    monkeypatch.setenv("B12X_DYNAMIC_SPLIT_COMPUTE_MAC", "224")
+    from b12x.moe.fused_moe import _impl as fused_moe_impl
+
+    fused_moe_impl.clear_tp_moe_caches()
+
+    weights = _make_nvfp4_weights(
+        device,
+        seed=231,
+        num_experts=num_experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+    )
+    weights = replace(
+        weights,
+        a1_scale=torch.ones(num_experts, dtype=torch.float32, device=device),
+        a2_scale=torch.ones(num_experts, dtype=torch.float32, device=device),
+    )
+    initial = _make_inputs(
+        device,
+        m=m,
+        seed=232,
+        route_shift=0,
+        num_experts=num_experts,
+        hidden_size=hidden_size,
+        topk=topk,
+    )
+    changed = _make_inputs(
+        device,
+        m=m,
+        seed=233,
+        route_shift=31,
+        num_experts=num_experts,
+        hidden_size=hidden_size,
+        topk=topk,
+    )
+    initial_reference = _nvfp4_oracle(
+        weights,
+        initial,
+        quant_scale_math="reciprocal_multiply",
+        num_experts=num_experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+    )
+    changed_reference = _nvfp4_oracle(
+        weights,
+        changed,
+        quant_scale_math="reciprocal_multiply",
+        num_experts=num_experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+    )
+    case = _prepare_and_bind(
+        weights,
+        initial,
+        quant_mode="nvfp4",
+        source_format="modelopt_nvfp4",
+        num_topk=topk,
+        fast_math=True,
+    )
+    launch_plan = case.scratch_plan.launch_plan
+    assert launch_plan.implementation == "dynamic"
+    assert case.binding.implementation == "dynamic"
+    assert launch_plan.execution.tile_m == 16
+    assert launch_plan.execution.tile_n == 128
+    dynamic_config = launch_plan.dynamic_launch_config
+    assert dynamic_config is not None
+    assert dynamic_config.split_route_compute
+    assert dynamic_config.split_compute_mac == 224
+    assert {
+        kind for kind, _dtype, _launch in case.scratch_plan._prewarmed_dynamic_launches
+    } == {
+        "route_pack",
+        "compute",
+    }
+    assert len(case.scratch_plan._prewarmed_dynamic_launches) == 4
+    assert fused_moe_impl._M8_ROUTE_PACK_KERNEL_CACHE
+
+    compiled_before = {
+        key: id(value) for key, value in fused_moe_impl._DYNAMIC_KERNEL_CACHE.items()
+    }
+    route_pack_before = {
+        key: id(value)
+        for key, value in fused_moe_impl._M8_ROUTE_PACK_KERNEL_CACHE.items()
+    }
+    monkeypatch.setenv("B12X_DYNAMIC_SPLIT_COMPUTE_MAC", "112")
+    from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
+
+    freeze_kernel_resolution("the M8 split artifacts were compiled during planning")
+    try:
+        _run_live_graph_check(
+            case,
+            initial=initial,
+            changed=changed,
+            initial_reference=initial_reference,
+            changed_reference=changed_reference,
+            context="standard-moe-glm53-m8-split-route-compute",
+            min_cos=0.999,
+            max_normalized_rmse=0.03,
+            replay_count=3,
+            # Dynamic expert accumulation does not define a bitwise summation order.
+            require_bit_exact_replay=False,
+            assert_no_replay_allocations=True,
+        )
+        case.binding.output.fill_(37.0)
+        fused_moe_impl.b12x_moe_fp4(binding=case.binding)
+        torch.cuda.synchronize()
+    finally:
+        unfreeze_kernel_resolution()
+    assert {
+        key: id(value) for key, value in fused_moe_impl._DYNAMIC_KERNEL_CACHE.items()
+    } == compiled_before
+    assert {
+        key: id(value)
+        for key, value in fused_moe_impl._M8_ROUTE_PACK_KERNEL_CACHE.items()
+    } == route_pack_before
+    assert launch_plan.dynamic_launch_config.split_compute_mac == 224
+    _assert_oracle(
+        case.binding.output,
+        changed_reference,
+        context="standard-moe-glm53-m8-runtime-compute-grid",
+        min_cos=0.999,
+        max_normalized_rmse=0.03,
+    )
 
 
 def test_standard_moe_tiny_decode_live_graph_oracle(

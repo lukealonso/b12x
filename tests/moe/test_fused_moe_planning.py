@@ -108,9 +108,7 @@ def _preplanned_w4a16_workspace(*, activation: str) -> SimpleNamespace:
         full_rotation=False,
         num_topk=8,
         planned_direct_topk_launches={4: "direct-topk"},
-        planned_fused_moe_launches={
-            ("packed", "e4m3_k16", 8, False): "route-packed"
-        },
+        planned_fused_moe_launches={("packed", "e4m3_k16", 8, False): "route-packed"},
         planned_mapped_direct_launches={4: "mapped-direct"},
         planned_tc_decode_launches={4: "tc-decode"},
         planned_token_counts=frozenset({8}),
@@ -961,6 +959,50 @@ def test_dynamic_launch_policy_round_trips_planned_tile(
         tile_m,
         direct,
         cluster_cap,
+    )
+
+
+@pytest.mark.parametrize(
+    ("work_source", "split", "prepare_mac"),
+    (
+        ("persistent_grid", True, None),
+        ("materialized_queue", True, 112),
+        ("ready_queue", False, None),
+    ),
+)
+def test_dynamic_execution_policy_round_trips_planned_split(
+    work_source: str,
+    split: bool,
+    prepare_mac: int | None,
+) -> None:
+    config = fused_moe_impl._DynamicMoELaunchConfig(
+        work_source=work_source,
+        external_route_plan=True,
+        direct_expert_scales=True,
+        split_route_compute=split,
+        split_fast_prepare=True,
+        split_low_smem=True,
+        fused_low_smem=not split,
+        skip_split_barrier_reset=True,
+        split_prepare_mac=prepare_mac,
+        split_compute_mac=224,
+        fast_math=True,
+    )
+
+    encoded = fused_moe_impl._encode_dynamic_execution_policy(
+        config,
+        split_route_compute=split,
+    )
+
+    assert fused_moe_impl._decode_dynamic_execution_policy(encoded) == (
+        work_source,
+        split,
+        split,
+        split,
+        not split,
+        split,
+        prepare_mac,
+        224 if split else 0,
     )
 
 
