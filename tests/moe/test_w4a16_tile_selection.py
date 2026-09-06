@@ -3,14 +3,19 @@ from __future__ import annotations
 import pytest
 import torch
 
+from b12x.moe._shared.kernels.w4a16 import kernel as kernel_module
+
 from b12x.moe._shared.kernels.w4a16.kernel import (
     _DEFAULT_MAX_SHARED_MEM,
+    _DEVICE_MAX_REG_BYTES,
+    _W4A16_MAX_LARGE_M_ACC_SETS,
     W4A16FusedMoeKernel,
     W4A16GemmKernel,
     _candidate_tile_fits,
     _covering_count,
     _select_tile_config,
     _shared_memory_footprint,
+    _w4a16_accumulator_regs_per_thread,
     _w4a16_b_unit_bytes,
     compile_w4a16_fused_moe,
 )
@@ -318,11 +323,119 @@ def test_fused_planner_admits_block_64_at_the_pinned_k3_tile(
         with pytest.raises(RuntimeError, match="not resolved for CUDA graph capture"):
             compile_w4a16_fused_moe(**kwargs)
     else:
-        # Block 96 has no measured register entry for the table tiles and its
-        # pinned tile does not fit (130,048 B); either gate is a ValueError
-        # that the serving planner treats as "try a narrower block".
-        with pytest.raises(
-            ValueError,
-            match="force_tile_config fc1 tile|missing W4A16 register count",
-        ):
+        # Block 96 needs six 16-row accumulator sets; the large-M schedule
+        # carries four. The serving planner reads the ValueError as "try a
+        # narrower route block".
+        with pytest.raises(ValueError, match="accumulator sets"):
             compile_w4a16_fused_moe(**kwargs)
+
+
+# The register budget of one route block: the large-M schedule keeps every
+# warp's fp32 partial of the whole CTA tile live across the K loop, so the
+# accumulators alone claim a fixed share of the SM register file.
+
+
+@pytest.mark.parametrize(
+    ("block", "tile_n", "expected"),
+    [
+        # The pinned Kimi-K3 tile: 2 N-groups, so each warp holds
+        # cta_m_blocks*16 rows by 64 columns -> 32 fp32 per m-block.
+        (16, 128, 32),
+        (32, 128, 64),
+        (48, 128, 96),
+        (64, 128, 128),
+        (96, 128, 192),
+        (128, 128, 256),
+        # A 64-wide tile has one N-group, so a warp covers all 64 columns:
+        # the same 32 fp32 per m-block.
+        (48, 64, 96),
+        # A 256-wide tile has four N-groups of 64 columns each: unchanged too.
+        (48, 256, 96),
+    ],
+)
+def test_accumulator_registers_per_thread(
+    block: int, tile_n: int, expected: int
+) -> None:
+    assert (
+        _w4a16_accumulator_regs_per_thread(
+            cta_m_blocks=_covering_count(block, 16), tile_n=tile_n
+        )
+        == expected
+    )
+
+
+def test_pinned_k3_tile_accumulators_against_the_sm_budget() -> None:
+    """Route block 48 already claims 37.6 % of the SM120 register file."""
+    per_thread = _w4a16_accumulator_regs_per_thread(cta_m_blocks=3, tile_n=128)
+    assert per_thread == 96
+    # One 256-thread CTA per SM; _DEVICE_MAX_REG_BYTES is the SM register file.
+    share = per_thread * 256 * 4 / _DEVICE_MAX_REG_BYTES
+    assert round(share, 3) == 0.376
+    # Block 96 would need 192 of the 255 registers a thread may hold, leaving
+    # 63 for the kernel body; the compiled block-64 kernel uses 245 registers
+    # with 128 accumulators, so the body needs far more than that.
+    assert _w4a16_accumulator_regs_per_thread(cta_m_blocks=6, tile_n=128) == 192
+
+
+def _k3_fc1_kernel(block: int) -> W4A16GemmKernel:
+    return _k3_gemm_kernel(
+        block,
+        size_n=768,
+        size_k=3584,
+        w13_layout="trellis3_t256_proj",
+        dual_a=True,
+        route_major_a=True,
+    )
+
+
+@pytest.mark.parametrize("block", [80, 96, 128])
+def test_route_blocks_above_four_m_blocks_are_rejected(
+    block: int, monkeypatch
+) -> None:
+    """A fifth 16-row m-block has no accumulator set of its own.
+
+    The allowed-route-size tuple already stops at 64, so this widens it to
+    prove the kernel refuses on its own terms instead of silently folding rows
+    64 and up into the fourth accumulator.
+    """
+    assert _covering_count(block, 16) > _W4A16_MAX_LARGE_M_ACC_SETS
+    assert block not in kernel_module._ALLOWED_ROUTED_SIZES
+    monkeypatch.setattr(
+        kernel_module,
+        "_ALLOWED_ROUTED_SIZES",
+        (*kernel_module._ALLOWED_ROUTED_SIZES, block),
+    )
+    with pytest.raises(ValueError, match="accumulator sets"):
+        _k3_fc1_kernel(block)
+
+
+def test_allowed_route_sizes_stay_within_the_accumulator_sets() -> None:
+    """The advertised route blocks must all be computable."""
+    for size in kernel_module._ALLOWED_ROUTED_SIZES:
+        assert _covering_count(size, 16) <= _W4A16_MAX_LARGE_M_ACC_SETS, size
+
+
+@pytest.mark.parametrize("block", [16, 32, 48, 64])
+def test_route_blocks_within_the_accumulator_sets_are_accepted(block: int) -> None:
+    kernel = _k3_fc1_kernel(block)
+    assert kernel.cta_m_blocks == _covering_count(block, 16)
+    assert kernel.cta_m_blocks <= _W4A16_MAX_LARGE_M_ACC_SETS
+
+
+def test_block_96_shared_memory_exceeds_the_sm120_limit_at_every_stage_count() -> None:
+    """Even before the register budget, the pinned tile does not fit.
+
+    The estimate stages ``_STAGES`` A tiles of ``96 x 128`` fp16 (24,576 B
+    each), so the four-stage pipeline the kernel runs needs 130,048 B against
+    the 101,376 B opt-in limit, and no stage count above two fits once the
+    4 KiB modal trellis table is added.
+    """
+    two_bpw = _w4a16_b_unit_bytes(weight_layout="trellis3_t256", trellis_bits=2)
+    assert _k3_footprint(96, b_unit_bytes=two_bpw) > _DEFAULT_MAX_SHARED_MEM
+    # The kernel's own layout, recomputed for a hypothetical stage count:
+    # 1,728 int4 of block metadata plus the aliased B/reduction region, and
+    # 1,568 int4 per stage (1,536 for A, 32 for the scale stage).
+    modal_table = 4096
+    for stages, fits in ((4, False), (3, False), (2, True)):
+        layout = (1_728 + stages * 1_568) * 16 + modal_table + 16
+        assert (layout <= _DEFAULT_MAX_SHARED_MEM) is fits, stages

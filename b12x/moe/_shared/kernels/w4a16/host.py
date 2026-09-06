@@ -14,6 +14,12 @@ from b12x.moe._shared.kernels.activations import (
 )
 
 
+# Route block sizes the W4A16 kernels accept. The ceiling is a property of the
+# large-M schedule, not a tuning choice: it keeps one fp32 accumulator set per
+# 16 routed rows live in registers for the whole K loop and addresses exactly
+# four of them, so 64 rows is the largest block it can compute. Widening this
+# tuple without widening that schedule is rejected by
+# ``W4A16GemmKernel.__init__`` (see ``_W4A16_MAX_LARGE_M_ACC_SETS``).
 _W4A16_ALLOWED_ROUTED_SIZES = (8, 16, 32, 48, 64)
 _ROUTED_SIZE_TARGET_FILL = 0.9
 _SUPPORTED_ACTIVATIONS = SUPPORTED_MOE_ACTIVATIONS
