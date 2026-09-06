@@ -59,16 +59,67 @@ def _served_gemm(monkeypatch: pytest.MonkeyPatch, *, fc: str, block: int, width:
     )
 
 
+def _fold_extent_int4(g) -> int:
+    """Model of the addresses ``_fold_cta_partials_*`` writes from sh_red_off.
+
+    Every thread of the upper half of the CTA stores one 16-byte slab per
+    accumulator quad; the fold reaches further than the output staging that
+    shares the base, so a layout that reserves only the staging leaves the
+    fold writing into the next region.
+    """
+    red_off = g.cta_threads // g.b_sh_stride_threads // 2
+    if red_off < 1:
+        return 0
+    slabs = 4 if g.uses_m_block_8 else 8
+    step = g.b_sh_stride_threads * (2 if g.uses_m_block_8 else 1)
+    highest = -1
+    for tid in range(g.cta_threads):
+        red_idx = tid // g.b_sh_stride_threads
+        red_sh_stride = g.b_sh_stride_threads * 4 * 2
+        red_sh_rd = red_sh_stride * red_idx + tid % g.b_sh_stride_threads
+        for slab in range(slabs):
+            if red_off == 2 and 2 <= red_idx < 4:
+                highest = max(highest, step * slab + red_sh_rd - red_sh_stride * 2)
+            if 1 <= red_idx < 2:
+                highest = max(highest, step * slab + red_sh_rd - red_sh_stride)
+                if red_off > 1:
+                    highest = max(highest, step * slab + red_sh_rd)
+            if red_idx == 0:
+                highest = max(highest, step * slab + red_sh_rd)
+    return highest + 1
+
+
+def _store_extent_bytes(g) -> int:
+    """Model of the bytes ``_store_tile_large_m_block`` writes from sh_red_off."""
+    c_sh_stride = 2 * g.cta_n_blocks + 1
+    highest = -1
+    for tid in range(g.cta_threads):
+        if tid // 32 >= g.tb_n_warps:
+            continue
+        cursor = 4 * c_sh_stride * ((tid & 31) // 4) + (tid & 31) % 4 + 32 * (tid // 32)
+        for _ in range(g.cta_m_blocks):
+            for jj in range(4):
+                base = cursor + 8 * jj
+                for offset in (0, 4, 4 * c_sh_stride * 8, 4 * c_sh_stride * 8 + 4):
+                    highest = max(highest, base + offset)
+            cursor += 16 * (4 * (2 * g.cta_n_blocks + 1))
+    return (highest + 1) * 4
+
+
 def _regions(g) -> dict[str, tuple[int, int]]:
-    """Byte ranges of every shared-memory region of one GEMM kernel."""
+    """Byte ranges of every shared-memory region of one GEMM kernel.
+
+    The epilogue region is the span the layout reserves from ``sh_red_off``
+    (output staging and cross-warp fold share that base), not the staging
+    footprint alone.
+    """
     meta = g.sh_meta_int4 * 16
     regions = {
         f"meta{i}": (i * meta, (i + 1) * meta) for i in range(g.sh_meta_copies)
     }
     b_bytes = _STAGES * g.b_sh_stage_bytes
     regions["b"] = (g.sh_b_off * 16, g.sh_b_off * 16 + b_bytes)
-    red_bytes = (2 * g.cta_n_blocks + 1) * 16 * g.cta_m_blocks * 16
-    regions["red"] = (g.sh_red_off * 16, g.sh_red_off * 16 + red_bytes)
+    regions["red"] = (g.sh_red_off * 16, g.sh_s_off * 16)
     regions["s"] = (g.sh_s_off * 16, (g.sh_s_off + _STAGES * g.s_sh_stage) * 16)
     regions["a"] = (g.sh_a_off * 16, (g.sh_a_off + _STAGES * g.a_sh_stage) * 16)
     return regions
@@ -95,11 +146,13 @@ def test_block48_layout_dealiases_red_and_double_buffers_metadata(
             assert not _overlaps(regions[x], regions[y]), (x, y, regions)
     assert all(start % 16 == 0 for start, _ in regions.values())
     assert g.shared_words * 4 == max(end for _, end in regions.values())
-    # Served geometry: 2 x 784 B metadata, 16 KiB B stages, 12.75 KiB red,
-    # 256 B bias slack, 2 KiB scale stages, 48 KiB A stages = 82,464 B; the
-    # fused launch adds the 4 KiB T12 table, one mbarrier and the 1 KiB
-    # struct alignment (86,576 B dynamic shared memory).
-    assert g.shared_words * 4 == 82_464
+    # Served geometry: 2 x 784 B metadata, 16 KiB B stages, 16 KiB epilogue
+    # scratch (the cross-warp fold, larger than the 12.75 KiB output staging
+    # and the 256 B bias slack it shares the base with), 2 KiB scale stages,
+    # 48 KiB A stages = 85,536 B; the fused launch adds the 4 KiB T12 table,
+    # one mbarrier and the 1 KiB struct alignment (89,648 B dynamic shared
+    # memory).
+    assert g.shared_words * 4 == 85_536
     assert (
         g.shared_words * 4 + kernel._CROSS_TILE_PREFETCH_SMEM_RESERVE_BYTES
         <= _MAX_SMEM
@@ -134,6 +187,30 @@ def test_block64_keeps_prefetch_but_aliases_red(monkeypatch: pytest.MonkeyPatch)
         g.shared_words * 4 + kernel._CROSS_TILE_PREFETCH_SMEM_RESERVE_BYTES
         <= _MAX_SMEM // g.blocks_per_sm
     )
+
+
+@pytest.mark.parametrize("prefetch", ["0", "1"])
+@pytest.mark.parametrize("fc", ["fc1", "fc2"])
+@pytest.mark.parametrize("block", [32, 48, 64])
+@pytest.mark.parametrize("width", [384, 256])
+def test_epilogue_scratch_holds_the_cross_warp_fold(
+    monkeypatch: pytest.MonkeyPatch, prefetch: str, fc: str, block: int, width: int
+) -> None:
+    """The fold and the output staging must both fit below the scale stages.
+
+    Both write from ``sh_red_off``. The fold reaches further, so a layout
+    that reserves only the staging lets it write over the scale and
+    activation stages of whatever the pipeline has already loaded there -
+    with the cross-tile prefetch that is the next tile's staged scales, and
+    e4m3 scale bytes overwritten by f32 accumulator words decode to NaN.
+    """
+    g = _served_gemm(monkeypatch, fc=fc, block=block, width=width, prefetch=prefetch)
+    span = (g.sh_s_off - g.sh_red_off) * 16
+    assert _fold_extent_int4(g) * 16 <= span, (
+        g.sh_red_off, g.sh_s_off, _fold_extent_int4(g)
+    )
+    assert _store_extent_bytes(g) <= span
+    assert g.sh_fold_size == _fold_extent_int4(g)
 
 
 def test_prefetch_requires_whole_tile_route_packed_schedule(monkeypatch: pytest.MonkeyPatch) -> None:

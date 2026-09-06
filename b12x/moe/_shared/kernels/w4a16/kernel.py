@@ -1403,6 +1403,28 @@ class W4A16GemmKernel:
         sh_size_max = max(sh_red_size, sh_b_size)
         sh_bias_size = self.cta_n_blocks * 16 // 8
         sh_b_red_bias_size = max(sh_size_max, sh_size_min + sh_bias_size)
+        # Two epilogue phases share the ``sh_red_off`` base and have different
+        # footprints. The output staging writes ``sh_red_size`` (one padded
+        # 16-row slab per M block). The cross-warp fold
+        # (``_fold_cta_partials_large_m_block`` / ``_fold_cta_partials_m8``)
+        # writes one 16-byte slab per accumulator quad for the upper half of
+        # the CTA: ``red_lanes`` groups of ``b_sh_stride_threads`` threads,
+        # each writing ``fold_slabs`` slabs ``fold_step`` apart. That reaches
+        # further than the output staging for every supported tile, so any
+        # layout must keep ``sh_red_off`` clear of the next region for the
+        # larger of the two - otherwise the fold writes into the scale and
+        # activation stages.
+        red_lanes = self.cta_threads // self.b_sh_stride_threads // 2
+        fold_slabs = 4 if self.uses_m_block_8 else 8
+        fold_step = self.b_sh_stride_threads * (2 if self.uses_m_block_8 else 1)
+        self.sh_fold_size = 0
+        if red_lanes >= 1:
+            self.sh_fold_size = (
+                fold_step * (fold_slabs - 1)
+                + self.b_sh_stride_threads * 8 * (red_lanes - 1)
+                + self.b_sh_stride_threads
+            )
+        sh_epilogue_size = max(sh_red_size + sh_bias_size, self.sh_fold_size)
         # Cross-tile prefetch (whole-tile route-packed schedules): the next
         # tile's route metadata and first pipeline stages are issued during
         # the current tile's epilogue. It needs two route-metadata blocks
@@ -1427,9 +1449,10 @@ class W4A16GemmKernel:
         # fused launch's reserve must fit, or the persistent grid barrier
         # would wait for CTAs that are never resident.
         smem_budget = int(max_shared_mem) // int(self.blocks_per_sm)
+        aliased_epilogue_size = max(sh_b_red_bias_size, sh_epilogue_size)
         if self.cross_tile_prefetch:
             sh_meta_total = 2 * self.sh_meta_int4
-            aliased_int4 = sh_meta_total + sh_b_red_bias_size + pipeline_int4
+            aliased_int4 = sh_meta_total + aliased_epilogue_size + pipeline_int4
             if (
                 aliased_int4 * 16 + _CROSS_TILE_PREFETCH_SMEM_RESERVE_BYTES
                 > smem_budget
@@ -1441,18 +1464,21 @@ class W4A16GemmKernel:
             sh_meta_total = 2 * self.sh_meta_int4
             self.sh_b_off = sh_meta_total
             dealiased_int4 = (
-                sh_meta_total + sh_b_size + sh_red_size + sh_bias_size + pipeline_int4
+                sh_meta_total + sh_b_size + sh_epilogue_size + pipeline_int4
             )
             self.sh_red_dealiased = (
                 dealiased_int4 * 16 + _CROSS_TILE_PREFETCH_SMEM_RESERVE_BYTES
                 <= smem_budget
             )
             if self.sh_red_dealiased:
+                # The de-aliased scratch stands alone, so it carries the whole
+                # epilogue span itself; the aliased layouts inherit it from the
+                # B stages they overlap.
                 self.sh_red_off = sh_meta_total + sh_b_size
-                self.sh_s_off = self.sh_red_off + sh_red_size + sh_bias_size
+                self.sh_s_off = self.sh_red_off + sh_epilogue_size
             else:
                 self.sh_red_off = sh_meta_total
-                self.sh_s_off = sh_meta_total + sh_b_red_bias_size
+                self.sh_s_off = sh_meta_total + aliased_epilogue_size
         else:
             self.sh_b_off = self.sh_valid_count_off
             self.sh_red_off = self.sh_valid_count_off
