@@ -34,7 +34,9 @@ from .pcie_oneshot import (
     DEFAULT_MAX_SIZE,
     DEFAULT_RANK_DATA_BYTES,
     SUPPORTED_WORLD_SIZES as ONESHOT_WORLD_SIZES,
+    TP2_PLAIN_REMOTE_PUSH_AUTO_MAX_BYTES,
     PCIeOneshotAllReducePool,
+    _tp2_plain_remote_push_enabled,
 )
 
 
@@ -70,6 +72,8 @@ def recommended_max_bytes(world_size: int, *, default: int = DEFAULT_MAX_SIZE) -
 
     if world_size in ISLAND_RS_WORLD_SIZES and _algorithm_override() == "island_rs":
         return max(default, ISLAND_RS_MAX_BYTES)
+    if world_size == 2 and _tp2_plain_remote_push_enabled():
+        return max(default, TP2_PLAIN_REMOTE_PUSH_AUTO_MAX_BYTES)
     return default
 
 

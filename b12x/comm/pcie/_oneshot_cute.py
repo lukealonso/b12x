@@ -1,10 +1,9 @@
 """CuTe DSL implementations of the PCIe oneshot collectives.
 
-The launch ABI uses stable device-resident ``uint64`` pointer tables.  This is
-the only intentional ABI difference from the former CUDA extension (which
-passed signal pointers by value and loaded data pointers through ``RankData``).
-The payload loop, 16-byte packs, rank rotation, system-scope flag protocol,
-and fused row barrier retain the CUDA implementation's ordering.
+The launch ABI uses stable device-resident ``uint64`` pointer tables. Payload
+transfers use aligned 16-byte records. TP2 graph peer-push records carry their
+generation beside the payload so readiness does not depend on a separate peer
+atomic operation.
 """
 
 from __future__ import annotations
@@ -29,11 +28,15 @@ from b12x._lib.runtime_control import raise_if_kernel_resolution_frozen
 from b12x._lib.utils import current_cuda_stream, make_ptr
 
 from ._cute_intrinsics import (
+    add_bf16x2,
+    add_f16x2,
     atomic_add_global_u32,
     f32_as_u32,
     graph_epoch_arrive,
+    graph_epoch_arrive_serialized,
     ld_global_f32,
     ld_relaxed_gpu_u32,
+    ld_relaxed_sys_global_v4_u32,
     pack_f32x2_to_bf16x2,
     pack_f32x2_to_f16x2,
     pcie_arrive_and_wait,
@@ -41,6 +44,7 @@ from ._cute_intrinsics import (
     spin_until_changed_acquire_gpu,
     st_global_f32,
     st_global_u32,
+    st_relaxed_sys_global_v4_u32,
     threadfence_gpu,
     unpack_bf16x2,
     unpack_f16x2,
@@ -80,13 +84,16 @@ class _PackedMath:
         self._pack_elems = _DTYPE_PACK_ELEMS[dtype_name]
 
     @cute.jit
-    def _load_accumulate(
+    def _accumulate_words(
         self,
         accumulator: cute.Tensor,
-        address: Int64,
+        word0: Uint32,
+        word1: Uint32,
+        word2: Uint32,
+        word3: Uint32,
         initialize: cutlass.Constexpr[bool],
     ) -> None:
-        words = ld_global_v4_u32(address)
+        words = (word0, word1, word2, word3)
         if cutlass.const_expr(self._dtype_name == "float32"):
             for word in cutlass.range_constexpr(4):
                 value = u32_as_f32(words[word])
@@ -107,6 +114,23 @@ class _PackedMath:
                 else:
                     accumulator[lane] = accumulator[lane] + lo
                     accumulator[lane + 1] = accumulator[lane + 1] + hi
+
+    @cute.jit
+    def _load_accumulate(
+        self,
+        accumulator: cute.Tensor,
+        address: Int64,
+        initialize: cutlass.Constexpr[bool],
+    ) -> None:
+        words = ld_global_v4_u32(address)
+        self._accumulate_words(
+            accumulator,
+            words[0],
+            words[1],
+            words[2],
+            words[3],
+            initialize,
+        )
 
     @cute.jit
     def _store_accumulator(self, address: Int64, accumulator: cute.Tensor) -> None:
@@ -153,14 +177,32 @@ class _OneshotLaunch(_PackedMath):
         stage_input: bool,
         device_slot_selection: bool,
         slot_bias: int,
+        transport: str,
         threads: int,
     ) -> None:
         super().__init__(dtype_name)
+        if transport not in (
+            "pull",
+            "tp2_remote_push",
+            "tp2_remote_push_stream",
+        ):
+            raise ValueError(f"invalid plain oneshot transport {transport!r}")
+        if transport.startswith("tp2_remote_push") and (
+            world_size != 2
+            or not stage_input
+            or not device_slot_selection
+            or dtype_name not in ("float16", "bfloat16")
+        ):
+            raise ValueError(
+                "TP2 remote push requires a graph-owned staged FP16 or BF16 "
+                "input on two ranks"
+            )
         self._world_size = int(world_size)
         self._rank = int(rank)
         self._stage_input = bool(stage_input)
         self._device_slot_selection = bool(device_slot_selection)
         self._slot_bias = int(slot_bias) & 1
+        self._transport = transport
         self._threads = int(threads)
 
     @cute.jit
@@ -171,6 +213,11 @@ class _OneshotLaunch(_PackedMath):
         input_ptr: cute.Pointer,
         output_ptr: cute.Pointer,
         size_packs: Int32,
+        plain_region_packs: Int64,
+        plain_local_slot0: Int64,
+        plain_peer_slot0: Int64,
+        plain_local_slot1: Int64,
+        plain_peer_slot1: Int64,
         grid_x: Int32,
         stream: cuda.CUstream,
     ) -> None:
@@ -180,6 +227,11 @@ class _OneshotLaunch(_PackedMath):
             input_ptr,
             output_ptr,
             size_packs,
+            plain_region_packs,
+            plain_local_slot0,
+            plain_peer_slot0,
+            plain_local_slot1,
+            plain_peer_slot1,
         ).launch(
             grid=(grid_x, 1, 1),
             block=[self._threads, 1, 1],
@@ -233,12 +285,19 @@ class _OneshotLaunch(_PackedMath):
         input_ptr: cute.Pointer,
         output_ptr: cute.Pointer,
         size_packs: Int32,
+        plain_region_packs: Int64,
+        plain_local_slot0: Int64,
+        plain_peer_slot0: Int64,
+        plain_local_slot1: Int64,
+        plain_peer_slot1: Int64,
     ) -> None:
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
         gdim, _, _ = cute.arch.grid_dim()
         input_base = Int64(input_ptr.toint())
         output_base = Int64(output_ptr.toint())
+        generation = Uint32(0)
+        slot = Uint32(0)
         if cutlass.const_expr(self._device_slot_selection):
             generation = ld_relaxed_gpu_u32(
                 Int64(signal_ptrs[self._rank]) + Int64(_GRAPH_EPOCH_OFFSET)
@@ -246,43 +305,164 @@ class _OneshotLaunch(_PackedMath):
             # The existing block/peer barrier below proves every thread has
             # consumed this load before any CTA can post its tail arrival.
             slot = (generation + Uint32(self._slot_bias)) % Uint32(2)
-            peer_ptrs = peer_ptrs + Int64(slot) * Int64(_MAX_RANKS)
+            if cutlass.const_expr(self._transport == "pull"):
+                peer_ptrs = peer_ptrs + Int64(slot) * Int64(_MAX_RANKS)
+
+            if cutlass.const_expr(self._transport != "pull"):
+                # Every CTA retains this invocation's slot before the final
+                # arrival advances the graph-local epoch. Same-stream launch
+                # ordering and alternating slots prevent premature reuse.
+                cute.arch.sync_threads()
+                if Int32(tidx) == Int32(0):
+                    self_signal = Int64(signal_ptrs[self._rank])
+                    graph_epoch_arrive_serialized(
+                        self_signal + Int64(_GRAPH_EPOCH_OFFSET),
+                        self_signal + Int64(_GRAPH_ARRIVED_OFFSET),
+                        Uint32(gdim),
+                    )
 
         index = Int32(bidx) * Int32(self._threads) + Int32(tidx)
         stride = Int32(gdim) * Int32(self._threads)
-        if cutlass.const_expr(self._stage_input):
-            staging_base = Int64(peer_ptrs[self._rank])
-            stage_index = index
-            while stage_index < size_packs:
-                self._copy_pack(
-                    input_base + Int64(stage_index) * Int64(16),
-                    staging_base + Int64(stage_index) * Int64(16),
-                )
-                stage_index += stride
+        if cutlass.const_expr(self._transport == "pull"):
+            if cutlass.const_expr(self._stage_input):
+                staging_base = Int64(peer_ptrs[self._rank])
+                stage_index = index
+                while stage_index < size_packs:
+                    self._copy_pack(
+                        input_base + Int64(stage_index) * Int64(16),
+                        staging_base + Int64(stage_index) * Int64(16),
+                    )
+                    stage_index += stride
 
-        self._multi_gpu_barrier(signal_ptrs)
+            self._multi_gpu_barrier(signal_ptrs)
 
-        while index < size_packs:
-            accumulator = cute.make_rmem_tensor((self._pack_elems,), cutlass.Float32)
-            for peer_index in cutlass.range_constexpr(self._world_size):
-                peer_rank = (self._rank + peer_index) % self._world_size
-                peer_base = Int64(peer_ptrs[peer_rank])
-                self._load_accumulate(
-                    accumulator,
-                    peer_base + Int64(index) * Int64(16),
-                    peer_index == 0,
+            while index < size_packs:
+                accumulator = cute.make_rmem_tensor(
+                    (self._pack_elems,), cutlass.Float32
                 )
-            self._store_accumulator(output_base + Int64(index) * Int64(16), accumulator)
-            index += stride
+                for peer_index in cutlass.range_constexpr(self._world_size):
+                    peer_rank = (self._rank + peer_index) % self._world_size
+                    peer_base = Int64(peer_ptrs[peer_rank])
+                    self._load_accumulate(
+                        accumulator,
+                        peer_base + Int64(index) * Int64(16),
+                        peer_index == 0,
+                    )
+                self._store_accumulator(
+                    output_base + Int64(index) * Int64(16), accumulator
+                )
+                index += stride
 
-        if cutlass.const_expr(self._device_slot_selection):
-            if Int32(tidx) == Int32(0):
-                self_signal = Int64(signal_ptrs[self._rank])
-                graph_epoch_arrive(
-                    self_signal + Int64(_GRAPH_EPOCH_OFFSET),
-                    self_signal + Int64(_GRAPH_ARRIVED_OFFSET),
-                    Uint32(gdim),
+            if cutlass.const_expr(self._device_slot_selection):
+                if Int32(tidx) == Int32(0):
+                    self_signal = Int64(signal_ptrs[self._rank])
+                    graph_epoch_arrive(
+                        self_signal + Int64(_GRAPH_EPOCH_OFFSET),
+                        self_signal + Int64(_GRAPH_ARRIVED_OFFSET),
+                        Uint32(gdim),
+                    )
+        elif cutlass.const_expr(self._transport.startswith("tp2_remote_push")):
+            peer_rank = self._rank ^ 1
+            local_scratch_base = plain_local_slot0
+            peer_scratch_base = plain_peer_slot0
+            if slot != Uint32(0):
+                local_scratch_base = plain_local_slot1
+                peer_scratch_base = plain_peer_slot1
+            peer_write_base = peer_scratch_base + plain_region_packs * Int64(16)
+            local_poll_base = local_scratch_base + plain_region_packs * Int64(16)
+            # Generation zero is the initialized scratch value. Starting at
+            # two and retaining published records gives every alternating slot
+            # a different expected value. For generation g, the immediately
+            # preceding record in the same slot is g while this invocation
+            # expects g + 2, including modulo-uint32 wraparound. Collective
+            # lockstep prevents a record from an entire 2^32-generation cycle
+            # remaining in a slot: a missed publication blocks that generation
+            # before either rank can advance its graph-local epoch.
+            expected_generation = generation + Uint32(2)
+
+            if cutlass.const_expr(self._transport == "tp2_remote_push"):
+                publish_index = index
+                while publish_index < size_packs:
+                    words = ld_global_v4_u32(
+                        input_base + Int64(publish_index) * Int64(16)
+                    )
+                    # Match NCCL LL publication: each naturally aligned
+                    # 16-byte line carries eight payload bytes and two copies
+                    # of the generation. The protocol does not assume that the
+                    # line is atomically visible; repeated generation lanes let
+                    # the receiver reject a torn observation.
+                    line_base = peer_write_base + Int64(publish_index) * Int64(32)
+                    st_relaxed_sys_global_v4_u32(
+                        line_base,
+                        words[0],
+                        expected_generation,
+                        words[1],
+                        expected_generation,
+                    )
+                    st_relaxed_sys_global_v4_u32(
+                        line_base + Int64(16),
+                        words[2],
+                        expected_generation,
+                        words[3],
+                        expected_generation,
+                    )
+                    publish_index += stride
+
+            while index < size_packs:
+                local_words = ld_global_v4_u32(input_base + Int64(index) * Int64(16))
+                if cutlass.const_expr(self._transport == "tp2_remote_push_stream"):
+                    peer_line_address = peer_write_base + Int64(index) * Int64(32)
+                    st_relaxed_sys_global_v4_u32(
+                        peer_line_address,
+                        local_words[0],
+                        expected_generation,
+                        local_words[1],
+                        expected_generation,
+                    )
+                    st_relaxed_sys_global_v4_u32(
+                        peer_line_address + Int64(16),
+                        local_words[2],
+                        expected_generation,
+                        local_words[3],
+                        expected_generation,
+                    )
+                line_address = local_poll_base + Int64(index) * Int64(32)
+                line0 = ld_relaxed_sys_global_v4_u32(line_address)
+                line1 = ld_relaxed_sys_global_v4_u32(line_address + Int64(16))
+                waiting = (
+                    (line0[1] ^ expected_generation)
+                    | (line0[3] ^ expected_generation)
+                    | (line1[1] ^ expected_generation)
+                    | (line1[3] ^ expected_generation)
                 )
+                while waiting != Uint32(0):
+                    line0 = ld_relaxed_sys_global_v4_u32(line_address)
+                    line1 = ld_relaxed_sys_global_v4_u32(line_address + Int64(16))
+                    waiting = (
+                        (line0[1] ^ expected_generation)
+                        | (line0[3] ^ expected_generation)
+                        | (line1[1] ^ expected_generation)
+                        | (line1[3] ^ expected_generation)
+                    )
+                peer_words = (line0[0], line0[2], line1[0], line1[2])
+                packed_sum = cute.make_rmem_tensor((4,), cutlass.Uint32)
+                for word in cutlass.range_constexpr(4):
+                    if cutlass.const_expr(self._dtype_name == "float16"):
+                        packed_sum[word] = add_f16x2(
+                            local_words[word], peer_words[word]
+                        )
+                    else:
+                        packed_sum[word] = add_bf16x2(
+                            local_words[word], peer_words[word]
+                        )
+                st_global_v4_u32(
+                    output_base + Int64(index) * Int64(16),
+                    packed_sum[0],
+                    packed_sum[1],
+                    packed_sum[2],
+                    packed_sum[3],
+                )
+                index += stride
 
 
 class _FusedOneshotLaunch(_PackedMath):
@@ -957,6 +1137,7 @@ def _oneshot_process_key(
     stage_input: bool,
     device_slot_selection: bool,
     slot_bias: int,
+    transport: str,
     threads: int,
     device_index: int,
 ) -> tuple[object, ...]:
@@ -967,6 +1148,7 @@ def _oneshot_process_key(
         bool(stage_input),
         bool(device_slot_selection),
         int(slot_bias) & 1 if device_slot_selection else 0,
+        str(transport),
         int(threads),
         int(device_index),
     )
@@ -979,6 +1161,7 @@ def is_oneshot_launcher_prepared(
     stage_input: bool,
     device_slot_selection: bool,
     slot_bias: int,
+    transport: str,
     threads: int,
     device_index: int,
 ) -> bool:
@@ -992,6 +1175,7 @@ def is_oneshot_launcher_prepared(
             stage_input,
             device_slot_selection,
             slot_bias,
+            transport,
             threads,
             device_index,
         )
@@ -1007,6 +1191,7 @@ def get_oneshot_launcher(
     stage_input: bool,
     device_slot_selection: bool,
     slot_bias: int,
+    transport: str,
     threads: int,
     device_index: int,
 ) -> Callable[..., None]:
@@ -1017,6 +1202,7 @@ def get_oneshot_launcher(
         stage_input,
         device_slot_selection,
         slot_bias,
+        transport,
         threads,
         device_index,
     )
@@ -1029,6 +1215,7 @@ def get_oneshot_launcher(
         stage_input,
         device_slot_selection,
         slot_bias,
+        transport,
         threads,
     )
     cache_key = (
@@ -1038,6 +1225,7 @@ def get_oneshot_launcher(
         bool(stage_input),
         bool(device_slot_selection),
         slot_bias,
+        str(transport),
         int(threads),
     )
     raise_if_kernel_resolution_frozen(
@@ -1051,8 +1239,13 @@ def get_oneshot_launcher(
         _dummy(cutlass.Uint32, 16),
         1,
         1,
+        1,
+        1,
+        1,
+        1,
+        1,
         current_cuda_stream(),
-        compile_spec=KernelCompileSpec.from_key("comm.pcie.oneshot", 1, cache_key),
+        compile_spec=KernelCompileSpec.from_key("comm.pcie.oneshot", 3, cache_key),
     )
 
     def run(
@@ -1061,6 +1254,11 @@ def get_oneshot_launcher(
         input_address: int,
         output_address: int,
         size_packs: int,
+        plain_region_packs: int,
+        plain_local_slot0: int,
+        plain_peer_slot0: int,
+        plain_local_slot1: int,
+        plain_peer_slot1: int,
         grid_x: int,
     ) -> None:
         raw(
@@ -1089,6 +1287,11 @@ def get_oneshot_launcher(
                 assumed_align=16,
             ),
             int(size_packs),
+            int(plain_region_packs),
+            int(plain_local_slot0),
+            int(plain_peer_slot0),
+            int(plain_local_slot1),
+            int(plain_peer_slot1),
             int(grid_x),
             current_cuda_stream(),
         )

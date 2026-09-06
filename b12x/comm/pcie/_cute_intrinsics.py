@@ -1,11 +1,10 @@
 """PTX intrinsics shared by the CuTe DSL PCIe collectives.
 
-The communication kernels deliberately spell out the scope and ordering of
-every flag access.  CUDA's default global-memory operations are not a
-cross-device synchronization contract; the ``.sys`` operations below are.
-Keeping these as small user ops also prevents compiler upgrades from silently
-changing the protocol while still allowing the surrounding kernels to be
-written entirely in Python/CuTe DSL.
+The communication kernels specify the scope and ordering of every protocol
+record access. CUDA's default global-memory operations are not a cross-device
+visibility contract; the explicit ``.sys`` operations below are. Keeping these
+operations isolated also makes generated-code inspection deterministic while
+the surrounding kernels remain in Python/CuTe DSL.
 """
 
 from __future__ import annotations
@@ -140,6 +139,105 @@ def st_global_u32(addr: Int64, value: Uint32, *, loc=None, ip=None) -> None:
         asm_dialect=llvm.AsmDialect.AD_ATT,
         loc=loc,
         ip=ip,
+    )
+
+
+@dsl_user_op
+def ld_relaxed_sys_global_v4_u32(
+    addr: Int64, *, loc=None, ip=None
+) -> Tuple[Uint32, Uint32, Uint32, Uint32]:
+    """Load one NCCL-style PCIe data-and-epoch line at system scope."""
+
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32(), T.i32(), T.i32(), T.i32()]),
+        [Int64(addr).ir_value(loc=loc, ip=ip)],
+        "ld.relaxed.sys.global.v4.u32 {$0, $1, $2, $3}, [$4];",
+        "=r,=r,=r,=r,l,~{memory}",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return tuple(
+        Uint32(llvm.extractvalue(T.i32(), result, [index], loc=loc, ip=ip))
+        for index in range(4)
+    )
+
+
+@dsl_user_op
+def st_relaxed_sys_global_v4_u32(
+    addr: Int64,
+    v0: Uint32,
+    v1: Uint32,
+    v2: Uint32,
+    v3: Uint32,
+    *,
+    loc=None,
+    ip=None,
+) -> None:
+    """Store one NCCL-style PCIe data-and-epoch line at system scope."""
+
+    llvm.inline_asm(
+        None,
+        [
+            Int64(addr).ir_value(loc=loc, ip=ip),
+            Uint32(v0).ir_value(loc=loc, ip=ip),
+            Uint32(v1).ir_value(loc=loc, ip=ip),
+            Uint32(v2).ir_value(loc=loc, ip=ip),
+            Uint32(v3).ir_value(loc=loc, ip=ip),
+        ],
+        "st.relaxed.sys.global.v4.u32 [$0], {$1, $2, $3, $4};",
+        "l,r,r,r,r,~{memory}",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def add_f16x2(left: Uint32, right: Uint32, *, loc=None, ip=None) -> Uint32:
+    """Add two packed FP16 lanes with round-to-nearest semantics."""
+
+    return Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [
+                Uint32(left).ir_value(loc=loc, ip=ip),
+                Uint32(right).ir_value(loc=loc, ip=ip),
+            ],
+            "add.rn.f16x2 $0, $1, $2;",
+            "=r,r,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def add_bf16x2(left: Uint32, right: Uint32, *, loc=None, ip=None) -> Uint32:
+    """Add two packed BF16 lanes with round-to-nearest semantics."""
+
+    return Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [
+                Uint32(left).ir_value(loc=loc, ip=ip),
+                Uint32(right).ir_value(loc=loc, ip=ip),
+            ],
+            "add.rn.bf16x2 $0, $1, $2;",
+            "=r,r,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
     )
 
 

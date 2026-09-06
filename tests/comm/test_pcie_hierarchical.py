@@ -101,6 +101,7 @@ def test_allreduce_factory_keeps_tp16_equal_quarter_opt_in(
 @pytest.mark.parametrize(
     ("world_size", "algorithm", "expected"),
     [
+        (2, "auto", 512 * 1024),
         (8, "auto", 84 * 1024),
         (12, "auto", 84 * 1024),
         (16, "auto", 84 * 1024),
@@ -114,6 +115,7 @@ def test_recommended_max_bytes_matches_available_tp_runtime(
     algorithm: str,
     expected: int,
 ) -> None:
+    monkeypatch.setenv("B12X_PCIE_TP2_PLAIN_REMOTE_PUSH", "1")
     monkeypatch.setenv("B12X_PCIE_ALLREDUCE_ALGORITHM", algorithm)
     assert recommended_max_bytes(world_size, default=84 * 1024) == expected
 
