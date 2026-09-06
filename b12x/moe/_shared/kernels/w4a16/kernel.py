@@ -445,6 +445,36 @@ def _w4a16_num_regs(
         ) from exc
 
 
+# The large-M schedule keeps one fp32 accumulator set per 16-row m-block in
+# registers for the whole K loop, and every path that touches those sets
+# (``_mma_accumulate_large_m``, ``_combine_splitk_accumulator_block``,
+# ``_fold_cta_partials_large_m``, ``_store_tile_large_m_block``) selects among
+# exactly four names with ``mb == 0 / 1 / 2 / else``. A fifth m-block owns no
+# accumulator: it would take the ``else`` arm and add its rows into the fourth
+# block's accumulator, silently corrupting the output. The route block is
+# therefore capped at four 16-row blocks until those paths carry more sets.
+_W4A16_MAX_LARGE_M_ACC_SETS = 4
+_W4A16_MAX_ROUTE_BLOCK_ROWS = _W4A16_MAX_LARGE_M_ACC_SETS * 16
+
+
+def _w4a16_accumulator_regs_per_thread(*, cta_m_blocks: int, tile_n: int) -> int:
+    """fp32 accumulator registers one thread holds across the whole K loop.
+
+    The CTA's warps are laid out as ``tb_n_warps = tile_n / 16 / 4`` N-groups
+    by ``cta_threads / 32 / tb_n_warps`` K-slices. Every warp keeps a private
+    fp32 partial of all ``cta_m_blocks * 16`` rows over its ``tile_n /
+    tb_n_warps`` columns until the epilogue folds the K-slices, so the count
+    per thread depends on the tile alone; the thread count only sets how many
+    K-slices share the work. At the pinned 128-wide tile this is 32 registers
+    per 16-row m-block. Multiplied by ``cta_threads`` it is the CTA's claim on
+    the SM register file (``_DEVICE_MAX_REG_BYTES``), and on its own it
+    competes with the 255-register per-thread cap.
+    """
+    cta_n_blocks = int(tile_n) // 16
+    tb_n_warps = max(cta_n_blocks // 4, 1)
+    return (int(cta_m_blocks) * 16 * int(tile_n)) // (tb_n_warps * 32)
+
+
 def _shared_memory_footprint(
     *,
     cta_m_blocks: int,
@@ -1202,6 +1232,14 @@ class W4A16GemmKernel:
         if self.fused_sum_fp32 and not self.fused_topk_sum:
             raise ValueError("fused_sum_fp32 requires fused_topk_sum")
         self.cta_m_blocks = int(_covering_count(moe_block_size, 16))
+        if self.cta_m_blocks > _W4A16_MAX_LARGE_M_ACC_SETS:
+            raise ValueError(
+                "W4A16 route block exceeds the accumulator sets the large-M "
+                f"schedule carries: moe_block_size={int(moe_block_size)} needs "
+                f"{self.cta_m_blocks} sets of 16 rows, the kernel has "
+                f"{_W4A16_MAX_LARGE_M_ACC_SETS} (at most "
+                f"{_W4A16_MAX_ROUTE_BLOCK_ROWS} rows)"
+            )
         self.uses_m_block_8 = moe_block_size == 8
         self.paired_m8_routes = bool(paired_m8_routes)
         if self.paired_m8_routes and (
@@ -9985,6 +10023,17 @@ def compile_w4a16_fused_moe(
     ):
         raise ValueError(
             "direct_topk_routes is only valid for supported small-M W4A16 decode"
+        )
+    if _covering_count(int(moe_block_size), 16) > _W4A16_MAX_LARGE_M_ACC_SETS:
+        # Reject here rather than at the register table, whose lookup failure
+        # names a tile the caller never asked for. Serving planners read this
+        # as "try a narrower route block".
+        raise ValueError(
+            "W4A16 route block exceeds the accumulator sets the large-M "
+            f"schedule carries: moe_block_size={int(moe_block_size)} needs "
+            f"{_covering_count(int(moe_block_size), 16)} sets of 16 rows, the "
+            f"kernel has {_W4A16_MAX_LARGE_M_ACC_SETS} (at most "
+            f"{_W4A16_MAX_ROUTE_BLOCK_ROWS} rows)"
         )
     fc1_cols = int(intermediate_size) * (2 if is_gated else 1)
     routed_rows = int(size_m) * int(top_k)
