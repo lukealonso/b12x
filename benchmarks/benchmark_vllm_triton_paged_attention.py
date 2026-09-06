@@ -89,7 +89,7 @@ def _bench_graph(
         graph.replay()
         ends[idx].record()
     torch.cuda.synchronize()
-    return [start.elapsed_time(end) * 1000.0 for start, end in zip(starts, ends)]
+    return [start.elapsed_time(end) * 1000.0 for start, end in zip(starts, ends, strict=True)]
 
 
 def _reference_output(
