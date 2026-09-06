@@ -313,10 +313,8 @@ def _block_fp8_linear_x_q_from_scratch(
         shape=layout.x_scale_mma_physical_shape,
         dtype=torch.uint8,
     )
-    # Quantization overwrites every logical row scale and every physical scale
-    # entry consumed by dense GEMM.  M128 padding is outside the logical output
-    # rows and remains deliberately unspecified; pre-filling it adds two CUDA
-    # launches before every projection without changing any logical result.
+    # Quantization overwrites every scale contributing to a logical output row.
+    # Leave M128 padding unspecified to avoid two CUDA fills when binding scratch.
     x_scale_mma = x_scale_mma_u8.view(torch.float8_e8m0fnu).permute(
         3,
         4,
