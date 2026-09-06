@@ -10,6 +10,7 @@ and fused row barrier retain the CUDA implementation's ordering.
 from __future__ import annotations
 
 import functools
+import os
 from collections.abc import Callable
 
 import cuda.bindings.driver as cuda
@@ -62,6 +63,7 @@ _RMS_ARRIVE_OFFSET = _SELF_COUNTER_BYTES + _PEER_COUNTER_BYTES
 _RMS_GEN_OFFSET = 150_016
 _RMS_PARTIAL_OFFSET = 150_272
 _REG_PACKS = 3
+_ONESHOT_PDL = os.getenv("B12X_PCIE_ONESHOT_PDL", "0") != "0"
 
 _DTYPE_PACK_ELEMS = {"float32": 4, "float16": 8, "bfloat16": 8}
 
@@ -283,6 +285,9 @@ class _OneshotLaunch(_PackedMath):
                     self_signal + Int64(_GRAPH_ARRIVED_OFFSET),
                     Uint32(gdim),
                 )
+        if cutlass.const_expr(_ONESHOT_PDL):
+            cute.arch.sync_threads()
+            cute.arch.griddepcontrol_launch_dependents()
 
 
 class _FusedOneshotLaunch(_PackedMath):
