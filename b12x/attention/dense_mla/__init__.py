@@ -13,6 +13,11 @@ are planned independently. Supported logical widths are ``(576, 512)`` and
 ``window_size=None`` attends to the full causal context. A positive
 ``window_size`` restricts query position ``p`` to the inclusive interval
 ``[max(0, p - window_size + 1), p]``. The attention scale is caller-provided.
+Experimental dynamic sparsity retains sink and recent 64-token chunks while
+striding the middle history after a configured threshold. ``sparse_stride=1``
+is the exact default; larger strides intentionally change model semantics and
+must be quality-qualified by the caller. Dynamic sparsity and local windows
+are deliberately mutually exclusive.
 BF16 and E4M3 records are supported. For E4M3 cache with BF16 query input,
 ``q_dtype=torch.bfloat16`` plans fixed query-quantization storage in the same
 caller-owned scratch buffer.
@@ -43,6 +48,7 @@ META = OpMeta(
         "plan",
         "bind",
         "compile",
+        "dynamic_sparse_chunk_indices",
         "run",
         "reference",
         "infer_mode",
@@ -81,6 +87,7 @@ if TYPE_CHECKING:
         bind,
         clear_caches,
         compile,
+        dynamic_sparse_chunk_indices,
         infer_mode,
         is_supported,
         plan,

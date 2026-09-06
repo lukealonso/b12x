@@ -196,6 +196,72 @@ def test_partial_row_budget_changes_native_split_policy() -> None:
     assert plan.chunks_per_split == 2
 
 
+def test_fp8_multi_request_verify_plan_tiles_four_queries() -> None:
+    plan = dense_mla.plan(
+        dense_mla.Caps(
+            device="cpu",
+            mode="verify",
+            kv_dtype=FP8,
+            num_q_heads=HEADS,
+            page_size=16,
+            max_total_q=8,
+            max_batch=2,
+            max_cache_tokens=128,
+            max_page_table_width=8,
+            num_cache_pages=16,
+            uses_query_cache_seqlens=True,
+        )
+    )
+
+    assert plan.query_tile == 4
+    assert plan.policy_resolution is not None
+    assert plan.policy_resolution.config.max_splits == plan.num_splits
+
+
+def test_dynamic_sparse_chunk_policy_preserves_sink_and_recent_chunks() -> None:
+    assert dense_mla.dynamic_sparse_chunk_indices(
+        10,
+        stride=3,
+        sink_chunks=2,
+        recent_chunks=2,
+    ) == (0, 1, 2, 5, 8, 9)
+
+
+def test_verify_plan_requires_query_cache_lengths() -> None:
+    plan = dense_mla.plan(
+        dense_mla.Caps(
+            device="cpu",
+            mode="verify",
+            kv_dtype=FP8,
+            num_q_heads=HEADS,
+            page_size=16,
+            max_total_q=4,
+            max_batch=1,
+            max_cache_tokens=64,
+            max_page_table_width=4,
+            num_cache_pages=4,
+            uses_query_cache_seqlens=True,
+        )
+    )
+    q = torch.empty(4, HEADS, QK_DIM, dtype=FP8)
+    cache = torch.empty(4, 16, QK_DIM, dtype=FP8)
+    output = torch.empty(4, HEADS, VALUE_DIM, dtype=torch.bfloat16)
+
+    with pytest.raises(ValueError, match="requires per-query cache lengths"):
+        dense_mla.bind(
+            plan,
+            scratch=_scratch(plan),
+            q=q,
+            kv_cache=cache,
+            output=output,
+            page_table=torch.arange(4, dtype=torch.int32).view(1, 4),
+            cache_seqlens=torch.tensor([64], dtype=torch.int32),
+            cu_seqlens_q=torch.tensor([0, 4], dtype=torch.int32),
+            q_scale=torch.tensor(0.01),
+            kv_scale=torch.tensor(0.01),
+        )
+
+
 @pytest.mark.parametrize("heads", [8, 12])
 @torch.inference_mode()
 def test_bf16_multi_request_decode_matches_reference(heads: int) -> None:
@@ -389,6 +455,179 @@ def test_fp8_query_tiled_causal_extend_matches_reference(heads: int) -> None:
         q_scale=q_scale,
         kv_scale=kv_scale,
     )
+    _assert_matches(
+        actual_output,
+        actual_lse,
+        expected_output,
+        expected_lse,
+    )
+
+
+@torch.inference_mode()
+def test_fp8_tiled_dcp_visibility_matches_reference() -> None:
+    device = require_b12x()
+    torch.manual_seed(20260901)
+    batch = 2
+    query_len = 4
+    total_q = batch * query_len
+    heads = 8
+    page_size = 16
+    pages = 8
+    plan = dense_mla.plan(
+        dense_mla.Caps(
+            device=device,
+            mode="verify",
+            kv_dtype=FP8,
+            num_q_heads=heads,
+            page_size=page_size,
+            max_total_q=total_q,
+            max_batch=batch,
+            max_cache_tokens=64,
+            max_page_table_width=4,
+            num_cache_pages=pages,
+            uses_query_cache_seqlens=True,
+        )
+    )
+    assert plan.query_tile == 4
+    q_float = torch.randn(total_q, heads, QK_DIM, device=device) * 0.14
+    cache_float = torch.randn(pages, page_size, QK_DIM, device=device) * 0.1
+    q_scale = (q_float.abs().max() / 400).reshape(1).float()
+    kv_scale = (cache_float.abs().max() / 400).reshape(1).float()
+    q = (q_float / q_scale).to(FP8)
+    cache = (cache_float / kv_scale).to(FP8)
+    page_table = torch.tensor(
+        [[4, 7, 1, 5], [0, 3, 6, 2]],
+        dtype=torch.int32,
+        device=device,
+    )
+    cache_seqlens = torch.tensor([31, 47], dtype=torch.int32, device=device)
+    query_cache_seqlens = torch.tensor(
+        [28, 29, 30, 31, 44, 45, 46, 47],
+        dtype=torch.int32,
+        device=device,
+    )
+    cu_seqlens_q = torch.tensor([0, 4, 8], dtype=torch.int32, device=device)
+    output = torch.empty(
+        total_q,
+        heads,
+        VALUE_DIM,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    binding = dense_mla.bind(
+        plan,
+        scratch=_scratch(plan),
+        q=q,
+        kv_cache=cache,
+        output=output,
+        page_table=page_table,
+        cache_seqlens=cache_seqlens,
+        query_cache_seqlens=query_cache_seqlens,
+        cu_seqlens_q=cu_seqlens_q,
+        q_scale=q_scale,
+        kv_scale=kv_scale,
+    )
+
+    actual_output, actual_lse = dense_mla.run(binding=binding)
+    expected_output, expected_lse = dense_mla.reference(
+        q,
+        cache,
+        page_table,
+        cache_seqlens,
+        cu_seqlens_q,
+        query_cache_seqlens=query_cache_seqlens,
+        q_scale=q_scale,
+        kv_scale=kv_scale,
+    )
+
+    _assert_matches(
+        actual_output,
+        actual_lse,
+        expected_output,
+        expected_lse,
+    )
+
+
+@torch.inference_mode()
+def test_fp8_dynamic_sparse_verify_matches_sparse_reference() -> None:
+    device = require_b12x()
+    torch.manual_seed(20260902)
+    query_len = 4
+    heads = 8
+    page_size = 16
+    pages = 16
+    cache_len = 240
+    sparse_kwargs = {
+        "sparse_stride": 3,
+        "sparse_min_tokens": 64,
+        "sparse_sink_chunks": 1,
+        "sparse_recent_chunks": 1,
+    }
+    plan = dense_mla.plan(
+        dense_mla.Caps(
+            device=device,
+            mode="verify",
+            kv_dtype=FP8,
+            num_q_heads=heads,
+            page_size=page_size,
+            max_total_q=query_len,
+            max_batch=1,
+            max_cache_tokens=256,
+            max_page_table_width=16,
+            num_cache_pages=pages,
+            uses_query_cache_seqlens=True,
+            **sparse_kwargs,
+        )
+    )
+    q_float = torch.randn(query_len, heads, QK_DIM, device=device) * 0.14
+    cache_float = torch.randn(pages, page_size, QK_DIM, device=device) * 0.1
+    q_scale = (q_float.abs().max() / 400).reshape(1).float()
+    kv_scale = (cache_float.abs().max() / 400).reshape(1).float()
+    q = (q_float / q_scale).to(FP8)
+    cache = (cache_float / kv_scale).to(FP8)
+    page_table = torch.arange(pages, dtype=torch.int32, device=device).view(1, -1)
+    cache_seqlens = torch.tensor([cache_len], dtype=torch.int32, device=device)
+    query_cache_seqlens = torch.arange(
+        cache_len - query_len + 1,
+        cache_len + 1,
+        dtype=torch.int32,
+        device=device,
+    )
+    cu_seqlens_q = torch.tensor([0, query_len], dtype=torch.int32, device=device)
+    output = torch.empty(
+        query_len,
+        heads,
+        VALUE_DIM,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    binding = dense_mla.bind(
+        plan,
+        scratch=_scratch(plan),
+        q=q,
+        kv_cache=cache,
+        output=output,
+        page_table=page_table,
+        cache_seqlens=cache_seqlens,
+        query_cache_seqlens=query_cache_seqlens,
+        cu_seqlens_q=cu_seqlens_q,
+        q_scale=q_scale,
+        kv_scale=kv_scale,
+    )
+
+    actual_output, actual_lse = dense_mla.run(binding=binding)
+    expected_output, expected_lse = dense_mla.reference(
+        q,
+        cache,
+        page_table,
+        cache_seqlens,
+        cu_seqlens_q,
+        query_cache_seqlens=query_cache_seqlens,
+        q_scale=q_scale,
+        kv_scale=kv_scale,
+        **sparse_kwargs,
+    )
+
     _assert_matches(
         actual_output,
         actual_lse,

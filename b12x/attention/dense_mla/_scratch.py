@@ -42,6 +42,12 @@ def _canonical_device(device: torch.device | str) -> torch.device:
 
 
 def _query_tile(caps: Caps) -> int:
+    if (
+        caps.mode == "verify"
+        and caps.max_total_q == caps.max_batch * 4
+        and caps.window_size is None
+    ):
+        return 4 if caps.kv_dtype == _FP8 else 1
     if caps.mode == "decode" or caps.max_batch != 1 or caps.window_size is not None:
         return 1
     if caps.kv_dtype == _FP8 and caps.max_total_q >= 3:
@@ -75,6 +81,12 @@ class Caps:
     physical_record_width: int = K3_ABSORBED_DIM
     window_size: int | None = None
     use_cuda_graph: bool = False
+    uses_query_cache_seqlens: bool = False
+    sparse_stride: int = 1
+    sparse_min_tokens: int = 0
+    sparse_sink_chunks: int = 0
+    sparse_recent_chunks: int = 0
+    sparse_refresh_interval: int = 0
     budget: Budget | None = None
 
     def __post_init__(self) -> None:
@@ -105,6 +117,24 @@ class Caps:
             raise ValueError("physical_record_width must cover the logical key record")
         if self.window_size is not None and int(self.window_size) <= 0:
             raise ValueError("window_size must be positive or None")
+        uses_query_cache_seqlens = bool(self.uses_query_cache_seqlens)
+        if uses_query_cache_seqlens and self.mode != "verify":
+            raise ValueError(
+                "per-query cache lengths are supported only by verify plans"
+            )
+        for name, minimum in (
+            ("sparse_stride", 1),
+            ("sparse_min_tokens", 0),
+            ("sparse_sink_chunks", 0),
+            ("sparse_recent_chunks", 0),
+            ("sparse_refresh_interval", 0),
+        ):
+            value = int(getattr(self, name))
+            if value < minimum:
+                raise ValueError(f"{name} must be >= {minimum}")
+            object.__setattr__(self, name, value)
+        if self.window_size is not None and self.sparse_stride > 1:
+            raise ValueError("dynamic sparsity cannot be combined with window_size")
         heads = int(self.num_q_heads)
         if heads <= 0:
             raise ValueError("num_q_heads must be positive")
@@ -144,6 +174,11 @@ class Caps:
         ):
             object.__setattr__(self, name, int(getattr(self, name)))
         object.__setattr__(self, "use_cuda_graph", bool(self.use_cuda_graph))
+        object.__setattr__(
+            self,
+            "uses_query_cache_seqlens",
+            uses_query_cache_seqlens,
+        )
         if self.window_size is not None:
             object.__setattr__(self, "window_size", int(self.window_size))
 
@@ -269,6 +304,12 @@ class Scratch:
     chunks_per_split: int
     query_tile: int
     use_cuda_graph: bool
+    uses_query_cache_seqlens: bool
+    sparse_stride: int
+    sparse_min_tokens: int
+    sparse_sink_chunks: int
+    sparse_recent_chunks: int
+    sparse_refresh_interval: int
     partial_output: torch.Tensor | None
     partial_lse: torch.Tensor | None
     final_lse: torch.Tensor
@@ -283,6 +324,7 @@ class Binding:
     output: torch.Tensor
     page_table: torch.Tensor
     cache_seqlens: torch.Tensor
+    query_cache_seqlens: torch.Tensor
     cu_seqlens_q: torch.Tensor
     kv_scale: torch.Tensor | None
     q_scale: torch.Tensor | None
@@ -397,6 +439,7 @@ def _validate_binding(
     output: torch.Tensor,
     page_table: torch.Tensor,
     cache_seqlens: torch.Tensor,
+    query_cache_seqlens: torch.Tensor | None,
     cu_seqlens_q: torch.Tensor,
     kv_scale: torch.Tensor | None,
     q_scale: torch.Tensor | None,
@@ -465,6 +508,34 @@ def _validate_binding(
             raise TypeError(f"{name} must be contiguous int32 with shape {shape}")
         if tensor.device != scratch.device or not tensor.is_contiguous():
             raise ValueError(f"{name} must be contiguous on the plan device")
+    if scratch.uses_query_cache_seqlens:
+        if query_cache_seqlens is None:
+            raise ValueError("verify plan requires per-query cache lengths")
+        if query_cache_seqlens.dtype != torch.int32 or tuple(
+            query_cache_seqlens.shape
+        ) != (int(q.shape[0]),):
+            raise TypeError(
+                "query_cache_seqlens must be contiguous int32 with shape [total_q]"
+            )
+        if (
+            query_cache_seqlens.device != scratch.device
+            or not query_cache_seqlens.is_contiguous()
+        ):
+            raise ValueError(
+                "query_cache_seqlens must be contiguous on the plan device"
+            )
+    elif query_cache_seqlens is not None:
+        raise ValueError("plan does not accept per-query cache lengths")
+    else:
+        query_cache_seqlens = cache_seqlens
+    if (
+        scratch.mode == "verify"
+        and scratch.query_tile > 1
+        and int(q.shape[0]) != batch * scratch.query_tile
+    ):
+        raise ValueError(
+            "tiled verify plan requires one complete query tile per request"
+        )
     if (
         page_table.ndim != 2
         or int(page_table.shape[0]) != batch
@@ -522,6 +593,7 @@ def _validate_binding(
         output=output,
         page_table=page_table.detach(),
         cache_seqlens=cache_seqlens.detach(),
+        query_cache_seqlens=query_cache_seqlens.detach(),
         cu_seqlens_q=cu_seqlens_q.detach(),
         kv_scale=kv_scale,
         q_scale=q_scale,
@@ -594,6 +666,12 @@ def _materialize(
         chunks_per_split=layout.chunks_per_split,
         query_tile=query_tile,
         use_cuda_graph=caps.use_cuda_graph,
+        uses_query_cache_seqlens=caps.uses_query_cache_seqlens,
+        sparse_stride=caps.sparse_stride,
+        sparse_min_tokens=caps.sparse_min_tokens,
+        sparse_sink_chunks=caps.sparse_sink_chunks,
+        sparse_recent_chunks=caps.sparse_recent_chunks,
+        sparse_refresh_interval=caps.sparse_refresh_interval,
         partial_output=partial_output,
         partial_lse=partial_lse,
         final_lse=final_lse,
@@ -635,6 +713,7 @@ class Plan:
         output: torch.Tensor,
         page_table: torch.Tensor,
         cache_seqlens: torch.Tensor,
+        query_cache_seqlens: torch.Tensor | None = None,
         cu_seqlens_q: torch.Tensor,
         kv_scale: torch.Tensor | None = None,
         q_scale: torch.Tensor | None = None,
@@ -654,6 +733,7 @@ class Plan:
             output=output,
             page_table=page_table,
             cache_seqlens=cache_seqlens,
+            query_cache_seqlens=query_cache_seqlens,
             cu_seqlens_q=cu_seqlens_q,
             kv_scale=kv_scale,
             q_scale=q_scale,

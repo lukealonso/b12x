@@ -87,6 +87,12 @@ def _signature(binding: Binding) -> tuple[object, ...]:
         scratch.head_dim,
         scratch.v_head_dim,
         scratch.window_size,
+        scratch.uses_query_cache_seqlens,
+        scratch.sparse_stride,
+        scratch.sparse_min_tokens,
+        scratch.sparse_sink_chunks,
+        scratch.sparse_recent_chunks,
+        scratch.sparse_refresh_interval,
         tuple(int(value) for value in binding.q.stride()),
         tuple(int(value) for value in binding.kv_cache.stride()),
         tuple(int(value) for value in binding.output.stride()),
@@ -131,6 +137,12 @@ def _forward_launch(binding: Binding) -> _ForwardLaunch:
         qk_dim=scratch.head_dim,
         value_dim=scratch.v_head_dim,
         window_size=scratch.window_size,
+        uses_query_cache_seqlens=scratch.uses_query_cache_seqlens,
+        sparse_stride=scratch.sparse_stride,
+        sparse_min_tokens=scratch.sparse_min_tokens,
+        sparse_sink_chunks=scratch.sparse_sink_chunks,
+        sparse_recent_chunks=scratch.sparse_recent_chunks,
+        sparse_refresh_interval=scratch.sparse_refresh_interval,
     )
 
     q_bytes = _byte_base_pointer(binding.q)
@@ -180,6 +192,12 @@ def _forward_launch(binding: Binding) -> _ForwardLaunch:
             dynamic_layout=True,
         ),
         _to_cute(
+            binding.query_cache_seqlens,
+            cutlass.Int32,
+            align=4,
+            dynamic_layout=True,
+        ),
+        _to_cute(
             output,
             cutlass.BFloat16,
             align=16,
@@ -203,7 +221,7 @@ def _forward_launch(binding: Binding) -> _ForwardLaunch:
     )
     spec = KernelCompileSpec.from_fields(
         "attention.dense_mla.forward",
-        4,
+        6,
         key_field("dtype", "fp8" if fp8 else "bf16"),
         key_field("heads", scratch.num_q_heads),
         key_field("page_size", scratch.page_size),
@@ -216,6 +234,15 @@ def _forward_launch(binding: Binding) -> _ForwardLaunch:
         key_field("head_dim", scratch.head_dim),
         key_field("v_head_dim", scratch.v_head_dim),
         key_field("window_size", scratch.window_size),
+        key_field(
+            "uses_query_cache_seqlens",
+            scratch.uses_query_cache_seqlens,
+        ),
+        key_field("sparse_stride", scratch.sparse_stride),
+        key_field("sparse_min_tokens", scratch.sparse_min_tokens),
+        key_field("sparse_sink_chunks", scratch.sparse_sink_chunks),
+        key_field("sparse_recent_chunks", scratch.sparse_recent_chunks),
+        key_field("sparse_refresh_interval", scratch.sparse_refresh_interval),
         key_field("record_stride_bytes", layout.record_stride_bytes),
         tensor_key(
             "q",

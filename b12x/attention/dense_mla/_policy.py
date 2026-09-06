@@ -64,10 +64,12 @@ class DenseMlaConfig:
 
 def _query_tile(query: DenseMlaQuery) -> int:
     if (
-        query.mode == "decode"
-        or query.max_batch != 1
-        or query.window_size is not None
+        query.mode == "verify"
+        and query.query_rows == query.max_batch * 4
+        and query.window_size is None
     ):
+        return 4 if query.kv_dtype == "float8_e4m3fn" else 1
+    if query.mode == "decode" or query.max_batch != 1 or query.window_size is not None:
         return 1
     if query.kv_dtype == "float8_e4m3fn" and query.query_rows >= 3:
         return 4
@@ -104,9 +106,7 @@ def _validate(
         raise ValueError("dense MLA max_splits must be positive")
     max_chunks = max(1, (query.cache_tokens + 63) // 64)
     if config.max_splits > max_chunks:
-        raise ValueError(
-            "dense MLA max_splits cannot exceed the cache chunk count"
-        )
+        raise ValueError("dense MLA max_splits cannot exceed the cache chunk count")
 
 
 DENSE_MLA_POLICY = ComponentPolicy(

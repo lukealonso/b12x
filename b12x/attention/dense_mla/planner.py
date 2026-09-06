@@ -13,6 +13,26 @@ _CANDIDATES_PER_CHUNK = 64
 _MAX_CEIL_WAVES = 3
 
 
+def dynamic_sparse_chunk_indices(
+    num_chunks: int,
+    *,
+    stride: int,
+    sink_chunks: int,
+    recent_chunks: int,
+) -> tuple[int, ...]:
+    """Return sorted sink/strided-history/recent chunk indices."""
+    num_chunks = max(int(num_chunks), 0)
+    stride = max(int(stride), 1)
+    sink = min(max(int(sink_chunks), 0), num_chunks)
+    recent = min(max(int(recent_chunks), 0), num_chunks - sink)
+    middle_end = num_chunks - recent
+    return tuple(
+        [*range(sink)]
+        + [*range(sink, middle_end, stride)]
+        + [*range(middle_end, num_chunks)]
+    )
+
+
 @dataclass(frozen=True, kw_only=True)
 class Budget:
     """Optional caller capacity clamps; B12X still chooses launch policy."""
@@ -119,5 +139,6 @@ __all__ = [
     "Budget",
     "Mode",
     "choose_num_splits",
+    "dynamic_sparse_chunk_indices",
     "infer_dense_mla_mode",
 ]

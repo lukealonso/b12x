@@ -21,6 +21,7 @@ from ._scratch import (
 from .planner import Budget
 from ._policy import DENSE_MLA_POLICY, DenseMlaConfig, DenseMlaQuery
 from .planner import (
+    dynamic_sparse_chunk_indices,
     infer_dense_mla_mode,
 )
 from ._reference import dense_mla_reference
@@ -122,6 +123,7 @@ __all__ = [
     "bind",
     "clear_caches",
     "compile",
+    "dynamic_sparse_chunk_indices",
     "infer_mode",
     "is_supported",
     "plan",
