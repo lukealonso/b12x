@@ -231,6 +231,20 @@ def _w4a16_cross_tile_prefetch_enabled() -> bool:
     return os.environ.get("B12X_W4A16_CROSS_TILE_PREFETCH", "1") == "1"
 
 
+def _w4a16_token_major_rotation_enabled() -> bool:
+    """Write the full-rotation A operand once per token instead of per route.
+
+    Applies to the coupled-Hadamard full rotation with one broadcast ``suh``
+    row (Kimi-K3 QSRT): the rotated row of a route is a function of its
+    token only, so the rotation phase writes ``M`` rows instead of
+    ``M * top_k`` and FC1 gathers them through ``route // top_k``. Every
+    MMA operand is the value the route-major layout holds for that route
+    (bit-identical outputs). Participates in the fused kernel cache key.
+    """
+
+    return os.environ.get("B12X_W4A16_TOKEN_MAJOR_ROTATION", "1") == "1"
+
+
 # Shared memory the fused launch appends after a GEMM's own layout: the
 # 4 KiB modal T12 table, the 16-byte copy barrier and the 1 KiB alignment
 # of the storage struct. The de-aliased reduction scratch is only used when
@@ -7295,6 +7309,14 @@ class W4A16FusedMoeKernel:
             and weight_layout == "trellis3_t256"
             and w13_layout == "trellis3_t256_proj"
         )
+        # Token-major rotated A: valid only when the rotated row cannot depend
+        # on the expert (one broadcast suh row, coupled gate/up input).
+        self.token_major_rotation = bool(
+            self.full_rotation
+            and self.coupled_hadamard
+            and self.broadcast_suh
+            and _w4a16_token_major_rotation_enabled()
+        )
         fc1_source_n_rotation = (
             int(intermediate_size)
             if (weight_layout == "modelopt" and w13_layout == "w13" and is_gated)
@@ -7324,7 +7346,7 @@ class W4A16FusedMoeKernel:
             single_token_route_fast_path=size_m == 1 and not self.direct_topk_routes,
             direct_topk_routes=self.direct_topk_routes,
             dual_a=self.dual_a,
-            route_major_a=self.full_rotation,
+            route_major_a=self.full_rotation and not self.token_major_rotation,
             schedule_whole_tiles=self.schedule_whole_tiles,
             dynamic_num_experts=self.dynamic_num_experts,
         )
@@ -7483,6 +7505,7 @@ class W4A16FusedMoeKernel:
             self.coupled_hadamard,
             self.broadcast_suh,
             self.rotation_input_dtype,
+            self.token_major_rotation,
             self.sqg_xor_cheb_t12_smem,
             self.sqg_xor_cheb_t12_direct_smem,
             self.small_m_splitk,
@@ -8383,20 +8406,48 @@ class W4A16FusedMoeKernel:
         grid_x: Int32,
         active_m: cutlass.Int32,
     ):
-        """Apply the shared H512 boundary followed by ordinary H128 inputs."""
+        """Apply the shared H512 boundary followed by ordinary H128 inputs.
+
+        Route-major form: one unit per (packed route, 512-column block), the
+        row is written at the route's index. Token-major form
+        (``token_major_rotation``): with one broadcast ``suh`` row the
+        rotated row depends on the token only, so one unit per (token,
+        512-column block) writes it once at the token's index and FC1 reads
+        it through ``route // top_k``; every value is the one the
+        route-major form writes for each of the token's routes.
+        """
 
         lane = tid & Int32(31)
         warp_in_cta = tid >> Int32(5)
         warps_per_cta = Int32(self.cta_threads // 32)
         nblk = Int32(self.hidden_size // 512)
+        gwarp = cta * warps_per_cta + warp_in_cta
+        gw_stride = grid_x * warps_per_cta
+        elem = lane * Int32(4)
+        if cutlass.const_expr(self.token_major_rotation):
+            total_units = active_m * nblk
+            unit = gwarp
+            while unit < total_units:
+                token = unit // nblk
+                blk = unit - token * nblk
+                self._rotate_coupled_row(
+                    x_input_flat,
+                    a_shared_flat,
+                    suh_flat,
+                    token,
+                    token,
+                    Int32(0),
+                    blk,
+                    lane,
+                    elem,
+                )
+                unit += gw_stride
+            return
         live_routes = active_m * Int32(self.top_k)
         route_count = packed_route_count[Int32(0)].to(Int32)
         if cutlass.const_expr(self.direct_topk_routes):
             route_count = live_routes
-        gwarp = cta * warps_per_cta + warp_in_cta
-        gw_stride = grid_x * warps_per_cta
         total_units = route_count * nblk
-        elem = lane * Int32(4)
         unit = gwarp
         while unit < total_units:
             route_pos = unit // nblk
@@ -8418,96 +8469,127 @@ class W4A16FusedMoeKernel:
                 and expert < weight_num_experts
             ):
                 token = route // Int32(self.top_k)
-                col0 = blk * Int32(512) + elem
-                x_base = token * Int32(self.hidden_size) + col0
-
-                x00 = cutlass.Float16(
-                    x_input_flat[x_base + Int32(0)].to(cutlass.Float32)
-                ).to(cutlass.Float32)
-                x01 = cutlass.Float16(
-                    x_input_flat[x_base + Int32(1)].to(cutlass.Float32)
-                ).to(cutlass.Float32)
-                x02 = cutlass.Float16(
-                    x_input_flat[x_base + Int32(2)].to(cutlass.Float32)
-                ).to(cutlass.Float32)
-                x03 = cutlass.Float16(
-                    x_input_flat[x_base + Int32(3)].to(cutlass.Float32)
-                ).to(cutlass.Float32)
-                x10 = cutlass.Float16(
-                    x_input_flat[x_base + Int32(128)].to(cutlass.Float32)
-                ).to(cutlass.Float32)
-                x11 = cutlass.Float16(
-                    x_input_flat[x_base + Int32(129)].to(cutlass.Float32)
-                ).to(cutlass.Float32)
-                x12 = cutlass.Float16(
-                    x_input_flat[x_base + Int32(130)].to(cutlass.Float32)
-                ).to(cutlass.Float32)
-                x13 = cutlass.Float16(
-                    x_input_flat[x_base + Int32(131)].to(cutlass.Float32)
-                ).to(cutlass.Float32)
-                x20 = cutlass.Float16(
-                    x_input_flat[x_base + Int32(256)].to(cutlass.Float32)
-                ).to(cutlass.Float32)
-                x21 = cutlass.Float16(
-                    x_input_flat[x_base + Int32(257)].to(cutlass.Float32)
-                ).to(cutlass.Float32)
-                x22 = cutlass.Float16(
-                    x_input_flat[x_base + Int32(258)].to(cutlass.Float32)
-                ).to(cutlass.Float32)
-                x23 = cutlass.Float16(
-                    x_input_flat[x_base + Int32(259)].to(cutlass.Float32)
-                ).to(cutlass.Float32)
-                x30 = cutlass.Float16(
-                    x_input_flat[x_base + Int32(384)].to(cutlass.Float32)
-                ).to(cutlass.Float32)
-                x31 = cutlass.Float16(
-                    x_input_flat[x_base + Int32(385)].to(cutlass.Float32)
-                ).to(cutlass.Float32)
-                x32 = cutlass.Float16(
-                    x_input_flat[x_base + Int32(386)].to(cutlass.Float32)
-                ).to(cutlass.Float32)
-                x33 = cutlass.Float16(
-                    x_input_flat[x_base + Int32(387)].to(cutlass.Float32)
-                ).to(cutlass.Float32)
-
-                h00, h01, h02, h03 = self._had128_quad(x00, x01, x02, x03, lane)
-                h10, h11, h12, h13 = self._had128_quad(x10, x11, x12, x13, lane)
-                h20, h21, h22, h23 = self._had128_quad(x20, x21, x22, x23, lane)
-                h30, h31, h32, h33 = self._had128_quad(x30, x31, x32, x33, lane)
-                c00, c10, c20, c30 = self._had4_normalized(h00, h10, h20, h30)
-                c01, c11, c21, c31 = self._had4_normalized(h01, h11, h21, h31)
-                c02, c12, c22, c32 = self._had4_normalized(h02, h12, h22, h32)
-                c03, c13, c23, c33 = self._had4_normalized(h03, h13, h23, h33)
-
-                if cutlass.const_expr(self.broadcast_suh):
-                    s_base = col0
-                else:
-                    s_base = expert * Int32(self.hidden_size) + col0
-                out_base = route * Int32(self.hidden_size) + col0
-                for group in cutlass.range_constexpr(4):
-                    offset = Int32(group * 128)
-                    if cutlass.const_expr(group == 0):
-                        c0, c1, c2, c3 = c00, c01, c02, c03
-                    elif cutlass.const_expr(group == 1):
-                        c0, c1, c2, c3 = c10, c11, c12, c13
-                    elif cutlass.const_expr(group == 2):
-                        c0, c1, c2, c3 = c20, c21, c22, c23
-                    else:
-                        c0, c1, c2, c3 = c30, c31, c32, c33
-                    s0 = suh_flat[s_base + offset + Int32(0)].to(cutlass.Float32)
-                    s1 = suh_flat[s_base + offset + Int32(1)].to(cutlass.Float32)
-                    s2 = suh_flat[s_base + offset + Int32(2)].to(cutlass.Float32)
-                    s3 = suh_flat[s_base + offset + Int32(3)].to(cutlass.Float32)
-                    c0 = cutlass.Float16(c0 * s0).to(cutlass.Float32)
-                    c1 = cutlass.Float16(c1 * s1).to(cutlass.Float32)
-                    c2 = cutlass.Float16(c2 * s2).to(cutlass.Float32)
-                    c3 = cutlass.Float16(c3 * s3).to(cutlass.Float32)
-                    o0, o1, o2, o3 = self._had128_quad(c0, c1, c2, c3, lane)
-                    a_shared_flat[out_base + offset + Int32(0)] = cutlass.Float16(o0)
-                    a_shared_flat[out_base + offset + Int32(1)] = cutlass.Float16(o1)
-                    a_shared_flat[out_base + offset + Int32(2)] = cutlass.Float16(o2)
-                    a_shared_flat[out_base + offset + Int32(3)] = cutlass.Float16(o3)
+                self._rotate_coupled_row(
+                    x_input_flat,
+                    a_shared_flat,
+                    suh_flat,
+                    token,
+                    route,
+                    expert,
+                    blk,
+                    lane,
+                    elem,
+                )
             unit += gw_stride
+
+    @cute.jit
+    def _rotate_coupled_row(
+        self,
+        x_input_flat: cute.Tensor,
+        a_shared_flat: cute.Tensor,
+        suh_flat: cute.Tensor,
+        token: Int32,
+        out_row: Int32,
+        expert: Int32,
+        blk: Int32,
+        lane: Int32,
+        elem: Int32,
+    ):
+        """Rotate one 512-column block of token ``token`` into row ``out_row``.
+
+        ``elem`` is the lane's column offset (``lane * 4``); it is hoisted by
+        the callers so the loop body keeps the served instruction sequence.
+        """
+
+        col0 = blk * Int32(512) + elem
+        x_base = token * Int32(self.hidden_size) + col0
+
+        x00 = cutlass.Float16(
+            x_input_flat[x_base + Int32(0)].to(cutlass.Float32)
+        ).to(cutlass.Float32)
+        x01 = cutlass.Float16(
+            x_input_flat[x_base + Int32(1)].to(cutlass.Float32)
+        ).to(cutlass.Float32)
+        x02 = cutlass.Float16(
+            x_input_flat[x_base + Int32(2)].to(cutlass.Float32)
+        ).to(cutlass.Float32)
+        x03 = cutlass.Float16(
+            x_input_flat[x_base + Int32(3)].to(cutlass.Float32)
+        ).to(cutlass.Float32)
+        x10 = cutlass.Float16(
+            x_input_flat[x_base + Int32(128)].to(cutlass.Float32)
+        ).to(cutlass.Float32)
+        x11 = cutlass.Float16(
+            x_input_flat[x_base + Int32(129)].to(cutlass.Float32)
+        ).to(cutlass.Float32)
+        x12 = cutlass.Float16(
+            x_input_flat[x_base + Int32(130)].to(cutlass.Float32)
+        ).to(cutlass.Float32)
+        x13 = cutlass.Float16(
+            x_input_flat[x_base + Int32(131)].to(cutlass.Float32)
+        ).to(cutlass.Float32)
+        x20 = cutlass.Float16(
+            x_input_flat[x_base + Int32(256)].to(cutlass.Float32)
+        ).to(cutlass.Float32)
+        x21 = cutlass.Float16(
+            x_input_flat[x_base + Int32(257)].to(cutlass.Float32)
+        ).to(cutlass.Float32)
+        x22 = cutlass.Float16(
+            x_input_flat[x_base + Int32(258)].to(cutlass.Float32)
+        ).to(cutlass.Float32)
+        x23 = cutlass.Float16(
+            x_input_flat[x_base + Int32(259)].to(cutlass.Float32)
+        ).to(cutlass.Float32)
+        x30 = cutlass.Float16(
+            x_input_flat[x_base + Int32(384)].to(cutlass.Float32)
+        ).to(cutlass.Float32)
+        x31 = cutlass.Float16(
+            x_input_flat[x_base + Int32(385)].to(cutlass.Float32)
+        ).to(cutlass.Float32)
+        x32 = cutlass.Float16(
+            x_input_flat[x_base + Int32(386)].to(cutlass.Float32)
+        ).to(cutlass.Float32)
+        x33 = cutlass.Float16(
+            x_input_flat[x_base + Int32(387)].to(cutlass.Float32)
+        ).to(cutlass.Float32)
+
+        h00, h01, h02, h03 = self._had128_quad(x00, x01, x02, x03, lane)
+        h10, h11, h12, h13 = self._had128_quad(x10, x11, x12, x13, lane)
+        h20, h21, h22, h23 = self._had128_quad(x20, x21, x22, x23, lane)
+        h30, h31, h32, h33 = self._had128_quad(x30, x31, x32, x33, lane)
+        c00, c10, c20, c30 = self._had4_normalized(h00, h10, h20, h30)
+        c01, c11, c21, c31 = self._had4_normalized(h01, h11, h21, h31)
+        c02, c12, c22, c32 = self._had4_normalized(h02, h12, h22, h32)
+        c03, c13, c23, c33 = self._had4_normalized(h03, h13, h23, h33)
+
+        if cutlass.const_expr(self.broadcast_suh):
+            s_base = col0
+        else:
+            s_base = expert * Int32(self.hidden_size) + col0
+        out_base = out_row * Int32(self.hidden_size) + col0
+        for group in cutlass.range_constexpr(4):
+            offset = Int32(group * 128)
+            if cutlass.const_expr(group == 0):
+                c0, c1, c2, c3 = c00, c01, c02, c03
+            elif cutlass.const_expr(group == 1):
+                c0, c1, c2, c3 = c10, c11, c12, c13
+            elif cutlass.const_expr(group == 2):
+                c0, c1, c2, c3 = c20, c21, c22, c23
+            else:
+                c0, c1, c2, c3 = c30, c31, c32, c33
+            s0 = suh_flat[s_base + offset + Int32(0)].to(cutlass.Float32)
+            s1 = suh_flat[s_base + offset + Int32(1)].to(cutlass.Float32)
+            s2 = suh_flat[s_base + offset + Int32(2)].to(cutlass.Float32)
+            s3 = suh_flat[s_base + offset + Int32(3)].to(cutlass.Float32)
+            c0 = cutlass.Float16(c0 * s0).to(cutlass.Float32)
+            c1 = cutlass.Float16(c1 * s1).to(cutlass.Float32)
+            c2 = cutlass.Float16(c2 * s2).to(cutlass.Float32)
+            c3 = cutlass.Float16(c3 * s3).to(cutlass.Float32)
+            o0, o1, o2, o3 = self._had128_quad(c0, c1, c2, c3, lane)
+            a_shared_flat[out_base + offset + Int32(0)] = cutlass.Float16(o0)
+            a_shared_flat[out_base + offset + Int32(1)] = cutlass.Float16(o1)
+            a_shared_flat[out_base + offset + Int32(2)] = cutlass.Float16(o2)
+            a_shared_flat[out_base + offset + Int32(3)] = cutlass.Float16(o3)
 
     @cute.jit
     def _load_coupled_pre_quad(
