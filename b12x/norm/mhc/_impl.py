@@ -32,7 +32,7 @@ MHC_DEFAULT_BLOCK_H = 512
 MHC_SOURCE_TILE_H = 128
 MHC_GRAM_BLOCK_H = 1024
 MHC_SUPPORTED_HIDDEN_SIZES = (4096, 7168)
-MHC_SUPPORTED_RMS_EPS = (1.0e-6, 1.0e-5)
+MHC_SUPPORTED_RMS_EPS = (1.0e-20, 1.0e-6, 1.0e-5)
 
 
 def _required_mhc_split_k(hidden_size: int, block_k: int) -> int:

@@ -54,6 +54,7 @@ from b12x._lib.intrinsics import (
     shared_ptr_to_u32,
     st_shared_bf16_from_f32,
     st_shared_f32_offset,
+    st_shared_u32,
 )
 
 from .decode_math import (
@@ -1798,6 +1799,8 @@ def s6_xv_nope_mg_dsv4(
     warp_id: Int32,
     lane: Int32,
     tid_flat: Int32,
+    index_base_ptr: Int64,
+    tile_length: Int32,
     *,
     n_v_chunks: cutlass.Constexpr,
     v_chunk: cutlass.Constexpr,
@@ -1835,6 +1838,20 @@ def s6_xv_nope_mg_dsv4(
     while i < Int32(n_hg * n_v_chunks * hpb):
         w_head_sc_view[i] = Float32(0.0)
         i += Int32(num_threads)
+    # Zero masked V rows before MMA: a zero probability does not mask NaNs
+    # copied from the unused page by the bulk gather.
+    entry = tid_flat // Int32(4)
+    if entry < Int32(bi):
+        index = Int32(-1)
+        if entry < tile_length:
+            index = ld_global_nc_u32(index_base_ptr + Int64(entry) * Int64(4)).to(Int32)
+        if index < Int32(0):
+            for chunk in cutlass.range_constexpr(448 // 16):
+                offset = (tid_flat % Int32(4)) * Int32(4) + Int32(chunk * 16)
+                st_shared_u32(
+                    kv_fp8_base_addr + entry * Int32(kv_smem_stride) + offset,
+                    Uint32(0),
+                )
     cute.arch.barrier(**bar_kw)
 
     w_head_sc_base = shared_ptr_to_u32(w_head_sc_view.iterator)
@@ -3391,6 +3408,8 @@ class UnifiedPrefillMGKernel:
                         warp_id,
                         lane,
                         tid,
+                        index_base_ptr,
+                        split_cand_end - split_cand_start,
                         n_v_chunks=t.n_v_chunks,
                         v_chunk=t.quant_tile,
                         hpb=t.hpb,
