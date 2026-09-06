@@ -2685,9 +2685,13 @@ class DenseGemmKernel:
                     epi_tile_n = self.epi_tile[1]
                     mma_tile_m = self.tile_shape_mnk[0] // cute.size(tRS_rAcc, mode=[1])
                     mma_tile_n = self.tile_shape_mnk[1] // cute.size(tRS_rAcc, mode=[2])
+                    # Persistent CTAs also reuse sC across multiple stores.
                     has_multi_epi_store = cutlass.const_expr(
                         not (
-                            self.epi_stage == 1 and epi_rest_m == 1 and epi_rest_n == 1
+                            self.single_work_tile_per_cta
+                            and self.epi_stage == 1
+                            and epi_rest_m == 1
+                            and epi_rest_n == 1
                         )
                     )
                     tma_store_producer_group = pipeline.CooperativeGroup(
