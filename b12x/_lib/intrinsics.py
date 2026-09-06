@@ -633,6 +633,33 @@ def ld_global_nc_v4_u32(
 
 
 @dsl_user_op
+def ld_global_cg_v4_u32(
+    base_ptr: Int64, *, loc=None, ip=None
+) -> Tuple[Uint32, Uint32, Uint32, Uint32]:
+    """Load 128 bits from global memory, cached at L2 only (ld.global.cg).
+
+    For data written by other CTAs of the running kernel: bypasses the SM's
+    non-coherent L1 so a stale line can never be returned."""
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32(), T.i32(), T.i32(), T.i32()]),
+        [Int64(base_ptr).ir_value(loc=loc, ip=ip)],
+        "ld.global.cg.v4.u32 {$0, $1, $2, $3}, [$4];",
+        "=r,=r,=r,=r,l",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return (
+        Uint32(llvm.extractvalue(T.i32(), result, [0], loc=loc, ip=ip)),
+        Uint32(llvm.extractvalue(T.i32(), result, [1], loc=loc, ip=ip)),
+        Uint32(llvm.extractvalue(T.i32(), result, [2], loc=loc, ip=ip)),
+        Uint32(llvm.extractvalue(T.i32(), result, [3], loc=loc, ip=ip)),
+    )
+
+
+@dsl_user_op
 def st_global_u64(base_ptr: Int64, value: Uint64, *, loc=None, ip=None):
     """Store 64 bits to global memory."""
     llvm.inline_asm(
@@ -1525,6 +1552,46 @@ def atomic_add_global_i32(addr: Int64, val: Int32, *, loc=None, ip=None) -> Int3
             has_side_effects=True,
             is_align_stack=False,
             asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def red_add_global_i32(addr: Int64, val: Int32, *, loc=None, ip=None):
+    """No-return global int32 add reduction (relaxed device scope)."""
+    llvm.inline_asm(
+        None,
+        [
+            Int64(addr).ir_value(loc=loc, ip=ip),
+            Int32(val).ir_value(loc=loc, ip=ip),
+        ],
+        "red.relaxed.gpu.global.add.s32 [$0], $1;",
+        "l,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def atomic_add_global_u64(addr: Int64, val: Int64, *, loc=None, ip=None) -> Int64:
+    """Global 64-bit atomic add (relaxed device scope). Returns the old value."""
+    return Int64(
+        llvm.inline_asm(
+            T.i64(),
+            [
+                Int64(addr).ir_value(loc=loc, ip=ip),
+                Int64(val).ir_value(loc=loc, ip=ip),
+            ],
+            "atom.relaxed.gpu.global.add.u64 $0, [$1], $2;",
+            "=l,l,l",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
         )
     )
 
@@ -2871,6 +2938,62 @@ def fp8x4_e4m3_to_bfloat2x2_via_f16(
     lo = llvm.extractvalue(T.i32(), result, [0], loc=loc, ip=ip)
     hi = llvm.extractvalue(T.i32(), result, [1], loc=loc, ip=ip)
     return Uint32(lo), Uint32(hi)
+
+
+@dsl_user_op
+def nvfp4_pair_to_bf16x2_sm120(
+    packed: Uint32, scale: Uint32, *, loc=None, ip=None
+) -> Uint32:
+    """Decode raw NVFP4 and E4M3 scale bytes using PTX 9.2 on SM120a.
+
+    Every finite E2M1 * E4M3 product is exactly representable in BF16.
+    """
+    return Uint32(llvm.inline_asm(
+        T.i32(), [Uint32(packed).ir_value(loc=loc, ip=ip),
+                  Uint32(scale).ir_value(loc=loc, ip=ip)],
+        """
+        {
+            .reg .b8 q;
+            .reg .b16 sf;
+            .reg .b32 values, factors, sf_pair;
+            cvt.u8.u32 q, $1;
+            shl.b32 sf_pair, $2, 8;
+            or.b32 sf_pair, $2, sf_pair;
+            cvt.u16.u32 sf, sf_pair;
+            cvt.rn.bf16x2.e2m1x2 values, q;
+            cvt.rn.bf16x2.e4m3x2 factors, sf;
+            mul.bf16x2 $0, values, factors;
+        }
+        """,
+        "=r,r,r", has_side_effects=False, is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip,
+    ))
+
+
+@dsl_user_op
+def mxfp8_pair_to_bf16x2_sm120(
+    packed: Uint32, scale: Uint32, *, loc=None, ip=None
+) -> Uint32:
+    """Decode E4M3 pairs and an unmodified UE8M0 byte on SM120a."""
+    return Uint32(llvm.inline_asm(
+        T.i32(), [Uint32(packed).ir_value(loc=loc, ip=ip),
+                  Uint32(scale).ir_value(loc=loc, ip=ip)],
+        """
+        {
+            .reg .b16 q, sf;
+            .reg .b32 values, factors, sf_pair;
+            cvt.u16.u32 q, $1;
+            cvt.rn.bf16x2.e4m3x2 values, q;
+            shl.b32 sf_pair, $2, 8;
+            or.b32 sf_pair, $2, sf_pair;
+            cvt.u16.u32 sf, sf_pair;
+            cvt.rn.bf16x2.ue8m0x2 factors, sf;
+            mul.bf16x2 $0, values, factors;
+        }
+        """,
+        "=r,r,r", has_side_effects=False, is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip,
+    ))
 
 
 @dsl_user_op

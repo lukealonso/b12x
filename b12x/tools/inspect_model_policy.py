@@ -54,7 +54,12 @@ def _aligned_shard_size(total: int, tp_size: int, alignment: int, minimum: int) 
     return ((max(logical_size, minimum) + alignment - 1) // alignment) * alignment
 
 
-def _moe_queries(tp_size: int, preset: MoePreset) -> tuple[KernelQuery, ...]:
+def _moe_queries(
+    tp_size: int,
+    preset: MoePreset,
+    *,
+    scenario_prefix: str = "moe",
+) -> tuple[KernelQuery, ...]:
     from b12x.moe.fused_moe._policy import MOE_DECODE_POLICY, MoeDecodeQuery
 
     if not 1 <= tp_size <= 16 or tp_size > preset.intermediate_size:
@@ -67,7 +72,7 @@ def _moe_queries(tp_size: int, preset: MoePreset) -> tuple[KernelQuery, ...]:
     )
     return tuple(
         KernelQuery(
-            scenario=f"moe-m{tokens}",
+            scenario=f"{scenario_prefix}-m{tokens}",
             kernel_family="fused-moe",
             policy=MOE_DECODE_POLICY,
             query=MoeDecodeQuery(
@@ -550,6 +555,50 @@ _MOE_PRESETS = {
         intermediate_alignment=16,
         minimum_intermediate_size=16,
     ),
+    "glm-5.3": MoePreset(
+        quant_mode="nvfp4",
+        source_format="modelopt_nvfp4",
+        activation="silu",
+        num_experts=256,
+        hidden_size=6_144,
+        intermediate_size=2_048,
+        top_k=8,
+        intermediate_alignment=16,
+        minimum_intermediate_size=16,
+    ),
+    "glm-5.3-mtp": MoePreset(
+        quant_mode="w4a16",
+        source_format="modelopt_nvfp4",
+        activation="silu",
+        num_experts=256,
+        hidden_size=6_144,
+        intermediate_size=2_048,
+        top_k=8,
+        intermediate_alignment=64,
+        minimum_intermediate_size=64,
+    ),
+    "glm-5.3-flash": MoePreset(
+        quant_mode="nvfp4",
+        source_format="modelopt_nvfp4",
+        activation="silu",
+        num_experts=288,
+        hidden_size=4_096,
+        intermediate_size=2_048,
+        top_k=8,
+        intermediate_alignment=16,
+        minimum_intermediate_size=16,
+    ),
+    "glm-5.3-flash-mtp": MoePreset(
+        quant_mode="w4a16",
+        source_format="modelopt_nvfp4",
+        activation="silu",
+        num_experts=288,
+        hidden_size=4_096,
+        intermediate_size=2_048,
+        top_k=8,
+        intermediate_alignment=64,
+        minimum_intermediate_size=64,
+    ),
     "minimax-m2.7": MoePreset(
         quant_mode="nvfp4",
         source_format="modelopt_nvfp4",
@@ -869,6 +918,38 @@ def _glm51_queries(
     return (*attention, *_moe_queries(tp_size, _MOE_PRESETS["glm-5.1"]))
 
 
+def _glm53_queries(
+    tp_size: int,
+    *,
+    runtime_device: str,
+) -> tuple[KernelQuery, ...]:
+    _validate_glm_tp("glm-5.3", tp_size)
+    attention = tuple(
+        item
+        for item in _glm52_queries(tp_size, runtime_device=runtime_device)
+        if item.policy.component_id.startswith("attention.")
+    )
+    return (
+        _vocab_projection_query(
+            model="glm-5.3",
+            tp_size=tp_size,
+            hidden_size=6_144,
+            global_vocab_size=154_880,
+        ),
+        *attention,
+        *_moe_queries(
+            tp_size,
+            _MOE_PRESETS["glm-5.3"],
+            scenario_prefix="main-moe",
+        ),
+        *_moe_queries(
+            tp_size,
+            _MOE_PRESETS["glm-5.3-mtp"],
+            scenario_prefix="mtp-moe",
+        ),
+    )
+
+
 def _glm53_flash_queries(
     tp_size: int,
     *,
@@ -883,20 +964,18 @@ def _glm53_flash_queries(
         SPARSE_MLA_POLICY,
         SparseMlaQuery,
     )
-    from b12x.moe.fused_moe._policy import MOE_DECODE_POLICY, MoeDecodeQuery
     from b12x.norm.mhc._policy import MHC_POLICY, MhcQuery
     from b12x.sequence.gdn_decode._policy import GDN_POLICY, GdnQuery
 
     del runtime_device
     _validate_glm_tp("glm-5.3-flash", tp_size)
     local_heads = 64 // tp_size
-    intermediate = ((2_048 + tp_size - 1) // tp_size + 15) // 16 * 16
     queries = [
         _vocab_projection_query(
             model="glm-5.3-flash",
             tp_size=tp_size,
             hidden_size=4_096,
-            global_vocab_size=163_840 if tp_size == 8 else 163_968,
+            global_vocab_size=154_880,
         ),
         KernelQuery(
             scenario="kda-spec6",
@@ -962,25 +1041,20 @@ def _glm53_flash_queries(
             ),
         ),
     ]
-    for tokens in (1, 4, 7):
-        queries.append(
-            KernelQuery(
-                scenario=f"moe-m{tokens}",
-                kernel_family="fused-moe",
-                policy=MOE_DECODE_POLICY,
-                query=MoeDecodeQuery(
-                    quant_mode="w4a16",
-                    source_format="modelopt_nvfp4",
-                    activation="silu",
-                    num_experts=288,
-                    hidden_size=4_096,
-                    intermediate_size=intermediate,
-                    top_k=8,
-                    num_tokens=tokens,
-                    routed_rows=tokens * 8,
-                ),
-            )
+    queries.extend(
+        _moe_queries(
+            tp_size,
+            _MOE_PRESETS["glm-5.3-flash"],
+            scenario_prefix="main-moe",
         )
+    )
+    queries.extend(
+        _moe_queries(
+            tp_size,
+            _MOE_PRESETS["glm-5.3-flash-mtp"],
+            scenario_prefix="mtp-moe",
+        )
+    )
     return tuple(queries)
 
 
@@ -990,6 +1064,7 @@ _MODEL_FACTORIES = {
     "dsv4f-nvfp4": _moe_only_factory("dsv4f-nvfp4"),
     "glm-5.1": _glm51_queries,
     "glm-5.2": _glm52_queries,
+    "glm-5.3": _glm53_queries,
     "glm-5.3-flash": _glm53_flash_queries,
     "kimi-k3": _kimi_k3_queries,
     "laguna-s2.1": _moe_only_factory("laguna-s2.1"),
@@ -1009,10 +1084,9 @@ _MODEL_ALIASES = {
     "glm51": "glm-5.1",
     "glm5.2": "glm-5.2",
     "glm52": "glm-5.2",
-    "glm-5.3": "glm-5.3-flash",
-    "glm5.3": "glm-5.3-flash",
+    "glm5.3": "glm-5.3",
     "glm5.3-flash": "glm-5.3-flash",
-    "glm53": "glm-5.3-flash",
+    "glm53": "glm-5.3",
     "glm53-flash": "glm-5.3-flash",
     "glm53-flash-shape": "glm-5.3-flash",
     "qwen3.8-flash-next": "qwen3.8-flash-next-180b",

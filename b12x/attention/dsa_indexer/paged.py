@@ -21,7 +21,6 @@ from b12x.attention.dsa_indexer.contiguous_kernel import (
     run_contiguous_logits_kernel,
 )
 from b12x.attention.dsa_indexer.kernel import (
-    _env_indexer_stream_scorer_enabled,
     _split_index_k_cache_runtime_views,
     run_paged_supertile_logits_kernel,
 )
@@ -747,6 +746,7 @@ def index_topk_fp8(
     out_indices: torch.Tensor | None = None,
     out_scores: torch.Tensor | None = None,
     supertile_k: int | None = None,
+    allow_transient_fold_buffers: bool = True,
 ) -> torch.Tensor:
     """Indexer top-k selection over the paged FP8 index cache.
 
@@ -760,7 +760,8 @@ def index_topk_fp8(
     filled with the float32 top-k scores corresponding position-for-position to
     the returned indices. A binding with ``output_physical_slots=True`` makes the
     producer emit flat physical cache slots directly; no post-selection remap is
-    performed or supported by this entrypoint.
+    performed or supported by this entrypoint. Every ``out_indices`` slot is
+    overwritten on every route, including ``-1`` padding beyond the live width.
     """
 
     metadata, scratch, binding_active_width = _resolve_binding_metadata(
@@ -859,6 +860,8 @@ def index_topk_fp8(
             merge_state_preinitialized=bool(
                 getattr(scratch, "fused_indexer_merge_state_preinitialized", False)
             ),
+            ctas_per_group=int(scratch.fused_ctas_per_group),
+            merge_threshold=int(scratch.fused_merge_threshold),
             output_physical_slots=output_physical_slots,
         )
         return idx
@@ -938,13 +941,17 @@ def index_topk_fp8(
     # the last chunk. The per-chunk tile-logits scratch stays at the supertile
     # ceiling. Physical-slot output keeps the legacy carry chain (the fold
     # gather emits logical indices).
-    fold_plan = _plan_two_level_fold(
-        q_rows=q_rows,
-        topk=topk,
-        page_size=page_size,
-        page_table_width=page_table_width,
-        supertile_pages=supertile_pages,
-        output_physical_slots=output_physical_slots,
+    fold_plan = (
+        _plan_two_level_fold(
+            q_rows=q_rows,
+            topk=topk,
+            page_size=page_size,
+            page_table_width=page_table_width,
+            supertile_pages=supertile_pages,
+            output_physical_slots=output_physical_slots,
+        )
+        if allow_transient_fold_buffers
+        else _TwoLevelFoldPlan(reason="transient fold buffers are disabled")
     )
     two_level_slices = fold_plan.slices
     total_slices = fold_plan.total_slices
@@ -968,13 +975,23 @@ def index_topk_fp8(
         carry_buf_values, carry_buf_indices = (
             scratch.get_indexer_contiguous_candidate_buffers()
         )
-        if carry_buf_values.shape[0] < 2 or carry_buf_indices.shape[0] < 2:
+        if (
+            carry_buf_values.ndim != 3
+            or carry_buf_indices.ndim != 3
+            or carry_buf_values.shape[0] < 2
+            or carry_buf_indices.shape[0] < 2
+            or carry_buf_values.shape[1] < q_rows
+            or carry_buf_indices.shape[1] < q_rows
+            or carry_buf_values.shape[2] < topk
+            or carry_buf_indices.shape[2] < topk
+        ):
             raise RuntimeError(
-                "paged indexer scratch carry buffers need a first dim of at least 2: "
-                f"have={carry_buf_values.shape[0]}"
+                "paged indexer scratch carry buffers are smaller than the runtime "
+                f"shape (2, {q_rows}, {topk}): values={carry_buf_values.shape}, "
+                f"indices={carry_buf_indices.shape}"
             )
-        carry_buf_values = carry_buf_values[:2, :q_rows, :topk]
-        carry_buf_indices = carry_buf_indices[:2, :q_rows, :topk]
+        carry_buf_values = carry_buf_values[:2]
+        carry_buf_indices = carry_buf_indices[:2]
         if (
             carry_buf_values.dtype != torch.float32
             or carry_buf_values.device != q_fp8.device
@@ -1002,6 +1019,7 @@ def index_topk_fp8(
         if binding_active_width is not None
         else scratch.get_paged_indexer_active_width_cap()
     )
+    stream_scorer = bool(getattr(scratch, "stream_scorer", True))
     page_table_for_kernel = metadata.real_page_table
     lengths_for_kernel = metadata.cache_seqlens_int32
     if use_shared_prefill_scorer:
@@ -1030,7 +1048,7 @@ def index_topk_fp8(
         chunk_pages = chunk.page_count
         chunk_width_tokens = chunk.token_count
         chunk_start_token = chunk.token_begin
-        if not _env_indexer_stream_scorer_enabled() and uses_paged_mqa_schedule(
+        if not stream_scorer and uses_paged_mqa_schedule(
             q_rows=q_rows, max_pages=chunk_pages
         ):
             # The streamed scorer schedules its own persistent grid over the
@@ -1083,6 +1101,9 @@ def index_topk_fp8(
                 tile_block_q=_PAGED_INDEX_TILE_BLOCK_Q,
                 tile_block_k=_PAGED_INDEX_TILE_BLOCK_K,
                 preinitialize_tile_logits=False,
+                stream_scorer=stream_scorer,
+                persistent_ctas=int(scratch.persistent_scorer_ctas),
+                stream_ctas=int(scratch.stream_scorer_ctas),
             )
             topk_lengths = lengths_for_kernel
         if not logits.is_contiguous():
@@ -1093,11 +1114,17 @@ def index_topk_fp8(
         is_first = chunk_idx == 0
         is_last = chunk_idx == num_chunks - 1
         if carry_buf_values is not None:
-            carry_values = carry_buf_values[(chunk_idx - 1) % 2]
-            carry_indices = carry_buf_indices[(chunk_idx - 1) % 2]
-            out_values = final_values if is_last else carry_buf_values[chunk_idx % 2]
+            carry_values = carry_buf_values[(chunk_idx - 1) % 2, :q_rows, :topk]
+            carry_indices = carry_buf_indices[(chunk_idx - 1) % 2, :q_rows, :topk]
+            out_values = (
+                final_values
+                if is_last
+                else carry_buf_values[chunk_idx % 2, :q_rows, :topk]
+            )
             out_indices = (
-                final_raw_indices if is_last else carry_buf_indices[chunk_idx % 2]
+                final_raw_indices
+                if is_last
+                else carry_buf_indices[chunk_idx % 2, :q_rows, :topk]
             )
         else:
             # Single chunk: is_first folds nothing and writes straight to the output.

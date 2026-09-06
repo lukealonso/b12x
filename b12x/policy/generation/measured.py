@@ -24,6 +24,15 @@ ConfigT = TypeVar("ConfigT")
 
 
 @dataclass(frozen=True, kw_only=True)
+class QualificationOutcome:
+    """Qualified single config of a component and its measurement evidence."""
+
+    encoded_config: FrozenMapping
+    evidence: dict[str, object]
+    completed_work_units: int
+
+
+@dataclass(frozen=True, kw_only=True)
 class GpuProbeMeasurement:
     """One correctness-gated production-path GPU timing."""
 
@@ -240,13 +249,18 @@ class MeasuredPolicyGenerator(Generic[QueryT, ConfigT]):
             "measurements": [item.to_dict() for item in measurements],
         }
 
-    def generate(
+    def qualify(
         self,
         context: GenerationContext,
         *,
         progress: ProgressReporter,
         checkpoints: CheckpointStore,
-    ) -> ComponentGenerationResult:
+    ) -> QualificationOutcome:
+        """Measure the production paths and validate the single config.
+
+        Composite generators combine the qualified config with decisions from
+        other sources; :meth:`generate` emits it as a single-leaf planner.
+        """
         config, encoded_config = self._config(context)
         del config
         progress.start_stage(
@@ -274,18 +288,8 @@ class MeasuredPolicyGenerator(Generic[QueryT, ConfigT]):
             progress.advance(self.component_id, detail=f"query-{index + 1}")
 
         latencies = [measurement.latency_us for measurement in measurements]
-        estimate = self.estimate(context)
-        return ComponentGenerationResult(
-            component={
-                "component_id": self.component_id,
-                "query_schema_version": self.query_schema_version,
-                "config_schema_version": self.config_schema_version,
-                "planner": {
-                    "kind": "leaf",
-                    "name": "measured-production-implementation",
-                    "config": encoded_config.to_dict(),
-                },
-            },
+        return QualificationOutcome(
+            encoded_config=encoded_config,
             evidence={
                 "selection": "single_candidate_gpu_qualification",
                 "gpu_measurement_cases": len(measurements),
@@ -295,7 +299,30 @@ class MeasuredPolicyGenerator(Generic[QueryT, ConfigT]):
                     "maximum": max(latencies),
                 },
             },
-            completed_work_units=estimate.work_units,
+            completed_work_units=self.estimate(context).work_units,
+        )
+
+    def generate(
+        self,
+        context: GenerationContext,
+        *,
+        progress: ProgressReporter,
+        checkpoints: CheckpointStore,
+    ) -> ComponentGenerationResult:
+        outcome = self.qualify(context, progress=progress, checkpoints=checkpoints)
+        return ComponentGenerationResult(
+            component={
+                "component_id": self.component_id,
+                "query_schema_version": self.query_schema_version,
+                "config_schema_version": self.config_schema_version,
+                "planner": {
+                    "kind": "leaf",
+                    "name": "measured-production-implementation",
+                    "config": outcome.encoded_config.to_dict(),
+                },
+            },
+            evidence=outcome.evidence,
+            completed_work_units=outcome.completed_work_units,
         )
 
 

@@ -7,6 +7,7 @@ import pytest
 import torch
 
 from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
+from b12x.attention import dsa_indexer
 from b12x.attention.dsa_indexer.kernel import (
     PAGED_MQA_LOGITS_SCHEDULE_PAGES_PER_SPLIT,
     _split_index_k_cache_runtime_views,
@@ -34,18 +35,107 @@ from b12x.attention.dsa_indexer._impl import (
 from b12x.attention.dsa_indexer.contiguous_kernel import (
     resolve_contiguous_prefill_block_k,
 )
-from b12x.attention.dsa_indexer import resolve_paged_prefill_k_rows
 from b12x.attention.dsa_indexer.scratch import (
     B12XIndexerContiguousScratchCaps,
     B12XIndexerPagedScratchCaps,
     INDEXER_PAGED_ROUTE_TILED,
     plan_indexer_contiguous_scratch,
     plan_indexer_paged_scratch,
+    resolve_paged_prefill_k_rows,
 )
 from b12x._lib.compiler import clear_compile_cache, compile_cache_info
 
 
 _FP8_E4M3_MAX = float(torch.finfo(torch.float8_e4m3fn).max)
+
+
+def test_public_plan_bind_run_contract_is_complete_and_bind_only_views(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("B12X_INDEXER_STREAM_SCORER", "0")
+    plan = dsa_indexer.plan(
+        dsa_indexer.Caps(
+            device="cpu",
+            num_q_heads=4,
+            max_q_rows=2,
+            max_page_table_width=4,
+            topk=2,
+        )
+    )
+    monkeypatch.setenv("B12X_INDEXER_STREAM_SCORER", "1")
+    (spec,) = plan.scratch_specs()
+    scratch = torch.full(spec.shape, 0xA5, dtype=spec.dtype)
+    before = scratch.clone()
+    binding = dsa_indexer.bind(
+        plan,
+        scratch=scratch,
+        q_fp8=torch.empty((2, 4, 128), dtype=torch.float8_e4m3fn),
+        query_weights=torch.empty((2, 4), dtype=torch.bfloat16),
+        index_k_cache=torch.empty((8, 64 * (128 + 4)), dtype=torch.uint8),
+        page_table=torch.zeros((2, 4), dtype=torch.int32),
+        cache_lengths=torch.full((2,), 64, dtype=torch.int32),
+        active_width=torch.full((1,), 256, dtype=torch.int32),
+        output_indices=torch.empty((2, 2), dtype=torch.int32),
+        output_scores=torch.empty((2, 2), dtype=torch.float32),
+    )
+
+    assert isinstance(binding, dsa_indexer.Binding)
+    assert plan.layout.stream_scorer is False
+    assert binding.runtime.scratch.stream_scorer is False
+    assert binding.runtime.scratch.persistent_scorer_ctas > 0
+    assert binding.runtime.scratch.stream_scorer_ctas > 0
+    torch.testing.assert_close(scratch, before)
+    assert tuple(inspect.signature(dsa_indexer.run).parameters) == ("binding",)
+    assert "index_topk_fp8" not in dsa_indexer.__all__
+    assert "route" not in inspect.signature(dsa_indexer.Caps).parameters
+    assert "source_layout" not in inspect.signature(dsa_indexer.Caps).parameters
+    assert "resolve_paged_prefill_k_rows" not in dsa_indexer.__all__
+
+
+@pytest.mark.parametrize(
+    ("output_index_space", "output_physical_slots"),
+    [("logical", False), ("physical", True)],
+)
+def test_public_output_index_space_is_fixed_during_planning(
+    output_index_space: str,
+    output_physical_slots: bool,
+) -> None:
+    plan = dsa_indexer.plan(
+        dsa_indexer.Caps(
+            device="cpu",
+            num_q_heads=4,
+            max_q_rows=2,
+            max_page_table_width=4,
+            topk=2,
+            output_index_space=output_index_space,
+        )
+    )
+    binding = dsa_indexer.bind(
+        plan,
+        scratch=_one_scratch(plan),
+        q_fp8=torch.empty((2, 4, 128), dtype=torch.float8_e4m3fn),
+        query_weights=torch.empty((2, 4), dtype=torch.bfloat16),
+        index_k_cache=torch.empty((8, 64 * (128 + 4)), dtype=torch.uint8),
+        page_table=torch.zeros((2, 4), dtype=torch.int32),
+        cache_lengths=torch.full((2,), 64, dtype=torch.int32),
+        active_width=torch.full((1,), 256, dtype=torch.int32),
+        output_indices=torch.empty((2, 2), dtype=torch.int32),
+    )
+
+    assert plan.caps.output_physical_slots is output_physical_slots
+    assert binding.runtime.output_physical_slots is output_physical_slots
+
+
+def test_public_output_index_space_rejects_unknown_semantics() -> None:
+    with pytest.raises(ValueError, match="output_index_space"):
+        dsa_indexer.Caps(
+            device="cpu",
+            num_q_heads=4,
+            max_q_rows=2,
+            max_page_table_width=4,
+            topk=2,
+            output_index_space="request_relative",
+        )
 
 
 def _make_real_page_table(

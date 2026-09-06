@@ -26,14 +26,21 @@ def align_up(value: int, alignment: int) -> int:
 @dataclass(frozen=True, kw_only=True)
 class MoeRecipe:
     recipe_id: str
+    family_id: str
     quant_mode: str
     source_format: str
     intermediate_alignment: int
     minimum_intermediate_size: int
+    compatible_activations: tuple[str, ...]
     trellis_variant: str | None = None
 
     def __post_init__(self) -> None:
-        if not self.recipe_id or not self.quant_mode or not self.source_format:
+        if (
+            not self.recipe_id
+            or not self.family_id
+            or not self.quant_mode
+            or not self.source_format
+        ):
             raise ValueError("MoE recipe identifiers must be non-empty")
         if self.intermediate_alignment <= 0:
             raise ValueError("intermediate_alignment must be positive")
@@ -43,6 +50,12 @@ class MoeRecipe:
             raise ValueError(
                 "minimum_intermediate_size must satisfy the recipe alignment"
             )
+        if not self.compatible_activations or len(self.compatible_activations) != len(
+            set(self.compatible_activations)
+        ):
+            raise ValueError("compatible_activations must be non-empty and unique")
+        if any(not activation for activation in self.compatible_activations):
+            raise ValueError("compatible_activations must contain non-empty strings")
         is_trellis = self.source_format in {"btx", "b12x_trellis"}
         if is_trellis and not self.trellis_variant:
             raise ValueError("Trellis recipes require a trellis_variant")
@@ -64,7 +77,7 @@ class MoeModelGeometry:
     num_experts: int
     native_top_k: int
     activation: str
-    recipe_ids: tuple[str, ...]
+    recipe_families: tuple[str, ...]
     source: str
     tp_sizes: tuple[int, ...] = COMMON_TP_SIZES
 
@@ -76,8 +89,12 @@ class MoeModelGeometry:
                 raise ValueError(f"{name} must be positive")
         if not 1 <= self.native_top_k <= self.num_experts:
             raise ValueError("native_top_k must be in the expert range")
-        if not self.recipe_ids or len(self.recipe_ids) != len(set(self.recipe_ids)):
-            raise ValueError("recipe_ids must be non-empty and unique")
+        if not self.recipe_families or len(self.recipe_families) != len(
+            set(self.recipe_families)
+        ):
+            raise ValueError("recipe_families must be non-empty and unique")
+        if any(not family for family in self.recipe_families):
+            raise ValueError("recipe_families must contain non-empty strings")
         if not self.tp_sizes or any(tp <= 0 for tp in self.tp_sizes):
             raise ValueError("tp_sizes must contain positive values")
         if len(self.tp_sizes) != len(set(self.tp_sizes)):
@@ -166,61 +183,86 @@ class MoeSweepCase:
 
 MOE_RECIPES = (
     MoeRecipe(
+        recipe_id="modelopt-nvfp4-auto",
+        family_id="modelopt-nvfp4",
+        quant_mode="nvfp4_auto",
+        source_format="modelopt_nvfp4",
+        intermediate_alignment=16,
+        minimum_intermediate_size=16,
+        compatible_activations=("silu",),
+    ),
+    MoeRecipe(
         recipe_id="modelopt-nvfp4",
+        family_id="modelopt-nvfp4",
         quant_mode="nvfp4",
         source_format="modelopt_nvfp4",
         intermediate_alignment=16,
         minimum_intermediate_size=16,
+        compatible_activations=("silu", "situ", "swigluoai_uninterleave", "relu2"),
     ),
     MoeRecipe(
         recipe_id="modelopt-w4a16",
+        family_id="modelopt-nvfp4",
         quant_mode="w4a16",
         source_format="modelopt_nvfp4",
         intermediate_alignment=64,
         minimum_intermediate_size=64,
+        compatible_activations=("silu", "situ", "swigluoai_uninterleave", "relu2"),
     ),
     MoeRecipe(
         recipe_id="modelopt-w4a8-nvfp4",
+        family_id="modelopt-nvfp4",
         quant_mode="w4a8_nvfp4",
         source_format="modelopt_nvfp4",
         intermediate_alignment=32,
         minimum_intermediate_size=32,
+        compatible_activations=("silu", "situ"),
     ),
     MoeRecipe(
         recipe_id="e8m0-w4a16",
+        family_id="fp4-e8m0-k32",
         quant_mode="w4a16",
         source_format="fp4_e8m0_k32",
         intermediate_alignment=16,
         minimum_intermediate_size=16,
+        compatible_activations=("silu", "situ", "swigluoai_uninterleave", "relu2"),
     ),
     MoeRecipe(
         recipe_id="e8m0-w4a8",
+        family_id="fp4-e8m0-k32",
         quant_mode="w4a8_mx",
         source_format="fp4_e8m0_k32",
         intermediate_alignment=32,
         minimum_intermediate_size=32,
+        compatible_activations=("silu", "situ", "relu2"),
     ),
     MoeRecipe(
         recipe_id="compressed-tensors-w4a16",
+        family_id="compressed-tensors",
         quant_mode="w4a16",
         source_format="compressed_tensors",
         intermediate_alignment=128,
         minimum_intermediate_size=128,
+        compatible_activations=("silu", "situ", "swigluoai_uninterleave", "relu2"),
     ),
     MoeRecipe(
         recipe_id="trellis-glm-w4a16",
+        family_id="trellis-glm-mcg",
         quant_mode="w4a16",
         source_format="b12x_trellis",
         intermediate_alignment=128,
         minimum_intermediate_size=128,
+        compatible_activations=("silu",),
         trellis_variant="glm-mcg-projection-tiered",
     ),
     MoeRecipe(
         recipe_id="trellis-k3-w4a16",
+        family_id="trellis-k3-sqg",
         quant_mode="w4a16",
         source_format="b12x_trellis",
         intermediate_alignment=256,
         minimum_intermediate_size=256,
+        compatible_activations=("situ",),
         trellis_variant="k3-sqg-uniform-coupled",
     ),
 )
@@ -234,7 +276,7 @@ COMMON_MOE_MODELS = (
         num_experts=256,
         native_top_k=8,
         activation="silu",
-        recipe_ids=("modelopt-nvfp4", "modelopt-w4a16"),
+        recipe_families=("modelopt-nvfp4",),
         source="Qwen3.5-35B-A3B-NVFP4 config.json",
     ),
     MoeModelGeometry(
@@ -244,7 +286,7 @@ COMMON_MOE_MODELS = (
         num_experts=256,
         native_top_k=8,
         activation="silu",
-        recipe_ids=("modelopt-nvfp4", "modelopt-w4a16"),
+        recipe_families=("modelopt-nvfp4",),
         source="Qwen3.5-122B-A10B-NVFP4 config.json",
     ),
     MoeModelGeometry(
@@ -254,7 +296,7 @@ COMMON_MOE_MODELS = (
         num_experts=512,
         native_top_k=10,
         activation="silu",
-        recipe_ids=("modelopt-nvfp4", "modelopt-w4a16"),
+        recipe_families=("modelopt-nvfp4",),
         source="Qwen3.5-397B-A17B-NVFP4 config.json",
     ),
     MoeModelGeometry(
@@ -264,7 +306,7 @@ COMMON_MOE_MODELS = (
         num_experts=512,
         native_top_k=10,
         activation="silu",
-        recipe_ids=("modelopt-nvfp4", "modelopt-w4a16"),
+        recipe_families=("modelopt-nvfp4",),
         source="Qwen3.8 Flash Next checkpoint config.json",
     ),
     MoeModelGeometry(
@@ -274,7 +316,7 @@ COMMON_MOE_MODELS = (
         num_experts=128,
         native_top_k=6,
         activation="relu2",
-        recipe_ids=("modelopt-w4a16", "compressed-tensors-w4a16"),
+        recipe_families=("modelopt-nvfp4", "compressed-tensors"),
         source="Nano3.5 W4A16 benchmark profile",
     ),
     MoeModelGeometry(
@@ -284,7 +326,7 @@ COMMON_MOE_MODELS = (
         num_experts=512,
         native_top_k=22,
         activation="relu2",
-        recipe_ids=("modelopt-nvfp4",),
+        recipe_families=("modelopt-nvfp4",),
         source="benchmark_moe.MODEL_PROFILES['nemotron-backbone']",
     ),
     MoeModelGeometry(
@@ -294,7 +336,7 @@ COMMON_MOE_MODELS = (
         num_experts=256,
         native_top_k=8,
         activation="silu",
-        recipe_ids=("e8m0-w4a16", "e8m0-w4a8", "modelopt-nvfp4"),
+        recipe_families=("modelopt-nvfp4", "fp4-e8m0-k32"),
         source="benchmark_moe dsv4f and dsv4f-nvfp4 shape profiles",
     ),
     MoeModelGeometry(
@@ -304,7 +346,7 @@ COMMON_MOE_MODELS = (
         num_experts=256,
         native_top_k=6,
         activation="silu",
-        recipe_ids=("e8m0-w4a16", "e8m0-w4a8"),
+        recipe_families=("fp4-e8m0-k32",),
         source="benchmark_moe.MODEL_PROFILES['deepseek-v4-flash']",
     ),
     MoeModelGeometry(
@@ -314,7 +356,7 @@ COMMON_MOE_MODELS = (
         num_experts=128,
         native_top_k=4,
         activation="swigluoai_uninterleave",
-        recipe_ids=("modelopt-nvfp4", "modelopt-w4a16"),
+        recipe_families=("modelopt-nvfp4",),
         source="MiniMax-M3 benchmark profile",
     ),
     MoeModelGeometry(
@@ -324,7 +366,7 @@ COMMON_MOE_MODELS = (
         num_experts=256,
         native_top_k=10,
         activation="silu",
-        recipe_ids=("modelopt-nvfp4", "modelopt-w4a16"),
+        recipe_families=("modelopt-nvfp4",),
         source="Laguna S-2.1 benchmark profile",
     ),
     MoeModelGeometry(
@@ -334,7 +376,7 @@ COMMON_MOE_MODELS = (
         num_experts=256,
         native_top_k=8,
         activation="silu",
-        recipe_ids=("modelopt-nvfp4",),
+        recipe_families=("modelopt-nvfp4",),
         source="benchmark_moe.MODEL_PROFILES['minimax-m27']",
     ),
     MoeModelGeometry(
@@ -344,7 +386,7 @@ COMMON_MOE_MODELS = (
         num_experts=256,
         native_top_k=8,
         activation="silu",
-        recipe_ids=("modelopt-nvfp4",),
+        recipe_families=("modelopt-nvfp4",),
         source="benchmark_moe.MODEL_PROFILES['glm51']",
     ),
     MoeModelGeometry(
@@ -354,8 +396,18 @@ COMMON_MOE_MODELS = (
         num_experts=256,
         native_top_k=8,
         activation="silu",
-        recipe_ids=("modelopt-w4a8-nvfp4", "trellis-glm-w4a16"),
+        recipe_families=("modelopt-nvfp4", "trellis-glm-mcg"),
         source="benchmark_moe.MODEL_PROFILES['glm52']",
+    ),
+    MoeModelGeometry(
+        model_id="glm-5.3",
+        hidden_size=6144,
+        intermediate_size=2048,
+        num_experts=256,
+        native_top_k=8,
+        activation="silu",
+        recipe_families=("modelopt-nvfp4",),
+        source="GLM-5.3-NVFP4 config.json",
     ),
     MoeModelGeometry(
         model_id="glm-5.3-flash",
@@ -364,7 +416,7 @@ COMMON_MOE_MODELS = (
         num_experts=288,
         native_top_k=8,
         activation="silu",
-        recipe_ids=("modelopt-nvfp4", "modelopt-w4a16"),
+        recipe_families=("modelopt-nvfp4",),
         source="benchmark_moe.MODEL_PROFILES['glm53-flash-shape']",
     ),
     MoeModelGeometry(
@@ -374,7 +426,7 @@ COMMON_MOE_MODELS = (
         num_experts=896,
         native_top_k=16,
         activation="situ",
-        recipe_ids=("trellis-k3-w4a16",),
+        recipe_families=("trellis-k3-sqg",),
         source="Kimi-K3 TP12 production geometry",
     ),
 )
@@ -460,6 +512,12 @@ MOE_BENCHMARK_PRESETS = (
         tp_size=8,
     ),
     MoeBenchmarkPreset(
+        preset_id="glm53-flash",
+        model_id="glm-5.3-flash",
+        recipe_id="modelopt-nvfp4",
+        tp_size=1,
+    ),
+    MoeBenchmarkPreset(
         preset_id="glm53-flash-shape",
         model_id="glm-5.3-flash",
         recipe_id="modelopt-w4a16",
@@ -500,47 +558,62 @@ def expand_physical_geometries(
     recipes_by_id = {recipe.recipe_id: recipe for recipe in recipes}
     if len(recipes_by_id) != len(recipes):
         raise ValueError("MoE recipe IDs must be unique")
+    recipes_by_family: dict[str, list[MoeRecipe]] = {}
+    for recipe in recipes:
+        recipes_by_family.setdefault(recipe.family_id, []).append(recipe)
     aliases_by_key: dict[tuple[object, ...], list[MoeGeometryAlias]] = {}
     recipe_by_key: dict[tuple[object, ...], MoeRecipe] = {}
     for model in models:
-        for recipe_id in model.recipe_ids:
+        for family_id in model.recipe_families:
             try:
-                recipe = recipes_by_id[recipe_id]
+                family_recipes = recipes_by_family[family_id]
             except KeyError as exc:
                 raise ValueError(
-                    f"model {model.model_id!r} references unknown recipe {recipe_id!r}"
+                    f"model {model.model_id!r} references unknown recipe family "
+                    f"{family_id!r}"
                 ) from exc
-            for tp_size in model.tp_sizes:
-                logical_sizes = _logical_shard_sizes(
-                    model.intermediate_size,
-                    tp_size,
+            compatible_recipes = tuple(
+                recipe
+                for recipe in family_recipes
+                if model.activation in recipe.compatible_activations
+            )
+            if not compatible_recipes:
+                raise ValueError(
+                    f"recipe family {family_id!r} has no recipe compatible with "
+                    f"activation {model.activation!r}"
                 )
-                if not logical_sizes:
-                    continue
-                logical_max = max(logical_sizes)
-                physical_size = recipe.physical_intermediate_size(logical_max)
-                key = (
-                    recipe.recipe_id,
-                    model.activation,
-                    model.num_experts,
-                    model.hidden_size,
-                    physical_size,
-                )
-                recipe_by_key[key] = recipe
-                aliases_by_key.setdefault(key, []).append(
-                    MoeGeometryAlias(
-                        model_id=model.model_id,
-                        tp_size=tp_size,
-                        global_intermediate_size=model.intermediate_size,
-                        logical_intermediate_sizes=logical_sizes,
-                        physical_intermediate_size=physical_size,
-                        padding_per_tp_group=(
-                            physical_size * tp_size - model.intermediate_size
-                        ),
-                        native_top_k=model.native_top_k,
-                        source=model.source,
+            for recipe in compatible_recipes:
+                for tp_size in model.tp_sizes:
+                    logical_sizes = _logical_shard_sizes(
+                        model.intermediate_size,
+                        tp_size,
                     )
-                )
+                    if not logical_sizes:
+                        continue
+                    logical_max = max(logical_sizes)
+                    physical_size = recipe.physical_intermediate_size(logical_max)
+                    key = (
+                        recipe.recipe_id,
+                        model.activation,
+                        model.num_experts,
+                        model.hidden_size,
+                        physical_size,
+                    )
+                    recipe_by_key[key] = recipe
+                    aliases_by_key.setdefault(key, []).append(
+                        MoeGeometryAlias(
+                            model_id=model.model_id,
+                            tp_size=tp_size,
+                            global_intermediate_size=model.intermediate_size,
+                            logical_intermediate_sizes=logical_sizes,
+                            physical_intermediate_size=physical_size,
+                            padding_per_tp_group=(
+                                physical_size * tp_size - model.intermediate_size
+                            ),
+                            native_top_k=model.native_top_k,
+                            source=model.source,
+                        )
+                    )
     geometries = []
     for key in sorted(aliases_by_key):
         recipe_id, activation, num_experts, hidden_size, intermediate_size = key

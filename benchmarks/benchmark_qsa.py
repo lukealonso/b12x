@@ -98,12 +98,28 @@ class BenchmarkCase:
     kind: str = "throughput"
     tail_length: int = 0
     preceding_accepted_tokens: int = 1
+    main_page_size: int = MAIN_PAGE_SIZE
+    planned_max_batch: int | None = None
+    planned_max_q_rows: int | None = None
+    planned_max_speculative_tokens: int | None = None
 
     def __post_init__(self) -> None:
         if self.kind not in {"throughput", "prefill", "stream_phase", "speculative"}:
             raise ValueError(f"unknown QSA benchmark case kind {self.kind!r}")
         if self.context % COMPRESS_RATIO:
             raise ValueError("QSA benchmark capacity must be compression aligned")
+        if self.main_page_size <= 0 or self.main_page_size % COMPRESS_RATIO:
+            raise ValueError(
+                "QSA benchmark main page size must be positive and compression aligned"
+            )
+        if self.planned_batch < self.request_count:
+            raise ValueError("planned QSA batch capacity must cover active requests")
+        if self.planned_q_rows < self.rows:
+            raise ValueError("planned QSA row capacity must cover active rows")
+        if self.planned_speculative_tokens < self.max_speculative_tokens:
+            raise ValueError(
+                "planned QSA speculative capacity must cover the active transaction"
+            )
         if self.kind == "stream_phase":
             if self.rows != 1 or self.tail_length not in range(COMPRESS_RATIO):
                 raise ValueError("stream-phase cases require one row and tail 0..3")
@@ -123,20 +139,52 @@ class BenchmarkCase:
 
     @property
     def name(self) -> str:
+        page_suffix = (
+            "" if self.main_page_size == MAIN_PAGE_SIZE else f"-p{self.main_page_size}"
+        )
         if self.kind == "stream_phase":
-            return f"{self.profile.name}-r1-cap{self.context}-tail{self.tail_length}"
+            return (
+                f"{self.profile.name}-r1-cap{self.context}-tail{self.tail_length}"
+                f"{page_suffix}"
+            )
         if self.kind == "speculative":
             return (
                 f"{self.profile.name}-r4-cap{self.context}-spec-"
-                f"accept{self.preceding_accepted_tokens}"
+                f"accept{self.preceding_accepted_tokens}{page_suffix}"
             )
         if self.kind == "prefill":
-            return f"{self.profile.name}-prefill-r{self.rows}-c{self.context}"
-        return f"{self.profile.name}-r{self.rows}-c{self.context}"
+            return (
+                f"{self.profile.name}-prefill-r{self.rows}-c{self.context}{page_suffix}"
+            )
+        return f"{self.profile.name}-r{self.rows}-c{self.context}{page_suffix}"
 
     @property
     def request_count(self) -> int:
         return 1 if self.kind in {"prefill", "speculative"} else self.rows
+
+    @property
+    def planned_batch(self) -> int:
+        return (
+            self.request_count
+            if self.planned_max_batch is None
+            else int(self.planned_max_batch)
+        )
+
+    @property
+    def planned_q_rows(self) -> int:
+        return (
+            self.rows
+            if self.planned_max_q_rows is None
+            else int(self.planned_max_q_rows)
+        )
+
+    @property
+    def planned_speculative_tokens(self) -> int:
+        return (
+            self.max_speculative_tokens
+            if self.planned_max_speculative_tokens is None
+            else int(self.planned_max_speculative_tokens)
+        )
 
     @property
     def max_speculative_tokens(self) -> int:
@@ -184,21 +232,29 @@ class BenchmarkCase:
 
     @property
     def main_pages_per_request(self) -> int:
-        return (self.context + MAIN_PAGE_SIZE - 1) // MAIN_PAGE_SIZE
+        return (self.context + self.main_page_size - 1) // self.main_page_size
 
     @property
     def main_pages_total(self) -> int:
         return self.request_count * self.main_pages_per_request
 
     @property
+    def main_pages_capacity(self) -> int:
+        return self.planned_batch * self.main_pages_per_request
+
+    @property
     def compressed_page_size(self) -> int:
-        return MAIN_PAGE_SIZE // COMPRESS_RATIO
+        return self.main_page_size // COMPRESS_RATIO
 
     @property
     def compressed_pages_per_request(self) -> int:
         return (
             self.groups + self.compressed_page_size - 1
         ) // self.compressed_page_size
+
+    @property
+    def compressed_pages_capacity(self) -> int:
+        return self.planned_batch * self.compressed_pages_per_request
 
 
 @dataclass
@@ -494,14 +550,14 @@ def _cache_capacity_bytes(
     )
     main_kv = (
         2
-        * case.main_pages_total
-        * MAIN_PAGE_SIZE
+        * case.main_pages_capacity
+        * case.main_page_size
         * case.profile.kv_heads
         * HEAD_DIM
         * kv_element_bytes
     )
     compressed = (
-        case.request_count
+        case.planned_batch
         * case.compressed_pages_per_request
         * case.compressed_page_size
         * INDEX_HEAD_DIM
@@ -511,7 +567,7 @@ def _cache_capacity_bytes(
         (COMPRESS_RATIO + case.max_speculative_tokens + COMPRESS_RATIO - 1)
         // COMPRESS_RATIO
     )
-    raw = case.request_count * (
+    raw = case.planned_batch * (
         raw_ring_capacity * INDEX_HEAD_DIM * element_bytes
         + raw_ring_capacity * torch.int64.itemsize
         + raw_ring_capacity * POSITION_AXES * torch.int64.itemsize
@@ -759,17 +815,15 @@ def _make_caps(
 ) -> qsa.Caps:
     return qsa.Caps(
         device=device,
-        max_batch=case.request_count,
-        max_raw_state_slots=case.request_count,
-        max_q_rows=case.rows,
+        max_batch=case.planned_batch,
+        max_raw_state_slots=case.planned_batch,
+        max_q_rows=case.planned_q_rows,
         max_seq_len=case.context,
-        num_main_cache_pages=case.main_pages_total,
-        num_compressed_cache_pages=(
-            case.request_count * case.compressed_pages_per_request
-        ),
-        main_page_size=MAIN_PAGE_SIZE,
+        num_main_cache_pages=case.main_pages_capacity,
+        num_compressed_cache_pages=(case.compressed_pages_capacity),
+        main_page_size=case.main_page_size,
         compressed_page_size=case.compressed_page_size,
-        max_speculative_tokens=case.max_speculative_tokens,
+        max_speculative_tokens=case.planned_speculative_tokens,
         q_heads=case.profile.q_heads,
         kv_heads=case.profile.kv_heads,
         head_dim=HEAD_DIM,
@@ -807,14 +861,14 @@ def _prepare_case(
     generator = torch.Generator(device=device).manual_seed(seed)
 
     main_cache_shape = (
-        case.main_pages_total,
-        MAIN_PAGE_SIZE,
+        case.main_pages_capacity,
+        case.main_page_size,
         case.profile.kv_heads,
         HEAD_DIM,
     )
     if main_cache_layout == "interleaved":
         main_kv_source = _random_bf16(
-            (case.main_pages_total, 2, *main_cache_shape[1:]),
+            (case.main_pages_capacity, 2, *main_cache_shape[1:]),
             generator=generator,
             device=device,
         )
@@ -847,14 +901,14 @@ def _prepare_case(
         main_k.copy_(source_k)
         main_v.copy_(source_v)
     main_table = _disjoint_page_table(
-        case.request_count,
+        case.planned_batch,
         case.main_pages_per_request,
         device=device,
     )
 
     compressed = _random_bf16(
         (
-            case.request_count * case.compressed_pages_per_request,
+            case.compressed_pages_capacity,
             case.compressed_page_size,
             INDEX_HEAD_DIM,
         ),
@@ -862,38 +916,38 @@ def _prepare_case(
         device=device,
     )
     compressed_by_request = compressed.view(
-        case.request_count,
+        case.planned_batch,
         case.compressed_pages_per_request,
         case.compressed_page_size,
         INDEX_HEAD_DIM,
     )
     compressed_table = _disjoint_page_table(
-        case.request_count,
+        case.planned_batch,
         case.compressed_pages_per_request,
         device=device,
     )
 
     raw_ring = _random_bf16(
-        (case.request_count, caps.raw_ring_capacity, INDEX_HEAD_DIM),
+        (case.planned_batch, caps.raw_ring_capacity, INDEX_HEAD_DIM),
         generator=generator,
         device=device,
     )
     raw_tags = torch.full(
-        (case.request_count, caps.raw_ring_capacity),
+        (case.planned_batch, caps.raw_ring_capacity),
         -1,
         dtype=torch.int64,
         device=device,
     )
     raw_rope = torch.full(
-        (case.request_count, caps.raw_ring_capacity, POSITION_AXES),
+        (case.planned_batch, caps.raw_ring_capacity, POSITION_AXES),
         -1,
         dtype=torch.int64,
         device=device,
     )
     interval_starts = torch.full(
-        (case.request_count,), -1, dtype=torch.int64, device=device
+        (case.planned_batch,), -1, dtype=torch.int64, device=device
     )
-    state_slot_ids = torch.arange(case.request_count, dtype=torch.int64, device=device)
+    state_slot_ids = torch.arange(case.planned_batch, dtype=torch.int64, device=device)
 
     q_weight = (
         torch.randn(
@@ -914,12 +968,14 @@ def _prepare_case(
     )
     rope_sin = torch.zeros_like(rope_cos)
     output = torch.empty(
-        (case.rows, case.profile.q_heads, HEAD_DIM),
+        (case.planned_q_rows, case.profile.q_heads, HEAD_DIM),
         dtype=torch.bfloat16,
         device=device,
     )
     selected = torch.empty(
-        (case.rows, caps.selection_width), dtype=torch.int32, device=device
+        (case.planned_q_rows, caps.selection_width),
+        dtype=torch.int32,
+        device=device,
     )
 
     binding = qsa.bind(
@@ -967,7 +1023,19 @@ def _prepare_case(
     else:
         request_ids = torch.arange(case.rows, dtype=torch.int64, device=device)
         query_start_loc = torch.arange(case.rows + 1, dtype=torch.int32, device=device)
-    accepted = torch.ones((case.request_count,), dtype=torch.int32, device=device)
+    sequence_lengths = torch.zeros(
+        (case.planned_batch,), dtype=torch.int32, device=device
+    )
+    sequence_lengths[: case.request_count] = case.active_sequence_length
+    padded_query_start_loc = torch.full(
+        (case.planned_batch + 1,),
+        case.rows,
+        dtype=torch.int32,
+        device=device,
+    )
+    padded_query_start_loc[: case.request_count + 1].copy_(query_start_loc)
+    accepted = torch.zeros((case.planned_batch,), dtype=torch.int32, device=device)
+    accepted[: case.request_count] = 1
     if case.kind == "speculative":
         accepted[0] = case.preceding_accepted_tokens
     dynamic = {
@@ -979,19 +1047,23 @@ def _prepare_case(
         "rope_positions": query_positions[:, None]
         .expand(case.rows, POSITION_AXES)
         .contiguous(),
-        "sequence_lengths": torch.full(
-            (case.request_count,),
-            case.active_sequence_length,
-            dtype=torch.int32,
-            device=device,
-        ),
-        "query_start_loc": query_start_loc,
+        "sequence_lengths": sequence_lengths,
+        "query_start_loc": padded_query_start_loc,
         "num_accepted_tokens": accepted,
-        "is_prefilling": torch.full(
-            (case.request_count,),
-            case.kind == "prefill",
-            dtype=torch.bool,
-            device=device,
+        "is_prefilling": torch.cat(
+            (
+                torch.full(
+                    (case.request_count,),
+                    case.kind == "prefill",
+                    dtype=torch.bool,
+                    device=device,
+                ),
+                torch.zeros(
+                    (case.planned_batch - case.request_count,),
+                    dtype=torch.bool,
+                    device=device,
+                ),
+            )
         ),
     }
 
@@ -1007,8 +1079,8 @@ def _prepare_case(
     )
     _initialize_selector_dataset(
         prepared_query_by_request=prepared_query_by_request,
-        compressed_by_request=compressed_by_request,
-        raw_ring=raw_ring,
+        compressed_by_request=compressed_by_request[: case.request_count],
+        raw_ring=raw_ring[: case.request_count],
         raw_index_key=raw_key,
         key_norm_weight=k_weight,
         rank_prefix_groups=case.rank_prefix_groups,
@@ -1076,13 +1148,23 @@ def _prepare_case(
             .expand(case.rows, POSITION_AXES)
             .contiguous(),
             "sequence_lengths": torch.tensor(
-                [case.setup_positions[-1] + 1], dtype=torch.int32, device=device
+                [case.setup_positions[-1] + 1, *([0] * (case.planned_batch - 1))],
+                dtype=torch.int32,
+                device=device,
             ),
             "query_start_loc": torch.tensor(
-                [0, case.rows], dtype=torch.int32, device=device
+                [0, *([case.rows] * case.planned_batch)],
+                dtype=torch.int32,
+                device=device,
             ),
-            "num_accepted_tokens": torch.ones((1,), dtype=torch.int32, device=device),
-            "is_prefilling": torch.zeros((1,), dtype=torch.bool, device=device),
+            "num_accepted_tokens": torch.tensor(
+                [1, *([0] * (case.planned_batch - 1))],
+                dtype=torch.int32,
+                device=device,
+            ),
+            "is_prefilling": torch.zeros(
+                (case.planned_batch,), dtype=torch.bool, device=device
+            ),
         }
         setup_oracle_compressed = compressed.clone()
         setup_oracle_raw_ring = raw_ring[0].clone()
@@ -1294,11 +1376,13 @@ def _validate_correctness(
     )
 
     compressed_groups = oracle_compressed.view(
-        case.request_count,
+        case.planned_batch,
         case.compressed_pages_per_request,
         case.compressed_page_size,
         INDEX_HEAD_DIM,
-    ).reshape(case.request_count, -1, INDEX_HEAD_DIM)[:, : case.groups]
+    ).reshape(case.planned_batch, -1, INDEX_HEAD_DIM)[
+        : case.request_count, : case.groups
+    ]
     reference_k_cache = binding.main_k_cache.float()
     reference_v_cache = binding.main_v_cache.float()
     sparse_gqa_atol = 2e-2
@@ -1608,7 +1692,7 @@ def _run_case(
             "main_cache_layout": args.main_cache_layout,
             "kv_cache_dtype": args.kv_cache_dtype,
             "head_dim": HEAD_DIM,
-            "main_page_size": MAIN_PAGE_SIZE,
+            "main_page_size": case.main_page_size,
             "compressed_page_size": case.compressed_page_size,
             "index_heads": INDEX_HEADS,
             "index_kv_heads": INDEX_KV_HEADS,
@@ -1623,11 +1707,13 @@ def _run_case(
         },
         "capacity": {
             "main_pages_per_request": case.main_pages_per_request,
-            "main_pages_total": case.main_pages_total,
+            "main_pages_active": case.main_pages_total,
+            "main_pages_capacity": case.main_pages_capacity,
             "compressed_pages_per_request": case.compressed_pages_per_request,
-            "compressed_pages": (
+            "compressed_pages_active": (
                 case.request_count * case.compressed_pages_per_request
             ),
+            "compressed_pages_capacity": case.compressed_pages_capacity,
             "cache_bytes": _cache_capacity_bytes(
                 case,
                 kv_cache_dtype=args.kv_cache_dtype,

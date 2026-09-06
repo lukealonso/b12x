@@ -524,8 +524,20 @@ def run_prefill(binding: LayerBinding, *, eps: float) -> torch.Tensor:
     return binding.out
 
 
-def run_mixed(binding: LayerBinding, *, eps: float) -> torch.Tensor:
-    """Run packed prefill and decode requests without reordering rows."""
+def run_mixed(
+    binding: LayerBinding, *, eps: float, token_count: int | None = None
+) -> torch.Tensor:
+    """Run packed prefill and decode requests without reordering rows.
+
+    Args:
+        binding: Fixed-capacity inputs, output, and recurrent state.
+        eps: Positive normalization epsilon.
+        token_count: Host launch bound, defaulting to the planned capacity.
+            Device metadata may select fewer tokens during graph replay.
+
+    Returns:
+        The output prefix of length token_count. Rows beyond it are untouched.
+    """
     if binding.plan.caps.mode != "mixed":
         raise ValueError("run_mixed requires a mixed LayerPlan")
     if binding.plan.caps.device.type != "cuda":
@@ -533,10 +545,14 @@ def run_mixed(binding: LayerBinding, *, eps: float) -> torch.Tensor:
     eps_value = float(eps)
     if not math.isfinite(eps_value) or eps_value <= 0:
         raise ValueError(f"eps must be finite and positive, got {eps_value}")
+    if token_count is None:
+        token_count = binding.plan.caps.max_tokens
+    if not 0 <= token_count <= binding.plan.caps.max_tokens:
+        raise ValueError("token_count must fit the planned token capacity")
     from ._kernels import run_layer_mixed_kernels
 
-    run_layer_mixed_kernels(binding, eps=eps_value)
-    return binding.out
+    run_layer_mixed_kernels(binding, eps=eps_value, token_count=token_count)
+    return binding.out[:token_count]
 
 
 __all__ = [

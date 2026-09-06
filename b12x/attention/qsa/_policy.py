@@ -59,22 +59,34 @@ class QsaQuery:
 @dataclass(frozen=True, kw_only=True)
 class QsaConfig:
     backend: str
+    sparse_gqa_direct_kv_warps: int = 2
 
     @classmethod
     def from_profile(cls, payload: FrozenMapping) -> "QsaConfig":
-        if set(payload) != {"backend"}:
-            raise ValueError("QSA profiles require exactly backend")
+        if set(payload) != {"backend", "sparse_gqa_direct_kv_warps"}:
+            raise ValueError(
+                "QSA profiles require exactly backend and sparse_gqa_direct_kv_warps"
+            )
         backend = payload["backend"]
         if not isinstance(backend, str):
             raise TypeError("QSA backend must be a string")
-        return cls(backend=backend)
+        direct_kv_warps = payload["sparse_gqa_direct_kv_warps"]
+        if not isinstance(direct_kv_warps, int) or isinstance(direct_kv_warps, bool):
+            raise TypeError("QSA sparse_gqa_direct_kv_warps must be an integer")
+        return cls(
+            backend=backend,
+            sparse_gqa_direct_kv_warps=direct_kv_warps,
+        )
 
 
 def _heuristic(
     _query: QsaQuery,
     _device: DeviceIdentity | None,
 ) -> QsaConfig:
-    return QsaConfig(backend="cutedsl")
+    return QsaConfig(
+        backend="cutedsl",
+        sparse_gqa_direct_kv_warps=2,
+    )
 
 
 def _validate(
@@ -84,6 +96,12 @@ def _validate(
 ) -> None:
     if config.backend != "cutedsl":
         raise ValueError(f"unsupported QSA backend {config.backend!r}")
+    if (
+        not isinstance(config.sparse_gqa_direct_kv_warps, int)
+        or isinstance(config.sparse_gqa_direct_kv_warps, bool)
+        or config.sparse_gqa_direct_kv_warps not in (1, 2, 4)
+    ):
+        raise ValueError("QSA sparse_gqa_direct_kv_warps must be 1, 2, or 4")
     if query.q_dtype != "bfloat16":
         raise ValueError("QSA requires BF16 queries")
     if query.kv_dtype not in ("bfloat16", "float8_e4m3fn"):
@@ -121,9 +139,14 @@ def _validate(
 QSA_POLICY = ComponentPolicy(
     component_id=QSA_ATTENTION,
     query_schema_version=1,
-    config_schema_version=1,
+    config_schema_version=2,
     query_fields=frozenset(QsaQuery.__dataclass_fields__),
-    config_fields=frozenset({"backend"}),
+    config_fields=frozenset(
+        {
+            "backend",
+            "sparse_gqa_direct_kv_warps",
+        }
+    ),
     encode_query=QsaQuery.profile_fields,
     decode_profile=QsaConfig.from_profile,
     heuristic=_heuristic,

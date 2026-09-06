@@ -54,6 +54,7 @@ from b12x._lib.intrinsics import (
     shared_ptr_to_u32,
     st_shared_bf16_from_f32,
     st_shared_f32_offset,
+    st_shared_u32,
 )
 
 from .decode_math import (
@@ -75,8 +76,10 @@ from .traits import (
     ComputeMode,
     ModelType,
     ScaleFormat,
+    UnifiedMLATraits,
     is_glm_model_type,
     make_unified_traits,
+    resolve_unplanned_traits,
 )
 
 
@@ -1796,6 +1799,8 @@ def s6_xv_nope_mg_dsv4(
     warp_id: Int32,
     lane: Int32,
     tid_flat: Int32,
+    index_base_ptr: Int64,
+    tile_length: Int32,
     *,
     n_v_chunks: cutlass.Constexpr,
     v_chunk: cutlass.Constexpr,
@@ -1833,6 +1838,20 @@ def s6_xv_nope_mg_dsv4(
     while i < Int32(n_hg * n_v_chunks * hpb):
         w_head_sc_view[i] = Float32(0.0)
         i += Int32(num_threads)
+    # Zero masked V rows before MMA: a zero probability does not mask NaNs
+    # copied from the unused page by the bulk gather.
+    entry = tid_flat // Int32(4)
+    if entry < Int32(bi):
+        index = Int32(-1)
+        if entry < tile_length:
+            index = ld_global_nc_u32(index_base_ptr + Int64(entry) * Int64(4)).to(Int32)
+        if index < Int32(0):
+            for chunk in cutlass.range_constexpr(448 // 16):
+                offset = (tid_flat % Int32(4)) * Int32(4) + Int32(chunk * 16)
+                st_shared_u32(
+                    kv_fp8_base_addr + entry * Int32(kv_smem_stride) + offset,
+                    Uint32(0),
+                )
     cute.arch.barrier(**bar_kw)
 
     w_head_sc_base = shared_ptr_to_u32(w_head_sc_view.iterator)
@@ -3389,6 +3408,8 @@ class UnifiedPrefillMGKernel:
                         warp_id,
                         lane,
                         tid,
+                        index_base_ptr,
+                        split_cand_end - split_cand_start,
                         n_v_chunks=t.n_v_chunks,
                         v_chunk=t.quant_tile,
                         hpb=t.hpb,
@@ -4115,8 +4136,12 @@ def run_unified_prefill_mg(
     stride_extra_kv_block: int | None = None,
     active_heads: int | None = None,
     head_offset: int = 0,
+    traits_override: UnifiedMLATraits | None = None,
 ):
-    model_type = int(model_type)
+    if traits_override is not None:
+        model_type = int(traits_override.model_type)
+    else:
+        model_type = int(model_type)
     is_glm = is_glm_model_type(model_type)
     # DSV4 dual-cache (has_extra) union. all-or-none + DSV4-only (GLM has no extra
     # section). Forced BF16-QK by the caller (FI ships dual-cache as BF16 only).
@@ -4132,9 +4157,30 @@ def run_unified_prefill_mg(
                 "SM120 sparse MLA MG dual-cache prefill is DSV4-only "
                 "(q_head_dim==512); GLM/DSV3.2 has no extra cache"
             )
-    if scale_format is None:
-        scale_format = ScaleFormat.ARBITRARY_FP32 if is_glm else ScaleFormat.UE8M0_BYTE
-    scale_format = int(scale_format)
+    if traits_override is not None:
+        traits = traits_override
+        compute_mode = int(traits.compute_mode)
+        scale_format = int(traits.scale_format)
+        fp8_rope = bool(traits.fp8_rope)
+        latent_scale_per_token = bool(traits.latent_scale_per_token)
+    else:
+        if scale_format is None:
+            scale_format = (
+                ScaleFormat.ARBITRARY_FP32 if is_glm else ScaleFormat.UE8M0_BYTE
+            )
+        scale_format = int(scale_format)
+        traits = resolve_unplanned_traits(
+            int(q.shape[-1]),
+            kv_cache.dtype,
+            int(kv_cache.shape[-1]),
+            model_type=model_type,
+            scale_format=scale_format,
+            fp8_rope=fp8_rope,
+            latent_scale_per_token=bool(latent_scale_per_token),
+        )
+        compute_mode = int(traits.compute_mode)
+        fp8_rope = bool(traits.fp8_rope)
+        latent_scale_per_token = bool(traits.latent_scale_per_token)
     expected_qdim = {
         ModelType.DSV4: _DSV4_HEAD_DIM,
         ModelType.GLM_NSA: _GLM_HEAD_DIM,
@@ -4165,48 +4211,6 @@ def run_unified_prefill_mg(
         raise ValueError(
             "SM120 sparse MLA MG prefill head range out of bounds: "
             f"head_offset={head_offset}, active_heads={active_heads}, total_heads={total_heads}"
-        )
-    if scale_format == ScaleFormat.NVFP4_E4M3:
-        record_bytes = int(kv_cache.shape[-1])
-        if fp8_rope is None:
-            if record_bytes not in (368, 432):
-                raise ValueError(
-                    "NVFP4 sparse MLA MG cache record must be 368 or 432 bytes, "
-                    f"got {record_bytes}"
-                )
-            fp8_rope = record_bytes == 368
-        expected_record_bytes = 368 if fp8_rope else 432
-        if record_bytes != expected_record_bytes:
-            raise ValueError(
-                "NVFP4 sparse MLA MG cache record disagrees with fp8_rope: "
-                f"got {record_bytes} bytes, expected {expected_record_bytes}"
-            )
-    # FAIL-CLOSED: the per-token fp32 latent scale lives at bytes [292, 296) of
-    # the NVFP4 fp8-rope 368-byte record ONLY.
-    if latent_scale_per_token:
-        if scale_format != ScaleFormat.NVFP4_E4M3:
-            raise ValueError(
-                "SM120 sparse MLA MG prefill latent_scale_per_token requires "
-                f"ScaleFormat.NVFP4_E4M3; got scale_format={int(scale_format)}"
-            )
-        if not bool(fp8_rope):
-            raise ValueError(
-                "SM120 sparse MLA MG prefill latent_scale_per_token requires "
-                "the fp8-rope 368-byte NVFP4 record; got the 432-byte record"
-            )
-    traits = make_unified_traits(
-        model_type,
-        int(compute_mode),
-        scale_format,
-        fp8_rope=fp8_rope,
-        latent_scale_per_token=bool(latent_scale_per_token),
-    )
-    if model_type == ModelType.GLM_NEXT and int(kv_cache.shape[-1]) != int(
-        traits.kv_gmem_stride
-    ):
-        raise ValueError(
-            "GLM_NEXT sparse MLA MG cache record must be 528 bytes, got "
-            f"{int(kv_cache.shape[-1])}"
         )
     # heads_per_cta = mg_n_hg * HPB. mg_n_hg==2 covers paired head groups; mg_n_hg==1
     # covers a single-group launch, including 16-head tails and the heads==8

@@ -1,0 +1,22 @@
+cell            A-roce tok/s    B-nccl tok/s    delta  A-roce itl  B-nccl itl
+c1@0k                   37.9            42.9   -11.5%        59ms        64ms
+c1@16k                  40.8            38.6     5.6%        60ms        65ms
+c1@32k                  41.8            40.3     3.7%        59ms        66ms
+c2@0k                   62.9            60.0     4.8%        82ms        88ms
+c2@16k                  62.5            58.0     7.8%        80ms        88ms
+c2@32k                  60.0            57.8     3.8%        83ms        89ms
+c4@0k                   98.2            99.8    -1.6%        99ms       105ms
+c4@16k                 103.2            86.3    19.7%       100ms       112ms
+c4@32k                 102.7            89.3    15.0%        98ms       113ms
+c8@0k                  146.1           128.6    13.6%       137ms       157ms
+c8@16k                 130.3           118.7     9.7%       151ms       163ms
+c8@32k                 116.7           118.0    -1.1%       156ms       165ms
+c16@0k                 213.9           174.4    22.6%       195ms       242ms
+c16@16k                192.0           166.7    15.2%       210ms       251ms
+c16@32k                190.4           159.6    19.3%       208ms       244ms
+coding_peak A-roce: runs_requested=5, runs_ok=5, max_tokens=2000
+coding_peak B-nccl: runs_requested=5, runs_ok=5, max_tokens=2000
+prefill         A-roce tok/s    B-nccl tok/s    delta
+8192                    2613            2612     0.0%
+32768                   2781            2761     0.7%
+131072                  2717            2699     0.7%

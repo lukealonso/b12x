@@ -12,13 +12,11 @@ A three-stage pipeline whose outputs feed ``attention.sparse_mla`` /
    ``q2k_indices_decode`` / ``q2k_indices_prefill`` (+ query-position
    helpers).
 
-Planning: one ``Caps``/``plan`` pair sizes the caller-owned scratch; facet
-binds produce ``PagedBinding`` / ``ContiguousBinding`` / ``MSAPagedBinding``
-/ ``MSAContiguousBinding`` (views only, capture safe). ``plan_paged_schedule``
-builds the paged-MQA schedule metadata. The persistent top-k-2048 selector
-ships as its own facet (``*_persistent_topk2048``). Paged index-K packing
-helpers (``PagedMetadata``, ``prepare_paged_metadata``, ``index_topk_fp8``)
-round out the cache-side contract.
+The production paged DSA lifecycle is ``plan(Caps(...))`` -> ``bind`` ->
+``run(binding)``. Planning owns route and scratch selection, binding captures
+all live tensors without allocating, and execution launches the selected route.
+Lower-level scorer and selector stages remain implementation facets for kernel
+development rather than integration entry points.
 
 Pure-torch semantics live in ``reference.py`` and ``msa_reference.py``.
 """
@@ -34,64 +32,14 @@ META = OpMeta(
     group="attention",
     api_style="planned",
     entry_points=(
-        # planning + scratch
         "Caps",
         "Plan",
-        "DsaIndexerConfig",
-        "DsaIndexerQuery",
-        "PagedScratch",
-        "ContiguousScratch",
-        "PagedBinding",
-        "ContiguousBinding",
-        "MSAPagedBinding",
-        "MSAContiguousBinding",
+        "Binding",
         "plan",
-        "bind_paged",
-        "bind_contiguous",
-        "bind_msa_paged",
-        "bind_msa_contiguous",
-        # stage 1: quantize
-        "quantize_q_fp8",
-        # stage 2: score
-        "logits_paged",
-        "logits_contiguous",
-        "block_scores_paged",
-        "block_scores_contiguous",
-        "ScoreMode",
-        "OutputMode",
-        # stage 3: select
-        "topk_blocks",
-        "topk_tiled",
-        "q2k_indices_decode",
-        "q2k_indices_prefill",
-        "query_positions_decode",
-        "query_positions_prefill",
-        "resolve_contiguous_prefill_block_k",
-        # paged schedule + cache-side contract
-        "plan_paged_schedule",
-        "uses_paged_schedule",
-        "PagedMetadata",
-        "PagedDecodeMetadata",
-        "ContiguousMetadata",
-        "prepare_paged_metadata",
-        "index_topk_fp8",
-        "resolve_local_num_q_heads",
-        "resolve_replicated_num_q_heads",
-        "resolve_paged_prefill_k_rows",
+        "bind",
+        "run",
         "INDEX_HEAD_DIM",
         "PAGED_INDEX_PAGE_SIZE",
-        "SOURCE_LAYOUT_PAGED",
-        "SOURCE_LAYOUT_CONTIGUOUS",
-        # persistent top-k facet
-        "PersistentTopK2048Caps",
-        "PersistentTopK2048Plan",
-        "PersistentTopK2048Binding",
-        "plan_persistent_topk2048",
-        "bind_persistent_topk2048",
-        "run_persistent_topk2048",
-        "supports_persistent_topk2048",
-        "persistent_topk2048_scratch_nbytes",
-        # maintenance
         "is_supported",
         "clear_caches",
     ),

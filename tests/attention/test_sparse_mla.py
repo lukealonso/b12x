@@ -1,6 +1,6 @@
 """attention.sparse_mla: decode over top-k-selected tokens vs the in-tree
 pure-torch reference (packed NSA MLA cache layout), through the public
-plan -> bind -> run_decode lifecycle, including -1-padded selections.
+plan -> bind -> run lifecycle, including -1-padded selections.
 """
 
 from __future__ import annotations
@@ -45,12 +45,14 @@ def _make_case(*, rows: int, heads: int, cache_tokens: int, width: int):
 
 def _run_public_decode(q_all, kv_cache, selected, cache_seqlens, active, *, width):
     rows, heads, _ = q_all.shape
+    sm_scale = HEAD_DIM**-0.5
     plan = sparse_mla.plan(
         sparse_mla.Caps(
             device=q_all.device,
             num_q_heads=heads,
             max_q_rows=rows,
             max_width=width,
+            softmax_scale=sm_scale,
             kv_dtype=torch.uint8,  # packed NSA byte cache (fp8+scale+rope)
         )
     )
@@ -60,17 +62,12 @@ def _run_public_decode(q_all, kv_cache, selected, cache_seqlens, active, *, widt
         plan,
         scratch=scratch,
         q=q_all,
-        selected_indices=selected,
-        cache_seqlens_int32=cache_seqlens,
-        nsa_cache_seqlens_int32=active,
-    )
-    sm_scale = HEAD_DIM**-0.5
-    out = sparse_mla.run_decode(
-        binding=binding,
         kv_cache=kv_cache,
-        sm_scale=sm_scale,
-        v_head_dim=V_HEAD_DIM,
+        selected_indices=selected,
+        cache_lengths=cache_seqlens,
+        selected_lengths=active,
     )
+    out = sparse_mla.run(binding)
     ref = sparse_mla_reference(
         q_all=q_all,
         kv_cache=kv_cache,

@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 import torch
 
+from b12x.attention import sparse_mla
 from b12x.attention._shared.mla.kernel import run_unified_decode
 from b12x.attention._shared.mla.kv_cache import (
     clear_nvfp4_mla_fp8_rope_kv_cache_kernel_cache,
@@ -33,6 +34,13 @@ _HEADS = 64
 _HEAD_DIM = 576
 _V_HEAD_DIM = 512
 _SENTINEL = 0xA5
+
+
+def test_nvfp4_mla_fp8_rope_writer_is_public() -> None:
+    assert (
+        sparse_mla.concat_and_cache_nvfp4_mla_fp8_rope
+        is concat_and_cache_nvfp4_mla_fp8_rope
+    )
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -450,6 +458,7 @@ def test_writer_records_feed_production_head_multisplit_decode(
     sm_scale = _HEAD_DIM**-0.5
 
     caps = B12XSparseMLAScratchCaps(
+        softmax_scale=1.0,
         device=device,
         dtype=torch.bfloat16,
         kv_dtype=torch.uint8,

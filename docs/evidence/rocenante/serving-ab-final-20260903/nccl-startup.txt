@@ -1,0 +1,2 @@
+(Worker pid=248) INFO 09-03 02:04:07 [cuda_communicator.py:313] Using ['PYNCCL'] all-reduce backends (in dispatch order) for group 'tp:0' out of potential backe
+sanity: Here's the classic one-liner using slicing:  ```python reversed_string = "hello"[::-1] ```  **How it works:** The slice 

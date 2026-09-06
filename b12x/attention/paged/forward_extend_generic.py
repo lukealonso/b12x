@@ -3214,6 +3214,39 @@ def _literal_update_mdo_states_fp32_pack_p(
 
 
 class PagedForwardKernel:
+    @classmethod
+    def selected_positions(
+        cls,
+        *,
+        q_heads: int,
+        kv_heads: int,
+        kv_is_fp8: bool,
+        direct_output: bool,
+        kv_warps: int,
+        page_size: int,
+        key_strides: tuple[int, int, int],
+        value_strides: tuple[int, int, int],
+    ):
+        """Build the selected-position ABI of the paged forward engine.
+
+        This ABI deliberately excludes dense/causal planner features. It owns
+        the same BF16 query, paged BF16/FP8 cache, tensor-core QK/PV, and online
+        softmax contract while replacing contiguous K-tile traversal with an
+        explicit logical-position row resolver.
+        """
+        from ._selected_forward import _SelectedPositionPagedForwardKernel
+
+        return _SelectedPositionPagedForwardKernel(
+            q_heads=q_heads,
+            kv_heads=kv_heads,
+            kv_is_fp8=kv_is_fp8,
+            direct_output=direct_output,
+            kv_warps=kv_warps,
+            page_size=page_size,
+            key_strides=key_strides,
+            value_strides=value_strides,
+        )
+
     def __init__(
         self,
         dtype_q: Type[cutlass.Numeric],

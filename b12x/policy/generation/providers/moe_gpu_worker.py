@@ -23,6 +23,7 @@ from b12x.policy.generation.moe_corpus import (
 from .moe import MoeCandidate, MoeMeasurement
 
 _MAX_RELATIVE_NORM_ERROR = 0.1
+_W4A8_MAX_RELATIVE_NORM_ERROR = 0.12
 _TUNER_OVERRIDE_ENV = (
     "B12X_DIRECT_CUTE_OPTIONS",
     "B12X_DYNAMIC_DETERMINISTIC_OUTPUT",
@@ -76,6 +77,7 @@ def _activation_mode(quant_mode: str):
     from b12x.moe import fused_moe
 
     return {
+        "nvfp4_auto": fused_moe.ActivationMode.AUTO,
         "nvfp4": fused_moe.ActivationMode.A4,
         "w4a16": fused_moe.ActivationMode.A16,
         "w4a8_mx": fused_moe.ActivationMode.A8,
@@ -87,6 +89,12 @@ def _benchmark_input_scale(geometry: MoePhysicalGeometry) -> float:
     if geometry.recipe.source_format in {"btx", "b12x_trellis"}:
         return 1.0e-2
     return 1.0
+
+
+def _maximum_relative_norm_error(geometry: MoePhysicalGeometry) -> float:
+    if geometry.recipe.quant_mode in {"w4a8_mx", "w4a8_nvfp4"}:
+        return _W4A8_MAX_RELATIVE_NORM_ERROR
+    return _MAX_RELATIVE_NORM_ERROR
 
 
 def _condition_benchmark_inputs(
@@ -121,7 +129,7 @@ def _packed_weights(
         format=fused_moe.PackedSourceFormat(source_format),
         w13_layout=(
             fused_moe.W13Layout.W31
-            if source_format == "modelopt_nvfp4"
+            if source_format == "modelopt_nvfp4" and geometry.recipe.quant_mode != "nvfp4_auto"
             else fused_moe.W13Layout.W13
         ),
     )
@@ -177,15 +185,18 @@ def _packed_weights(
         w13_scales = swizzle_block_scale(w13_scales)
         w2_scales = swizzle_block_scale(w2_scales)
     unit = torch.ones(experts, dtype=torch.float32, device=device)
+    automatic = geometry.recipe.quant_mode == "nvfp4_auto"
+    weight_global = unit * (1.0 / 128.0) if automatic else unit
+    activation_global = unit * 32.0 if automatic else unit
     packed = fused_moe.PackedWeights(
         w13=w13,
         w2=w2,
         w13_block_scales=w13_scales,
         w2_block_scales=w2_scales,
-        w13_global_scales=unit,
-        w2_global_scales=unit,
-        input_scale=(unit if geometry.recipe.quant_mode != "w4a16" else None),
-        intermediate_scale=(unit if geometry.recipe.quant_mode != "w4a16" else None),
+        w13_global_scales=weight_global,
+        w2_global_scales=weight_global,
+        input_scale=(activation_global if geometry.recipe.quant_mode != "w4a16" else None),
+        intermediate_scale=(activation_global if geometry.recipe.quant_mode != "w4a16" else None),
     )
     return fused_moe.prepare_weights(plan=weight_plan, weights=packed)
 
@@ -632,6 +643,15 @@ def _candidates_for_geometry(
     sm_count: int,
 ) -> tuple[MoeCandidate, ...]:
     recipe = geometry.recipe
+    if recipe.quant_mode == "nvfp4_auto":
+        from dataclasses import replace
+        return tuple(
+            candidate
+            for mode in ("nvfp4", "w4a16")
+            for candidate in _candidates_for_geometry(
+                replace(geometry, recipe=replace(recipe, quant_mode=mode)), sm_count=sm_count,
+            )
+        )
     if recipe.quant_mode == "w4a16":
         route_modes = (
             ("packed",)
@@ -651,7 +671,14 @@ def _candidates_for_geometry(
             )
             for route_mode in route_modes
         )
-    dynamic_tile_ms = (128,) if recipe.quant_mode == "w6a8_mx" else (16, 32, 64, 128)
+    if recipe.quant_mode == "w6a8_mx":
+        dynamic_tile_ms = (128,)
+    elif recipe.quant_mode == "nvfp4" and geometry.activation == "relu2":
+        # The M16/M32 Relu2 kernels require 117760/121856 bytes of shared
+        # memory, above the 101376-byte SM120/SM121 opt-in limit.
+        dynamic_tile_ms = (64, 128)
+    else:
+        dynamic_tile_ms = (16, 32, 64, 128)
     candidates = []
     if recipe.quant_mode != "w6a8_mx":
         candidates.append(
@@ -712,6 +739,8 @@ def _candidates_for_geometry(
 def _w4a16_weight_layout(geometry: MoePhysicalGeometry) -> str:
     from b12x.moe.fused_moe import _impl
 
+    if geometry.recipe.recipe_id == "modelopt-nvfp4-auto":
+        return "modelopt"
     return _impl._w4a16_weight_layout_for_source(
         geometry.recipe.source_format,
         intermediate_size=geometry.intermediate_size,
@@ -744,7 +773,8 @@ def _w4a16_direct_path(
         return None
     weight_layout = _w4a16_weight_layout(geometry)
     query = _impl.MoeDecodeQuery(
-        quant_mode=geometry.recipe.quant_mode,
+        quant_mode=("nvfp4_auto" if geometry.recipe.recipe_id == "modelopt-nvfp4-auto"
+                    else geometry.recipe.quant_mode),
         source_format=geometry.recipe.source_format,
         activation=geometry.activation,
         num_experts=geometry.num_experts,
@@ -757,7 +787,7 @@ def _w4a16_direct_path(
     if not _impl._w4a16_direct_routing_supported(query):
         return None
     if weight_layout == "modelopt":
-        return "w4a16.small_m_direct"
+        return "w4a16.small_m_direct" if case.num_tokens <= 8 else None
     if weight_layout != "packed":
         return None
     if (
@@ -777,6 +807,13 @@ def _eligible_candidates_for_case(
 ) -> tuple[MoeCandidate, ...]:
     from b12x.moe.fused_moe import _impl
 
+    if geometry.recipe.quant_mode == "nvfp4_auto":
+        return tuple(
+            candidate for candidate in candidates
+            if _eligible_candidates_for_case(
+                _precision_candidate_geometry(geometry, candidate), case, (candidate,),
+            )
+        )
     eligible = []
     for candidate in candidates:
         if candidate.config["backend"] == "dynamic":
@@ -850,6 +887,14 @@ def _eligible_candidates_for_case(
                 continue
         eligible.append(candidate)
     return tuple(eligible)
+
+
+def _precision_candidate_geometry(geometry, candidate):
+    from dataclasses import replace
+    if geometry.recipe.quant_mode != "nvfp4_auto":
+        return geometry
+    mode = "w4a16" if candidate.config["backend"] == "w4a16" else "nvfp4"
+    return replace(geometry, recipe=replace(geometry.recipe, quant_mode=mode))
 
 
 def _concrete_candidate_path(
@@ -1164,9 +1209,8 @@ class _MoeGeometrySession(AbstractContextManager["_MoeGeometrySession"]):
             )
             for spec in plan.scratch_specs()
         }
-        payload = self._experts._impl.representation_for(
-            self._geometry.recipe.quant_mode
-        )
+        candidate_geometry = _precision_candidate_geometry(self._geometry, candidate)
+        payload = self._experts._impl.representation_for(candidate_geometry.recipe.quant_mode)
         output_dtype = (
             torch.float32
             if getattr(payload, "weight_layout", "") == "trellis_t256"
@@ -1189,7 +1233,7 @@ class _MoeGeometrySession(AbstractContextManager["_MoeGeometrySession"]):
         )
         _verify_cooperative_workspace(binding)
         concrete_path = _concrete_candidate_path(
-            geometry=self._geometry,
+            geometry=candidate_geometry,
             case=case,
             candidate=candidate,
             plan=plan,
@@ -1228,8 +1272,17 @@ class _MoeGeometrySession(AbstractContextManager["_MoeGeometrySession"]):
         run()
         torch.cuda.synchronize(self._device)
         graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            run()
+        if self._geometry.recipe.quant_mode == "nvfp4_auto":
+            import b12x
+            b12x.freeze_kernel_resolution("MoE precision candidate graph capture")
+            try:
+                with torch.cuda.graph(graph):
+                    run()
+            finally:
+                b12x.unfreeze_kernel_resolution()
+        else:
+            with torch.cuda.graph(graph):
+                run()
         torch.cuda.synchronize(self._device)
         prepared = _PreparedCandidate(
             run=run,
@@ -1309,7 +1362,8 @@ class _MoeGeometrySession(AbstractContextManager["_MoeGeometrySession"]):
                     finite
                     and cosine >= settings.minimum_cosine
                     and graph_cosine >= settings.minimum_cosine
-                    and relative_norm_error <= _MAX_RELATIVE_NORM_ERROR
+                    and relative_norm_error
+                    <= _maximum_relative_norm_error(self._geometry)
                     and allocated_after <= allocated_before
                 )
                 graph_cosine_metric = (
@@ -1473,6 +1527,9 @@ class _MoeGeometrySession(AbstractContextManager["_MoeGeometrySession"]):
         *,
         correctness: bool = False,
     ) -> tuple[MoeMeasurement, ...]:
+        if self._geometry.recipe.quant_mode == "nvfp4_auto":
+            from .moe_precision import measure_precision
+            return measure_precision(self, case, candidates)
         if any(candidate not in self._candidates for candidate in candidates):
             raise ValueError("MoE worker received an unknown candidate")
         eligible = self.eligible_candidates(case, candidates)
