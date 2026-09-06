@@ -8,6 +8,7 @@ import torch
 from benchmarks.benchmark_qsrt_tp9_extent import (
     NUM_EXPERTS,
     TOP_K,
+    _HISTOGRAM_BLOCKS,
     _load_topk_ids,
     _routing_histogram,
     _uniform_topk_ids,
@@ -26,8 +27,8 @@ def test_histogram_reports_blocks_for_the_chosen_and_candidate_blocks() -> None:
     summary = _routing_histogram(ids, 48)
     assert summary["tokens"] == 4608
     assert summary["routes"] == 4608 * TOP_K
-    assert set(summary["blocks"]) == {"48", "64"}
-    for block in (48, 64):
+    assert set(summary["blocks"]) == {str(b) for b in _HISTOGRAM_BLOCKS}
+    for block in _HISTOGRAM_BLOCKS:
         stats = summary["blocks"][str(block)]
         assert stats["total_blocks"] == _expected_blocks(ids, block)
         assert stats["padded_slots"] == stats["total_blocks"] * block
@@ -38,16 +39,26 @@ def test_histogram_reports_blocks_for_the_chosen_and_candidate_blocks() -> None:
     assert 80.0 <= summary["rows_per_expert"]["mean"] <= 85.0
     assert summary["blocks"]["48"]["experts_needing"]["2"] > 0.9
     assert summary["blocks"]["64"]["total_blocks"] < summary["blocks"]["48"]["total_blocks"]
+    # A route block above the typical rows per expert is what collapses the
+    # two blocks per expert into one: 96 does it for nearly every expert and
+    # 128 for all of them, while 64 leaves the count essentially unchanged.
+    assert summary["blocks"]["96"]["experts_needing"]["1"] > 0.85
+    assert summary["blocks"]["128"]["experts_needing"]["1"] == 1.0
+    assert summary["blocks"]["64"]["total_blocks"] > 1.8 * summary["blocks"]["96"]["total_blocks"]
+    # The padding it costs, though, is what decides the trade: 96 pads about
+    # as much as two 48-row blocks, 128 far more.
+    assert summary["blocks"]["96"]["padding_fraction"] < 0.35
+    assert summary["blocks"]["128"]["padding_fraction"] > 0.5
 
 
 def test_histogram_includes_an_extra_chosen_block() -> None:
     ids = torch.zeros((3, TOP_K), dtype=torch.int32)
     ids[:] = torch.arange(TOP_K, dtype=torch.int32)
-    summary = _routing_histogram(ids, 32)
-    assert set(summary["blocks"]) == {"32", "48", "64"}
+    summary = _routing_histogram(ids, 40)
+    assert set(summary["blocks"]) == {"40", *(str(b) for b in _HISTOGRAM_BLOCKS)}
     assert summary["rows_per_expert"]["max"] == 3
     assert summary["rows_per_expert"]["empty_experts"] == NUM_EXPERTS - TOP_K
-    assert summary["blocks"]["32"]["total_blocks"] == TOP_K
+    assert summary["blocks"]["40"]["total_blocks"] == TOP_K
 
 
 def test_zipf_routing_is_over_dispersed_and_seeded() -> None:

@@ -30,7 +30,12 @@ import torch
 NUM_EXPERTS = 896
 TOP_K = 16
 HIDDEN = 3584
-_HISTOGRAM_BLOCKS = (48, 64)
+# Route block sizes the histogram always reports, so one run's evidence can be
+# read for any candidate block without re-running the harness. The route block
+# only pays off when it crosses the typical rows-per-expert count, so the list
+# spans below (32), around (48, 64) and above (96, 128) the 82 rows per expert
+# that a 4,608-token chunk routes at 896 experts and top-k 16.
+_HISTOGRAM_BLOCKS = (32, 48, 64, 96, 128)
 
 
 def _uniform_topk_ids(m: int, device: torch.device) -> torch.Tensor:
