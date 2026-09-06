@@ -1673,16 +1673,15 @@ def test_unified_decode_glm_multitoken_per_token_length(num_tokens) -> None:
 
 @torch.inference_mode()
 @pytest.mark.parametrize("num_tokens", [1, 4])
-def test_unified_decode_glm_serial_chunks_rescale_late_maximum(num_tokens) -> None:
-    """A split that walks several chunks serially must rescale its accumulators
-    when the running maximum rises in a later chunk. Each of the 64 keys of the
-    last of ten chunks is the dominant key of one pair of row-0 heads (logit
-    about 7 against a background of about 0.15); the single-split serial walk
-    must match the reference and the one-chunk-per-split walk. A kernel that
-    loses the cross-chunk rescale keeps the earlier chunks at their unscaled
-    weight and fails this with an error close to 100 %, while the reference
-    checks of the other GLM decode tests (cosine > 0.995, atol 3e-2) still
-    pass on their low-spread data."""
+@pytest.mark.parametrize("high_page_ids", [False, True], ids=["low-pages", "high-pages"])
+def test_unified_decode_glm_serial_chunks_rescale_late_maximum(
+    num_tokens, high_page_ids
+) -> None:
+    """Rescale accumulated values when every row-0 head peaks in the last chunk.
+
+    Compare a serial ten-chunk walk and one chunk per split with the reference,
+    using both ordinary page IDs and page offsets beyond signed 32-bit range.
+    """
     device = require_b12x_sparse_mla()
     from b12x.attention._shared.mla.kernel import run_unified_decode
     from b12x.attention.sparse_mla._scratch import (
@@ -1706,7 +1705,9 @@ def test_unified_decode_glm_serial_chunks_rescale_late_maximum(num_tokens) -> No
     )
     q = case["q"].contiguous()
     kv_cache = case["kv_cache"].contiguous()
-    idx = case["topk_indices"].contiguous()
+    # Distinct slots keep boosted keys out of the first nine chunks.
+    idx = torch.arange(topk, dtype=torch.int32, device=device)
+    idx = idx.expand(num_tokens, -1).contiguous()
     sm_scale = case["sm_scale"]
     s_kv = kv_cache.shape[0]
     # Heads h and h + 64 of row 0 share key h in the last chunk; the key's rope
@@ -1718,10 +1719,39 @@ def test_unified_decode_glm_serial_chunks_rescale_late_maximum(num_tokens) -> No
     for key in range(64):
         slot = int(idx[0, topk - 64 + key])
         kv_cache[slot, 0, 528:656] = pair_mean[key].to(torch.bfloat16).view(torch.uint8)
+    kv = glm_ref.unpack_mla_kv_cache_reference(kv_cache).squeeze(1).float()
+    scores = q[0].float() @ kv[idx[0].long()].T * sm_scale
+    assert (scores.argmax(dim=-1) >= topk - 64).all(), "maximum must arrive late"
     lengths = torch.full((num_tokens,), topk, dtype=torch.int32, device=device)
     exp_O = glm_ref.glm_decode_reference(
         q, kv_cache, idx, sm_scale, active_token_counts=lengths
     ).float()
+    assert torch.isfinite(exp_O).all() and exp_O.norm() > 0
+
+    if high_page_ids:
+        page_stride_bytes = _GLM_PAGE * _GLM_KV_BYTES_PER_TOKEN
+        int32_max = torch.iinfo(torch.int32).max
+        high_page = int32_max // page_stride_bytes + 2
+        slot_bias = high_page * _GLM_PAGE
+        required_bytes = (slot_bias + s_kv) * _GLM_KV_BYTES_PER_TOKEN
+        free_bytes, _ = torch.cuda.mem_get_info(device)
+        if free_bytes < required_bytes + 2 * 1024**3:
+            pytest.skip(
+                "GLM high-page rescale test requires "
+                f"{required_bytes + 2 * 1024**3} bytes free, found {free_bytes}"
+            )
+        pool = torch.empty(
+            (slot_bias + s_kv, 1, _GLM_KV_BYTES_PER_TOKEN),
+            dtype=torch.uint8,
+            device=device,
+        )
+        # Relocate the oracle's initialized keys without reading the unused pool.
+        pool[slot_bias:].copy_(kv_cache)
+        kv_cache = pool
+        idx = idx + slot_bias
+        s_kv = pool.shape[0]
+        assert high_page * page_stride_bytes > int32_max
+        assert s_kv < int32_max
 
     def run(forced_num_splits: int) -> torch.Tensor:
         caps = B12XSparseMLAScratchCaps(
